@@ -1,0 +1,103 @@
+{
+  "description": "Data-generation configuration for real Binance AFML DRB bars and OU synthetic data.",
+  "real_data": {
+    "script": "binance_scripts/generate_afml_drb_from_aggtrades.py",
+    "symbols": ["BTCUSDT.P", "ETHUSDT.P", "BNBUSDT.P", "SOLUSDT.P"],
+    "threshold_history_start": "2025-01-01",
+    "generation_start": "2025-02-01",
+    "generation_end": "2026-04-30",
+    "product": "um",
+    "threshold_rolling_window_days": 30,
+    "threshold_daily_notional_divisor": 250,
+    "threshold_update_frequency": "monthly",
+    "threshold_min_lookback_days": 7,
+    "ewma_span": 150,
+    "update_expected_ticks": false,
+    "download": {
+      "period_mode": "monthly",
+      "workers": 32,
+      "job_workers": 4,
+      "chunk_mb": 8,
+      "retries": 8,
+      "timeout": 120.0
+    },
+    "incremental": {
+      "enabled": true,
+      "end_policy": "last_complete_month",
+      "download_start_fallback": "2025-01-01",
+      "generation_start_fallback": "2025-02-01"
+    },
+    "input_dir": "binance_scripts/data/binance_vision",
+    "output_dir": "binance_scripts/data/afml_bars",
+    "catalog_dir": "binance_scripts/data/afml_catalog",
+    "calibration_output_dir": "binance_scripts/data/afml_bar_calibration",
+    "tick_cache_dir": "binance_scripts/data/afml_tick_cache",
+    "use_tick_cache": true,
+    "write_catalog": true,
+    "resume_calibration": true,
+    "resume_completed_csv": true,
+    "backup_existing_catalog": true,
+    "tick_cache_schema_version": "1",
+    "tick_cache_write_batch_size": 500000,
+    "tick_cache_read_batch_size": 250000
+  },
+  "synthetic_data": {
+    "script": "afml_scripts/generate_ou_residual_synthetic.py",
+    "enabled": true,
+    "symbols": ["BTCUSDT.P", "ETHUSDT.P", "BNBUSDT.P", "SOLUSDT.P"],
+    "input_csv": "binance_scripts/data/afml_bars/BTCUSDT/BTCUSDT_20250201_20260531_250tpd_DRB.csv",
+    "input_csvs": {
+      "BTCUSDT": "binance_scripts/data/afml_bars/BTCUSDT/BTCUSDT_20250201_20260531_250tpd_DRB.csv",
+      "ETHUSDT": "binance_scripts/data/afml_bars/ETHUSDT/ETHUSDT_20250201_20260531_250tpd_DRB.csv",
+      "BNBUSDT": "binance_scripts/data/afml_bars/BNBUSDT/BNBUSDT_20250201_20260531_250tpd_DRB.csv",
+      "SOLUSDT": "binance_scripts/data/afml_bars/SOLUSDT/SOLUSDT_20250201_20260531_250tpd_DRB.csv"
+    },
+    "output_dir": "afml_scripts/output/ou_synthetic",
+    "symbol": "BTCUSDT.P",
+    "strategy_config": "afml_strategies/cvdslope.json",
+    "price_model": {
+      "kind": "log_price_trend_plus_ou_residual",
+      "price_column": "close",
+      "output_price_space": "relative_path"
+    },
+    "fair_value": {
+      "kind": "kalman_local_level",
+      "q_over_r": 0.001,
+      "input_space": "log_price"
+    },
+    "trend_process": {
+      "kind": "gaussian_random_walk_log_trend_increments",
+      "drift_shrinkage": 1.0,
+      "volatility_scale": 1.0,
+      "anchor_policy": "last_observed_kalman_fair_value"
+    },
+    "ou_process": {
+      "kind": "discrete_ou_ar1_log_residual",
+      "seed_policy": "stationary_distribution",
+      "residual_volatility_scale": 1.0
+    },
+    "monte_carlo": {
+      "n_paths": 6400,
+      "max_horizon_bars": 100,
+      "seed": 42,
+      "innovation_distribution": "joint_gaussian",
+      "joint_innovation_model": "trend_increment_and_ou_residual_innovation",
+      "output_format": "npz",
+      "write_long_csv": false,
+      "dtype": "float32"
+    },
+    "calibration": {
+      "mode": "rolling",
+      "rolling_window_days": 90,
+      "rolling_step_days": 30
+    },
+    "diagnostics": {
+      "max_adf_lag": null,
+      "hurst_lag_min": 2,
+      "hurst_lag_max": 64,
+      "hurst_threshold": 0.5,
+      "min_half_life_bars": 1.0,
+      "max_half_life_bars": 100.0
+    }
+  }
+}

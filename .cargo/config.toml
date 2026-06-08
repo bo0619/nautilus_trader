@@ -1,6 +1,15 @@
 [build]
 rustdocflags = ["--cfg", "docsrs", "-D", "warnings"]
 
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+
 [target.'cfg(all())']
 rustflags = [
   # https://rust-lang.github.io/rust-clippy/master/index.html#drop_non_drop

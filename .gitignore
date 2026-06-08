@@ -5,6 +5,7 @@
 *.obj
 *.so
 *.xml
+*.pdf
 
 # Git
 *.diff
@@ -33,6 +34,8 @@ logs/
 *.dbn
 *.dbn.zst
 *.parquet
+*.csv
+*.npz
 
 # IntelliJ and VSCode project
 *.iml
