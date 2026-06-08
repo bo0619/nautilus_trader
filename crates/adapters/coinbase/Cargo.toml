@@ -12,28 +12,30 @@ keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false # Do not publish to crates.io yet
 
 [lints]
 workspace = true
 
 [lib]
 name = "nautilus_coinbase"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
+  "nautilus-live/extension-module",
   "nautilus-model/extension-module",
   "nautilus-network/extension-module",
-  "python",
   "pyo3/extension-module",
+  "python",
 ]
 python = [
+  "dep:nautilus-system",
   "nautilus-common/python",
   "nautilus-core/python",
+  "nautilus-live/python",
   "nautilus-model/python",
   "nautilus-network/python",
   "nautilus-system/python",
@@ -41,6 +43,11 @@ python = [
   "pyo3-stub-gen",
 ]
 high-precision = ["nautilus-model/high-precision"]
+examples = [
+  "nautilus-live/node",
+  "nautilus-network/transport-sockudo",
+  "nautilus-trading/examples",
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -52,7 +59,7 @@ nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
-nautilus-system = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -83,6 +90,7 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
+nautilus-trading = { workspace = true }
 
 axum = { workspace = true }
 dotenvy = { workspace = true }
@@ -96,6 +104,12 @@ doc = false
 test = false
 
 [[bin]]
+name = "coinbase-cancel-all-open"
+path = "bin/cancel_all_open.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "coinbase-http-private"
 path = "bin/http_private.rs"
 doc = false
@@ -104,4 +118,11 @@ test = false
 [[example]]
 name = "coinbase-data-tester"
 path = "examples/node_data_tester.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "coinbase-exec-tester"
+path = "examples/node_exec_tester.rs"
+required-features = ["examples"]
 doc = false

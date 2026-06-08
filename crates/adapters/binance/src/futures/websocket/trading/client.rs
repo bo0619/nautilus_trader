@@ -38,7 +38,9 @@ use nautilus_core::string::secret::REDACTED;
 use nautilus_network::{
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
-    websocket::{PingHandler, WebSocketClient, WebSocketConfig, channel_message_handler},
+    websocket::{
+        PingHandler, TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
+    },
 };
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -92,6 +94,7 @@ pub struct BinanceFuturesWsTradingClient {
     task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     request_id_counter: Arc<AtomicU64>,
     cancellation_token: CancellationToken,
+    transport_backend: TransportBackend,
 }
 
 impl Debug for BinanceFuturesWsTradingClient {
@@ -112,6 +115,7 @@ impl BinanceFuturesWsTradingClient {
         api_key: String,
         api_secret: String,
         heartbeat: Option<u64>,
+        transport_backend: TransportBackend,
     ) -> Self {
         let url = url.unwrap_or_else(|| BINANCE_FUTURES_USD_WS_API_URL.to_string());
         let credential = Arc::new(SigningCredential::new(api_key, api_secret));
@@ -131,6 +135,7 @@ impl BinanceFuturesWsTradingClient {
             task_handle: None,
             request_id_counter: Arc::new(AtomicU64::new(1)),
             cancellation_token: CancellationToken::new(),
+            transport_backend,
         }
     }
 
@@ -184,6 +189,8 @@ impl BinanceFuturesWsTradingClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: None,
         };
 
         let keyed_quotas = vec![(

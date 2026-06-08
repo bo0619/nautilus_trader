@@ -37,7 +37,7 @@ impl OKXDataClientConfig {
         base_url_http = None,
         base_url_ws_public = None,
         base_url_ws_business = None,
-        http_proxy_url = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
@@ -55,7 +55,7 @@ impl OKXDataClientConfig {
         base_url_http: Option<String>,
         base_url_ws_public: Option<String>,
         base_url_ws_business: Option<String>,
-        http_proxy_url: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -74,8 +74,7 @@ impl OKXDataClientConfig {
             base_url_http,
             base_url_ws_public,
             base_url_ws_business,
-            http_proxy_url,
-            ws_proxy_url: None,
+            proxy_url,
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
@@ -85,6 +84,7 @@ impl OKXDataClientConfig {
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
             vip_level,
+            transport_backend: defaults.transport_backend,
         }
     }
 
@@ -109,7 +109,7 @@ impl OKXExecClientConfig {
         base_url_http = None,
         base_url_ws_private = None,
         base_url_ws_business = None,
-        http_proxy_url = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
@@ -128,7 +128,7 @@ impl OKXExecClientConfig {
         base_url_http: Option<String>,
         base_url_ws_private: Option<String>,
         base_url_ws_business: Option<String>,
-        http_proxy_url: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -148,8 +148,7 @@ impl OKXExecClientConfig {
             base_url_http,
             base_url_ws_private,
             base_url_ws_business,
-            http_proxy_url,
-            ws_proxy_url: None,
+            proxy_url,
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             use_fills_channel: defaults.use_fills_channel,
@@ -160,6 +159,7 @@ impl OKXExecClientConfig {
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             margin_mode,
             use_spot_margin: defaults.use_spot_margin,
+            transport_backend: defaults.transport_backend,
         }
     }
 

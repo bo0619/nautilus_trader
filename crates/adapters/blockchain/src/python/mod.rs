@@ -21,12 +21,11 @@ pub mod config;
 pub mod factories;
 
 #[cfg(feature = "hypersync")]
+use nautilus_common::factories::{ClientConfig, DataClientFactory};
+#[cfg(feature = "hypersync")]
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 #[cfg(feature = "hypersync")]
-use nautilus_system::{
-    factories::{ClientConfig, DataClientFactory},
-    get_global_pyo3_registry,
-};
+use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 /// Extractor function for `BlockchainDataClientFactory`.

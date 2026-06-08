@@ -16,6 +16,7 @@
 //! Configuration structures for the Deribit adapter.
 
 use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_network::websocket::TransportBackend;
 
 use crate::{
     common::{
@@ -48,6 +49,8 @@ pub struct DeribitDataClientConfig {
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The Deribit environment (mainnet or testnet).
     #[builder(default)]
     pub environment: DeribitEnvironment,
@@ -69,6 +72,9 @@ pub struct DeribitDataClientConfig {
     /// Interval for refreshing instruments (in minutes).
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for DeribitDataClientConfig {
@@ -138,6 +144,8 @@ pub struct DeribitExecClientConfig {
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The Deribit environment (mainnet or testnet).
     #[builder(default)]
     pub environment: DeribitEnvironment,
@@ -153,6 +161,9 @@ pub struct DeribitExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for DeribitExecClientConfig {

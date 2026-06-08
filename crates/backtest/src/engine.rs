@@ -44,7 +44,7 @@ use nautilus_execution::models::fill::FillModelAny;
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Data, HasTsInit},
-    enums::AccountType,
+    enums::{AccountType, AggregationSource, BookType},
     identifiers::{AccountId, ClientId, InstrumentId, TraderId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
@@ -92,6 +92,7 @@ pub struct BacktestEngine {
     data_stream_counter: usize,
     ts_first: Option<UnixNanos>,
     ts_last_data: Option<UnixNanos>,
+    sorted: bool,
     iteration: usize,
     force_stop: bool,
     last_ns: UnixNanos,
@@ -119,7 +120,12 @@ impl BacktestEngine {
     /// # Errors
     ///
     /// Returns an error if the core `NautilusKernel` fails to initialize.
-    pub fn new(config: BacktestEngineConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: BacktestEngineConfig) -> anyhow::Result<Self> {
+        // The engine does not replay `add_instrument` on reset, so reruns rely
+        // on the cache retaining instruments regardless of the caller's config.
+        let mut cache_config = config.cache.unwrap_or_default();
+        cache_config.drop_instruments_on_reset = false;
+        config.cache = Some(cache_config);
         let kernel = NautilusKernel::new("BacktestEngine".to_string(), config.clone())?;
         Ok(Self {
             instance_id: kernel.instance_id,
@@ -137,6 +143,7 @@ impl BacktestEngine {
             data_stream_counter: 0,
             ts_first: None,
             ts_last_data: None,
+            sorted: true,
             iteration: 0,
             force_stop: false,
             last_ns: UnixNanos::default(),
@@ -166,6 +173,12 @@ impl BacktestEngine {
         self.kernel.trader_id()
     }
 
+    /// Returns the machine ID for this engine.
+    #[must_use]
+    pub fn machine_id(&self) -> &str {
+        self.kernel.machine_id()
+    }
+
     /// Returns the unique instance ID for this engine.
     #[must_use]
     pub fn instance_id(&self) -> UUID4 {
@@ -176,6 +189,42 @@ impl BacktestEngine {
     #[must_use]
     pub fn iteration(&self) -> usize {
         self.iteration
+    }
+
+    /// Returns the last run config ID, if any.
+    #[must_use]
+    pub fn run_config_id(&self) -> Option<&str> {
+        self.run_config_id.as_deref()
+    }
+
+    /// Returns the last run ID, if any.
+    #[must_use]
+    pub const fn run_id(&self) -> Option<UUID4> {
+        self.run_id
+    }
+
+    /// Returns when the last run started, if any.
+    #[must_use]
+    pub const fn run_started(&self) -> Option<UnixNanos> {
+        self.run_started
+    }
+
+    /// Returns when the last run finished, if any.
+    #[must_use]
+    pub const fn run_finished(&self) -> Option<UnixNanos> {
+        self.run_finished
+    }
+
+    /// Returns the last backtest range start, if any.
+    #[must_use]
+    pub const fn backtest_start(&self) -> Option<UnixNanos> {
+        self.backtest_start
+    }
+
+    /// Returns the last backtest range end, if any.
+    #[must_use]
+    pub const fn backtest_end(&self) -> Option<UnixNanos> {
+        self.backtest_end
     }
 
     /// Returns the list of registered venue identifiers.
@@ -303,20 +352,25 @@ impl BacktestEngine {
     }
 
     /// Adds market data to the engine for replay during the backtest run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `data` is empty.
+    /// - `validate` is `true` and the instrument for the first element has not been
+    ///   added to the cache via [`add_instrument`](Self::add_instrument).
+    /// - `validate` is `true` and the first element is a [`Data::Bar`] whose
+    ///   `aggregation_source` is not [`AggregationSource::External`].
     pub fn add_data(
         &mut self,
         data: Vec<Data>,
         _client_id: Option<ClientId>,
         validate: bool,
         sort: bool,
-    ) {
-        if data.is_empty() {
-            log::warn!("add_data called with empty data slice – ignoring");
-            return;
-        }
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!data.is_empty(), "data was empty");
 
         let count = data.len();
-
         let mut to_add = data;
 
         if sort {
@@ -324,31 +378,62 @@ impl BacktestEngine {
         }
 
         if validate {
-            for item in &to_add {
-                let instr_id = item.instrument_id();
-                self.has_data.insert(instr_id);
+            // Mirror Cython: validate against the first element only and assume the
+            // batch is homogeneous (documented contract on add_data).
+            let first = &to_add[0];
+            let first_instrument_id = first.instrument_id();
+            anyhow::ensure!(
+                self.kernel
+                    .cache
+                    .borrow()
+                    .instrument(&first_instrument_id)
+                    .is_some(),
+                "Instrument {first_instrument_id} for the given data not found in the cache. \
+                 Add the instrument through `add_instrument()` prior to adding related data."
+            );
 
-                if item.is_order_book_data() {
-                    self.has_book_data.insert(instr_id);
-                }
-
-                self.add_market_data_client_if_not_exists(instr_id.venue);
+            if let Data::Bar(bar) = first {
+                anyhow::ensure!(
+                    bar.bar_type.aggregation_source() == AggregationSource::External,
+                    "bar_type.aggregation_source must be External, was {:?}",
+                    bar.bar_type.aggregation_source(),
+                );
             }
         }
 
-        // Track time bounds for start/end defaults
-        if let Some(first) = to_add.first() {
-            let ts = first.ts_init();
-            if self.ts_first.is_none_or(|t| ts < t) {
-                self.ts_first = Some(ts);
+        // Track has_data / has_book_data unconditionally so the depth-vs-data
+        // run-time check still fires for callers that pass validate=false
+        // (e.g. node.rs run_oneshot loading from a catalog). Time bounds are
+        // also tracked here so start/end defaults are correct even when the
+        // batch was added with sort=false.
+        let mut batch_min_ts: Option<UnixNanos> = None;
+        let mut batch_max_ts: Option<UnixNanos> = None;
+
+        for item in &to_add {
+            let instr_id = item.instrument_id();
+            self.has_data.insert(instr_id);
+
+            if item.is_order_book_data() {
+                self.has_book_data.insert(instr_id);
             }
+
+            self.add_market_data_client_if_not_exists(instr_id.venue);
+
+            let ts = item.ts_init();
+            batch_min_ts = Some(batch_min_ts.map_or(ts, |cur| cur.min(ts)));
+            batch_max_ts = Some(batch_max_ts.map_or(ts, |cur| cur.max(ts)));
         }
 
-        if let Some(last) = to_add.last() {
-            let ts = last.ts_init();
-            if self.ts_last_data.is_none_or(|t| ts > t) {
-                self.ts_last_data = Some(ts);
-            }
+        if let Some(ts) = batch_min_ts
+            && self.ts_first.is_none_or(|t| ts < t)
+        {
+            self.ts_first = Some(ts);
+        }
+
+        if let Some(ts) = batch_max_ts
+            && self.ts_last_data.is_none_or(|t| ts > t)
+        {
+            self.ts_last_data = Some(ts);
         }
 
         self.data_len += count;
@@ -356,11 +441,15 @@ impl BacktestEngine {
         self.data_stream_counter += 1;
         self.data_iterator.add_data(&stream_name, to_add, true);
 
+        self.sorted = sort;
+
         log::info!(
             "Added {count} data element{} to BacktestEngine ({} total)",
             if count == 1 { "" } else { "s" },
             self.data_len,
         );
+
+        Ok(())
     }
 
     /// Adds a strategy to the backtest engine.
@@ -376,6 +465,21 @@ impl BacktestEngine {
         self.kernel.trader.borrow_mut().add_strategy(strategy)
     }
 
+    /// Adds the given strategies to the backtest engine. Stops at the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any strategy fails to register; preceding strategies remain registered.
+    pub fn add_strategies<T>(&mut self, strategies: Vec<T>) -> anyhow::Result<()>
+    where
+        T: Strategy + Component + Debug + 'static,
+    {
+        for strategy in strategies {
+            self.add_strategy(strategy)?;
+        }
+        Ok(())
+    }
+
     /// Adds an actor to the backtest engine.
     ///
     /// # Errors
@@ -387,6 +491,21 @@ impl BacktestEngine {
         T: DataActor + Component + Debug + 'static,
     {
         self.kernel.trader.borrow_mut().add_actor(actor)
+    }
+
+    /// Adds the given actors to the backtest engine. Stops at the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any actor fails to register; preceding actors remain registered.
+    pub fn add_actors<T>(&mut self, actors: Vec<T>) -> anyhow::Result<()>
+    where
+        T: DataActor + Component + Debug + 'static,
+    {
+        for actor in actors {
+            self.add_actor(actor)?;
+        }
+        Ok(())
     }
 
     /// Adds an execution algorithm to the backtest engine.
@@ -402,6 +521,22 @@ impl BacktestEngine {
             .trader
             .borrow_mut()
             .add_exec_algorithm(exec_algorithm)
+    }
+
+    /// Adds the given execution algorithms to the backtest engine. Stops at the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any execution algorithm fails to register; preceding algorithms remain
+    /// registered.
+    pub fn add_exec_algorithms<T>(&mut self, exec_algorithms: Vec<T>) -> anyhow::Result<()>
+    where
+        T: ExecutionAlgorithm + Component + Debug + 'static,
+    {
+        for exec_algorithm in exec_algorithms {
+            self.add_exec_algorithm(exec_algorithm)?;
+        }
+        Ok(())
     }
 
     /// Run a backtest.
@@ -447,6 +582,34 @@ impl BacktestEngine {
         run_config_id: Option<String>,
         streaming: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.sorted,
+            "Data has been added but not sorted, call `engine.sort_data()` or use \
+             `engine.add_data(..., sort=true)` before running"
+        );
+
+        for exchange in self.venues.values() {
+            let exchange = exchange.borrow();
+            let book_type_has_depth = exchange.book_type() as u8 > BookType::L1_MBP as u8;
+            if !book_type_has_depth {
+                continue;
+            }
+
+            for instrument_id in exchange.instrument_ids() {
+                let has_data = self.has_data.contains(instrument_id);
+                let missing_book_data = !self.has_book_data.contains(instrument_id);
+                if has_data && missing_book_data {
+                    anyhow::bail!(
+                        "No order book data found for instrument '{instrument_id}' when `book_type` \
+                         is '{:?}'. Set the venue `book_type` to 'L1_MBP' (for top-of-book data \
+                         like quotes, trades, and bars) or provide order book data for this \
+                         instrument.",
+                        exchange.book_type()
+                    );
+                }
+            }
+        }
+
         // Determine time boundaries
         let start_ns = start.unwrap_or_else(|| self.ts_first.unwrap_or_default());
         let end_ns = end.unwrap_or_else(|| {
@@ -557,6 +720,13 @@ impl BacktestEngine {
                 self.advance_time_impl(ts_init, &clocks);
             }
 
+            // A timer fired during clock advance may have requested shutdown,
+            // skip delivering this data point in that case
+            if self.kernel.is_shutdown_requested() {
+                self.force_stop = true;
+                break;
+            }
+
             // Route data to exchange
             self.route_data_to_exchange(d);
 
@@ -585,14 +755,14 @@ impl BacktestEngine {
         self.settle_venues(ts_now);
         self.run_venue_modules(ts_now);
 
-        // Flush remaining timer events. In streaming mode only flush to the
-        // last data timestamp to avoid advancing timers past the current batch.
-        // The final flush to end_ns happens in end() or a non-streaming run.
-        if streaming {
-            self.flush_accumulator_events(&clocks, self.last_ns);
+        // Cap at last_ns when streaming or after shutdown to avoid firing
+        // timers past the current batch or the graceful stop
+        let flush_ts = if streaming || self.force_stop || self.kernel.is_shutdown_requested() {
+            self.last_ns
         } else {
-            self.flush_accumulator_events(&clocks, end_ns);
-        }
+            end_ns
+        };
+        self.flush_accumulator_events(&clocks, flush_ts);
 
         Ok(())
     }
@@ -664,10 +834,14 @@ impl BacktestEngine {
             log::error!("Error resetting trader: {e:?}");
         }
 
-        // Reset all exchanges
+        // `exchange.reset()` re-emits a fresh account state event; the cache
+        // reset that follows drops it so the next run starts with the same
+        // event count as the first.
         for exchange in self.venues.values() {
             exchange.borrow_mut().reset();
         }
+        self.kernel.cache.borrow_mut().reset();
+        self.kernel.portfolio.borrow_mut().reset();
 
         // Clear run state
         self.run_config_id = None;
@@ -695,11 +869,11 @@ impl BacktestEngine {
     /// Useful when data has been added with `sort=false` for batch performance,
     /// then sorted once before running.
     pub fn sort_data(&mut self) {
-        // The iterator sorts internally on add_data, but if multiple streams
-        // were added unsorted we need to re-add them. Since we use a single
-        // "backtest_data" stream, the iterator already maintains sort order.
-        // This is a no-op when using the iterator (data is sorted on insert).
-        log::info!("Data sort requested (iterator maintains sort order)");
+        // Each `add_data` call creates its own stream; the iterator merges streams
+        // by `ts_init` across streams but does not re-sort within a stream. Mark
+        // the engine as sorted so `run` no longer rejects it.
+        self.sorted = true;
+        log::info!("Data sort requested (iterator merges streams by ts_init)");
     }
 
     /// Clear the engine's internal data stream. Does not clear instruments.
@@ -711,6 +885,16 @@ impl BacktestEngine {
         self.data_stream_counter = 0;
         self.ts_first = None;
         self.ts_last_data = None;
+        self.sorted = true;
+    }
+
+    /// Clear all actors from the engine's internal trader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any actor fails to dispose.
+    pub fn clear_actors(&mut self) -> anyhow::Result<()> {
+        self.kernel.trader.borrow_mut().clear_actors()
     }
 
     /// Clear all trading strategies from the engine's internal trader.
@@ -873,6 +1057,7 @@ impl BacktestEngine {
         };
 
         let mut ts_last: Option<UnixNanos> = None;
+        let mut shutdown_at: Option<UnixNanos> = None;
 
         while let Some(handler) = self.accumulator.pop_next_at_or_before(ts_before) {
             let ts_event = handler.event.ts_event;
@@ -892,6 +1077,14 @@ impl BacktestEngine {
             handler.run();
             self.drain_command_queues();
 
+            // Drop queued events on a handler-triggered shutdown so no later
+            // timer fires after the graceful stop
+            if self.kernel.is_shutdown_requested() {
+                self.accumulator.clear();
+                shutdown_at = Some(ts_event);
+                break;
+            }
+
             // Re-advance clocks to capture chained timers
             for clock in clocks {
                 Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
@@ -904,11 +1097,23 @@ impl BacktestEngine {
             self.run_venue_modules(ts);
         }
 
-        Self::set_all_clocks_time(clocks, ts_now);
-        logging_clock_set_static_time(ts_now.as_u64());
+        // On a mid-drain shutdown, anchor state at the firing timer's ts so
+        // post-run settlement and backtest_end reflect the graceful stop
+        if let Some(ts_event) = shutdown_at {
+            self.last_ns = ts_event;
+        } else {
+            Self::set_all_clocks_time(clocks, ts_now);
+            logging_clock_set_static_time(ts_now.as_u64());
+        }
     }
 
     fn flush_accumulator_events(&mut self, clocks: &[Rc<RefCell<dyn Clock>>], ts_now: UnixNanos) {
+        // Bail after shutdown so handler-scheduled alerts do not fire post-stop
+        if self.kernel.is_shutdown_requested() {
+            self.accumulator.clear();
+            return;
+        }
+
         for clock in clocks {
             Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
         }
@@ -932,6 +1137,13 @@ impl BacktestEngine {
 
             handler.run();
             self.drain_command_queues();
+
+            // Drop queued events on a handler-triggered shutdown so no later
+            // timer fires after the graceful stop
+            if self.kernel.is_shutdown_requested() {
+                self.accumulator.clear();
+                break;
+            }
 
             // Re-advance clocks to capture chained timers
             for clock in clocks {
@@ -1327,6 +1539,55 @@ mod tests {
             .build();
         engine.add_venue(venue_config).unwrap();
         engine
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(true))]
+    #[case(Some(false))]
+    fn test_new_forces_drop_instruments_on_reset_false(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+        #[case] user_value: Option<bool>,
+    ) {
+        use nautilus_common::cache::CacheConfig;
+
+        let config = match user_value {
+            None => BacktestEngineConfig::builder().build(),
+            Some(value) => BacktestEngineConfig::builder()
+                .cache(
+                    CacheConfig::builder()
+                        .drop_instruments_on_reset(value)
+                        .build(),
+                )
+                .build(),
+        };
+        let mut engine = BacktestEngine::new(config).unwrap();
+
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("BINANCE"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .build();
+        engine.add_venue(venue_config).unwrap();
+
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let instrument_id = instrument.id();
+        engine.add_instrument(&instrument).unwrap();
+
+        engine.reset();
+
+        assert!(
+            engine
+                .kernel()
+                .cache
+                .borrow()
+                .instrument(&instrument_id)
+                .is_some(),
+            "instrument must survive engine.reset(); user-supplied \
+             drop_instruments_on_reset={user_value:?} must not leak through",
+        );
     }
 
     #[rstest]

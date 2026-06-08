@@ -35,7 +35,8 @@ use nautilus_model::{
 use nautilus_network::{
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, SubscriptionState, WebSocketClient, WebSocketConfig, channel_message_handler,
+        AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
+        channel_message_handler,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -87,6 +88,8 @@ pub struct KrakenSpotWebSocketClient {
     account_id: Arc<RwLock<Option<AccountId>>>,
     truncated_id_map: Arc<AtomicMap<String, ClientOrderId>>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    transport_backend: TransportBackend,
+    proxy_url: Option<String>,
 }
 
 impl Clone for KrakenSpotWebSocketClient {
@@ -108,13 +111,19 @@ impl Clone for KrakenSpotWebSocketClient {
             account_id: Arc::clone(&self.account_id),
             truncated_id_map: Arc::clone(&self.truncated_id_map),
             instruments: Arc::clone(&self.instruments),
+            transport_backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         }
     }
 }
 
 impl KrakenSpotWebSocketClient {
     /// Creates a new client with the given configuration.
-    pub fn new(config: KrakenDataClientConfig, cancellation_token: CancellationToken) -> Self {
+    pub fn new(
+        mut config: KrakenDataClientConfig,
+        cancellation_token: CancellationToken,
+        proxy_url: Option<String>,
+    ) -> Self {
         // Prefer private URL if explicitly set (for authenticated endpoints)
         let url = if config.ws_private_url.is_some() {
             config.ws_private_url()
@@ -124,6 +133,13 @@ impl KrakenSpotWebSocketClient {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SpotHandlerCommand>();
         let initial_mode = AtomicU8::new(ConnectionMode::Closed.as_u8());
         let connection_mode = Arc::new(ArcSwap::from_pointee(initial_mode));
+
+        let transport_backend = config.transport_backend;
+
+        // Keep the config's proxy_url in sync with the constructor argument so
+        // refresh_auth_token() (which reads config.proxy_url) goes through the
+        // same proxy as the WebSocket connection.
+        config.proxy_url = proxy_url.clone();
 
         Self {
             url,
@@ -142,6 +158,8 @@ impl KrakenSpotWebSocketClient {
             account_id: Arc::new(RwLock::new(None)),
             truncated_id_map: Arc::new(AtomicMap::new()),
             instruments: Arc::new(AtomicMap::new()),
+            transport_backend,
+            proxy_url,
         }
     }
 
@@ -171,6 +189,8 @@ impl KrakenSpotWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         };
 
         let ws_client = WebSocketClient::connect(
@@ -1035,7 +1055,7 @@ async fn refresh_auth_token(config: &KrakenDataClientConfig) -> Result<String, K
         None,
         None,
         None,
-        config.http_proxy.clone(),
+        config.proxy_url.clone(),
         config
             .max_requests_per_second
             .unwrap_or(KRAKEN_SPOT_DEFAULT_RATE_LIMIT_PER_SECOND),
@@ -1119,6 +1139,8 @@ mod tests {
     #[case("SOL/USD", "SOL/USD")]
     #[case("BTC/USD", "BTC/USD")]
     #[case("ETH/BTC", "ETH/BTC")]
+    #[case("XDG/USD", "DOGE/USD")]
+    #[case("XDG/EUR", "DOGE/EUR")]
     fn test_to_kraken_ws_v2_symbol(#[case] input: &str, #[case] expected: &str) {
         let symbol = Ustr::from(input);
         let result = to_ws_v2_symbol(symbol);
@@ -1126,7 +1148,11 @@ mod tests {
     }
 
     fn test_client_without_credentials() -> KrakenSpotWebSocketClient {
-        KrakenSpotWebSocketClient::new(KrakenDataClientConfig::default(), CancellationToken::new())
+        KrakenSpotWebSocketClient::new(
+            KrakenDataClientConfig::default(),
+            CancellationToken::new(),
+            None,
+        )
     }
 
     #[rstest]

@@ -20,7 +20,7 @@
 //! reconstructed position matches the venue's reported position within tolerance
 //! (default 0.01%) after reconciliation is applied.
 
-use ahash::AHashMap;
+use indexmap::IndexMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
@@ -176,9 +176,9 @@ pub fn check_position_match(
 /// # Notes
 ///
 /// The function handles four scenarios:
-/// 1. Position to flat: reconciliation_px = current_avg_px (close at current average)
-/// 2. Flat to position: reconciliation_px = target_avg_px
-/// 3. Position flip (sign change): reconciliation_px = target_avg_px (due to value reset in simulation)
+/// 1. Position to flat: `reconciliation_px` = `current_avg_px` (close at current average)
+/// 2. Flat to position: `reconciliation_px` = `target_avg_px`
+/// 3. Position flip (sign change): `reconciliation_px` = `target_avg_px` (due to value reset in simulation)
 /// 4. Accumulation/reduction: weighted average formula
 pub fn calculate_reconciliation_price(
     current_position_qty: Decimal,
@@ -470,7 +470,7 @@ pub fn adjust_fills_for_partial_window(
 ///
 /// Populates `avg_px` from the fill's price so downstream reconciliation paths
 /// (e.g. [`crate::reconciliation::orders::create_inferred_fill`]) can resolve a
-/// fill price without falling back to the "no avg_px or price available" warning.
+/// fill price without falling back to the "no `avg_px` or price available" warning.
 ///
 /// # Errors
 ///
@@ -690,8 +690,8 @@ fn extract_instrument_reports(
     mass_status: &ExecutionMassStatus,
     instrument_id: InstrumentId,
 ) -> ReconciliationResult {
-    let mut orders = AHashMap::new();
-    let mut fills = AHashMap::new();
+    let mut orders = IndexMap::new();
+    let mut fills = IndexMap::new();
 
     for (id, order) in mass_status.order_reports() {
         if order.instrument_id == instrument_id {
@@ -717,8 +717,8 @@ fn extract_instrument_reports(
 /// Extracted fills and reports for an instrument.
 struct ExtractedFills {
     snapshots: Vec<FillSnapshot>,
-    orders: AHashMap<VenueOrderId, OrderStatusReport>,
-    fills: AHashMap<VenueOrderId, Vec<FillReport>>,
+    orders: IndexMap<VenueOrderId, OrderStatusReport>,
+    fills: IndexMap<VenueOrderId, Vec<FillReport>>,
 }
 
 /// Extract fills for an instrument and convert to snapshots.
@@ -727,8 +727,8 @@ fn extract_fills_for_instrument(
     instrument_id: InstrumentId,
 ) -> ExtractedFills {
     let mut snapshots = Vec::new();
-    let mut order_map = AHashMap::new();
-    let mut fill_map = AHashMap::new();
+    let mut order_map = IndexMap::new();
+    let mut fill_map = IndexMap::new();
 
     // Seed order_map
     for (id, order) in mass_status.order_reports() {

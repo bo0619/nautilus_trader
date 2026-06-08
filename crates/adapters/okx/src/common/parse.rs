@@ -257,6 +257,7 @@ pub fn okx_status_to_market_action(status: OKXInstrumentStatus) -> MarketStatusA
         OKXInstrumentStatus::Suspend => MarketStatusAction::Suspend,
         OKXInstrumentStatus::Preopen => MarketStatusAction::PreOpen,
         OKXInstrumentStatus::Test => MarketStatusAction::NotAvailableForTrading,
+        OKXInstrumentStatus::PostOnly => MarketStatusAction::Quoting,
     }
 }
 
@@ -309,7 +310,7 @@ pub fn parse_rfc3339_timestamp(timestamp: &str) -> anyhow::Result<UnixNanos> {
 /// of decimal places exceeds `precision`.
 pub fn parse_price(value: &str, precision: u8) -> anyhow::Result<Price> {
     let decimal = Decimal::from_str(value)?;
-    Price::from_decimal_dp(decimal, precision)
+    Price::from_decimal_dp(decimal, precision).map_err(Into::into)
 }
 
 /// Converts a textual quantity to a [`Quantity`].
@@ -320,7 +321,7 @@ pub fn parse_price(value: &str, precision: u8) -> anyhow::Result<Price> {
 /// precision.
 pub fn parse_quantity(value: &str, precision: u8) -> anyhow::Result<Quantity> {
     let decimal = Decimal::from_str(value)?;
-    Quantity::from_decimal_dp(decimal, precision)
+    Quantity::from_decimal_dp(decimal, precision).map_err(Into::into)
 }
 
 /// Converts a textual fee amount into a [`Money`] value.
@@ -336,7 +337,7 @@ pub fn parse_fee(value: Option<&str>, currency: Currency) -> anyhow::Result<Mone
     // OKX uses opposite sign convention: negative = cost, positive = rebate.
     // Negate to match Nautilus convention: positive = cost, negative = rebate.
     let decimal = Decimal::from_str(value.unwrap_or("0"))?;
-    Money::from_decimal(-decimal, currency)
+    Money::from_decimal(-decimal, currency).map_err(Into::into)
 }
 
 /// Parses OKX fee currency code, handling empty strings.
@@ -2599,12 +2600,12 @@ mod tests {
         // Test error handling with invalid price string
         let invalid_price = "invalid-price";
         let result = crate::common::parse::parse_price(invalid_price, 2);
-        assert!(result.is_err());
+        result.unwrap_err();
 
         // Test error handling with invalid quantity string
         let invalid_quantity = "invalid-quantity";
         let result = crate::common::parse::parse_quantity(invalid_quantity, 8);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[rstest]
@@ -3394,7 +3395,7 @@ mod tests {
 
         // Test error case
         let invalid_timestamp = "invalid-timestamp";
-        assert!(parse_rfc3339_timestamp(invalid_timestamp).is_err());
+        parse_rfc3339_timestamp(invalid_timestamp).unwrap_err();
     }
 
     #[rstest]
@@ -3406,7 +3407,7 @@ mod tests {
 
         // Test error case
         let invalid_price = "invalid-price";
-        assert!(parse_price(invalid_price, precision).is_err());
+        parse_price(invalid_price, precision).unwrap_err();
     }
 
     #[rstest]
@@ -3418,7 +3419,7 @@ mod tests {
 
         // Test error case
         let invalid_quantity = "invalid-quantity";
-        assert!(parse_quantity(invalid_quantity, precision).is_err());
+        parse_quantity(invalid_quantity, precision).unwrap_err();
     }
 
     #[rstest]
@@ -5053,6 +5054,19 @@ mod tests {
 
     #[rstest]
     fn test_extract_inst_family_single_segment_fails() {
-        assert!(extract_inst_family("BTC").is_err());
+        extract_inst_family("BTC").unwrap_err();
+    }
+
+    #[rstest]
+    #[case(OKXInstrumentStatus::Live, MarketStatusAction::Trading)]
+    #[case(OKXInstrumentStatus::Suspend, MarketStatusAction::Suspend)]
+    #[case(OKXInstrumentStatus::Preopen, MarketStatusAction::PreOpen)]
+    #[case(OKXInstrumentStatus::Test, MarketStatusAction::NotAvailableForTrading)]
+    #[case(OKXInstrumentStatus::PostOnly, MarketStatusAction::Quoting)]
+    fn test_okx_status_to_market_action(
+        #[case] status: OKXInstrumentStatus,
+        #[case] expected: MarketStatusAction,
+    ) {
+        assert_eq!(okx_status_to_market_action(status), expected);
     }
 }

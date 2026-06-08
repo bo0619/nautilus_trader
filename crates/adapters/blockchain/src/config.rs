@@ -15,12 +15,13 @@
 
 use std::any::Any;
 
+use nautilus_common::factories::ClientConfig;
 use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::{
     defi::{Chain, DexType, SharedChain},
     identifiers::{AccountId, TraderId},
 };
-use nautilus_system::ClientConfig;
+use nautilus_network::websocket::TransportBackend;
 
 /// Defines filtering criteria for the DEX pool universe that the data client will operate on.
 #[derive(Debug, Clone, bon::Builder)]
@@ -78,13 +79,8 @@ pub struct BlockchainDataClientConfig {
     pub multicall_calls_per_rpc_request: u32,
     /// The WebSocket secure URL for the blockchain RPC endpoint.
     pub wss_rpc_url: Option<String>,
-    /// Optional HTTP proxy URL for RPC requests.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL for RPC connections.
-    ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The block from which to sync historical data.
     pub from_block: Option<u64>,
     /// Filtering criteria that define which DEX pools to include in the data universe.
@@ -92,6 +88,9 @@ pub struct BlockchainDataClientConfig {
     pub pool_filters: DexPoolFilters,
     /// Optional configuration for data client's Postgres cache database
     pub postgres_cache_database_config: Option<PostgresConnectOptions>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 #[derive(Debug, Clone, bon::Builder)]
@@ -110,6 +109,9 @@ pub struct BlockchainExecutionClientConfig {
     pub http_rpc_url: String,
     /// The maximum number of RPC requests allowed per second.
     pub rpc_requests_per_second: Option<u32>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl ClientConfig for BlockchainExecutionClientConfig {

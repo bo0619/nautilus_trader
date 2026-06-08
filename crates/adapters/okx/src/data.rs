@@ -176,7 +176,7 @@ impl OKXDataClient {
                 config.retry_delay_initial_ms,
                 config.retry_delay_max_ms,
                 config.environment,
-                config.http_proxy_url.clone(),
+                config.proxy_url.clone(),
             )?
         } else {
             OKXHttpClient::new(
@@ -186,7 +186,7 @@ impl OKXDataClient {
                 config.retry_delay_initial_ms,
                 config.retry_delay_max_ms,
                 config.environment,
-                config.http_proxy_url.clone(),
+                config.proxy_url.clone(),
             )?
         };
 
@@ -198,22 +198,25 @@ impl OKXDataClient {
             None,
             Some(OKX_WS_HEARTBEAT_SECS),
             None,
+            config.transport_backend,
+            config.proxy_url.clone(),
         )
         .context("failed to construct OKX public websocket client")?;
 
         let ws_business = if config.requires_business_ws() {
-            Some(
-                OKXWebSocketClient::new(
-                    Some(config.ws_business_url()),
-                    None, // No auth needed for public business channels
-                    None,
-                    None,
-                    None,
-                    Some(OKX_WS_HEARTBEAT_SECS),
-                    None,
-                )
-                .context("failed to construct OKX business websocket client")?,
+            let ws = OKXWebSocketClient::new(
+                Some(config.ws_business_url()),
+                None, // No auth needed for public business channels
+                None,
+                None,
+                None,
+                Some(OKX_WS_HEARTBEAT_SECS),
+                None,
+                config.transport_backend,
+                config.proxy_url.clone(),
             )
+            .context("failed to construct OKX business websocket client")?;
+            Some(ws)
         } else {
             None
         };
@@ -685,13 +688,12 @@ impl DataClient for OKXDataClient {
 
     fn start(&mut self) -> anyhow::Result<()> {
         log::info!(
-            "Started: client_id={}, vip_level={:?}, instrument_types={:?}, environment={}, http_proxy_url={:?}, ws_proxy_url={:?}",
+            "Started: client_id={}, vip_level={:?}, instrument_types={:?}, environment={}, proxy_url={:?}",
             self.client_id,
             self.vip_level(),
             self.config.instrument_types,
             self.config.environment,
-            self.config.http_proxy_url,
-            self.config.ws_proxy_url,
+            self.config.proxy_url,
         );
         Ok(())
     }
@@ -945,11 +947,11 @@ impl DataClient for OKXDataClient {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         if let Some(ref mut ws) = self.ws_public {
-            let _ = ws.close().await;
+            let _result = ws.close().await;
         }
 
         if let Some(ref mut ws) = self.ws_business {
-            let _ = ws.close().await;
+            let _result = ws.close().await;
         }
 
         let handles: Vec<_> = self.tasks.drain(..).collect();

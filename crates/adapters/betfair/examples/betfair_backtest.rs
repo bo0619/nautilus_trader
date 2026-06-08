@@ -150,9 +150,13 @@ fn main() -> anyhow::Result<()> {
         engine.add_instrument(instrument)?;
     }
 
-    let actor = BookImbalanceActor::new(instrument_ids, 5000, None);
+    let log_interval: u64 = std::env::var("IMBALANCE_LOG_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    let actor = BookImbalanceActor::new(instrument_ids, log_interval, None);
     engine.add_actor(actor)?;
-    engine.add_data(data, None, true, true);
+    engine.add_data(data, None, true, true)?;
 
     println!("\nRunning backtest...");
     engine.run(None, None, None, false)?;

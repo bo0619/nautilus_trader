@@ -33,7 +33,7 @@ impl BitmexDataClientConfig {
         api_secret = None,
         base_url_http = None,
         base_url_ws = None,
-        http_proxy_url = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
@@ -52,7 +52,7 @@ impl BitmexDataClientConfig {
         api_secret: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
-        http_proxy_url: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -71,8 +71,7 @@ impl BitmexDataClientConfig {
             api_secret,
             base_url_http,
             base_url_ws,
-            http_proxy_url,
-            ws_proxy_url: None,
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
@@ -87,6 +86,7 @@ impl BitmexDataClientConfig {
                 .unwrap_or(defaults.max_requests_per_second),
             max_requests_per_minute: max_requests_per_minute
                 .unwrap_or(defaults.max_requests_per_minute),
+            transport_backend: defaults.transport_backend,
         }
     }
 
@@ -105,7 +105,7 @@ impl BitmexExecClientConfig {
         api_secret = None,
         base_url_http = None,
         base_url_ws = None,
-        http_proxy_url = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
@@ -129,7 +129,7 @@ impl BitmexExecClientConfig {
         api_secret: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
-        http_proxy_url: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -153,8 +153,7 @@ impl BitmexExecClientConfig {
             api_secret,
             base_url_http,
             base_url_ws,
-            http_proxy_url,
-            ws_proxy_url: None,
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
@@ -175,6 +174,7 @@ impl BitmexExecClientConfig {
             submitter_proxy_urls,
             canceller_proxy_urls,
             deadmans_switch_timeout_secs,
+            transport_backend: defaults.transport_backend,
         }
     }
 

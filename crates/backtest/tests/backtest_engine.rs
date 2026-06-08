@@ -38,9 +38,10 @@ use nautilus_indicators::{
     indicator::{Indicator, MovingAverage},
 };
 use nautilus_model::{
-    data::{BarSpecification, BarType, Data, QuoteTick},
+    data::{Bar, BarSpecification, BarType, BookOrder, Data, OrderBookDelta, QuoteTick},
     enums::{
-        AccountType, AggregationSource, BarAggregation, BookType, OmsType, OrderSide, PriceType,
+        AccountType, AggregationSource, BarAggregation, BookAction, BookType, OmsType, OrderSide,
+        PriceType,
     },
     events::OrderFilled,
     identifiers::{ActorId, ExecAlgorithmId, InstrumentId, StrategyId, Venue},
@@ -473,6 +474,45 @@ fn quote_with_size(instrument_id: InstrumentId, bid: &str, ask: &str, size: &str
     ))
 }
 
+fn bid_delta(instrument_id: InstrumentId, price: &str, sequence: u64, ts: u64) -> Data {
+    Data::Delta(OrderBookDelta::new(
+        instrument_id,
+        BookAction::Add,
+        BookOrder::new(
+            OrderSide::Buy,
+            Price::from(price),
+            Quantity::from("1.000"),
+            sequence,
+        ),
+        0,
+        sequence,
+        ts.into(),
+        ts.into(),
+    ))
+}
+
+fn bar_with_aggregation(
+    instrument_id: InstrumentId,
+    aggregation_source: AggregationSource,
+    ts: u64,
+) -> Data {
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Mid),
+        aggregation_source,
+    );
+    Data::Bar(Bar::new(
+        bar_type,
+        Price::from("1000.00"),
+        Price::from("1001.00"),
+        Price::from("999.00"),
+        Price::from("1000.50"),
+        Quantity::from("10.000"),
+        ts.into(),
+        ts.into(),
+    ))
+}
+
 #[rstest]
 fn test_run_with_empty_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let mut engine = create_engine();
@@ -489,6 +529,251 @@ fn test_run_with_empty_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
 }
 
 #[rstest]
+fn test_add_data_rejects_empty(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    engine
+        .add_instrument(&InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+        .unwrap();
+
+    let err = engine.add_data(vec![], None, true, true).unwrap_err();
+    assert!(err.to_string().contains("data was empty"), "got: {err}");
+}
+
+#[rstest]
+fn test_add_data_rejects_unknown_instrument(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument_id = crypto_perpetual_ethusdt.id();
+    // Note: instrument intentionally NOT added to engine.
+
+    let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1)];
+    let err = engine.add_data(quotes, None, true, true).unwrap_err();
+    assert!(
+        err.to_string().contains("not found in the cache"),
+        "got: {err}"
+    );
+}
+
+#[rstest]
+fn test_run_rejects_unsorted_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
+    engine.add_data(quotes, None, true, false).unwrap();
+
+    let err = engine.run(None, None, None, false).unwrap_err();
+    assert!(err.to_string().contains("not sorted"), "got: {err}");
+}
+
+#[rstest]
+fn test_run_rejects_depth_book_without_book_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    // Build an engine with a venue requesting L2 depth, then add only quote
+    // ticks (non-book data) for an instrument. `run` must refuse to start.
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L2_MBP)
+        .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .build();
+    engine.add_venue(venue_config).unwrap();
+
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
+    engine.add_data(quotes, None, true, true).unwrap();
+
+    let err = engine.run(None, None, None, false).unwrap_err();
+    assert!(
+        err.to_string().contains("No order book data found"),
+        "got: {err}",
+    );
+}
+
+#[rstest]
+fn test_add_data_rejects_bar_internal_aggregation(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let bars = vec![bar_with_aggregation(
+        instrument_id,
+        AggregationSource::Internal,
+        1_000_000_000,
+    )];
+    let err = engine.add_data(bars, None, true, true).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("aggregation_source must be External"),
+        "got: {err}",
+    );
+}
+
+#[rstest]
+fn test_run_with_depth_venue_and_book_data_succeeds(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    // Mirror of test_run_rejects_depth_book_without_book_data with deltas added
+    // so the venue's L2 book requirement is satisfied. Catches an inverted
+    // depth-vs-data check that the negative test alone would not detect.
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L2_MBP)
+        .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .build();
+    engine.add_venue(venue_config).unwrap();
+
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let deltas = vec![
+        bid_delta(instrument_id, "1000.00", 1, 1_000_000_000),
+        bid_delta(instrument_id, "1000.50", 2, 2_000_000_000),
+    ];
+    engine.add_data(deltas, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+    assert_eq!(engine.get_result().iterations, 2);
+}
+
+#[rstest]
+fn test_run_depth_check_fires_on_validate_false_path(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    // The depth-vs-data check at run time must fire even when add_data is
+    // called with validate=false (e.g. the catalog-loading path in node.rs).
+    // This locks in the round-1 fix that hoisted has_data/has_book_data
+    // bookkeeping out of the validate branch.
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L2_MBP)
+        .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .build();
+    engine.add_venue(venue_config).unwrap();
+
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
+    engine.add_data(quotes, None, false, true).unwrap();
+
+    let err = engine.run(None, None, None, false).unwrap_err();
+    assert!(
+        err.to_string().contains("No order book data found"),
+        "got: {err}",
+    );
+}
+
+#[rstest]
+fn test_add_data_tracks_global_ts_bounds_when_unsorted(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    // Two add_data calls with sort=false where neither first nor last element
+    // is the global min/max. The engine must still pick the correct global
+    // start/end as defaults so run() processes the full range.
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let batch1 = vec![
+        quote(instrument_id, "1000.00", "1000.10", 300),
+        quote(instrument_id, "1000.50", "1000.60", 100),
+        quote(instrument_id, "1001.00", "1001.10", 200),
+    ];
+    engine.add_data(batch1, None, true, false).unwrap();
+
+    let batch2 = vec![
+        quote(instrument_id, "1002.00", "1002.10", 400),
+        quote(instrument_id, "1003.00", "1003.10", 50),
+    ];
+    engine.add_data(batch2, None, true, false).unwrap();
+
+    engine.sort_data();
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(engine.backtest_start(), Some(UnixNanos::from(50)));
+    assert_eq!(engine.backtest_end(), Some(UnixNanos::from(400)));
+}
+
+#[rstest]
+fn test_sort_data_unblocks_run_after_unsorted_add(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
+    engine.add_data(quotes, None, true, false).unwrap();
+
+    // sort_data flips the sorted flag so run no longer rejects.
+    engine.sort_data();
+    engine.run(None, None, None, false).unwrap();
+}
+
+#[rstest]
+fn test_clear_data_resets_sorted_flag(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    // Pollute sorted=false, then clear, then add a sorted batch and run.
+    engine
+        .add_data(
+            vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)],
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+    engine.clear_data();
+    engine
+        .add_data(
+            vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+}
+
+#[rstest]
+fn test_add_strategies_stops_at_first_error() {
+    // Batch should fail when the second strategy duplicates the first's ID,
+    // and the first strategy must remain registered (fail-fast semantics).
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .build();
+    engine.add_venue(venue_config).unwrap();
+
+    let s1 = EmptyStrategy::new();
+    let s2 = EmptyStrategy::new(); // identical strategy_id
+    let result = engine.add_strategies(vec![s1, s2]);
+    assert!(result.is_err());
+    assert_eq!(
+        engine.kernel().trader.borrow().strategy_count(),
+        1,
+        "first strategy must remain registered after batch fail-fast",
+    );
+}
+
+#[rstest]
 fn test_run_processes_quote_ticks(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let mut engine = create_engine();
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
@@ -500,13 +785,19 @@ fn test_run_processes_quote_ticks(crypto_perpetual_ethusdt: CryptoPerpetual) {
         quote(instrument_id, "1000.50", "1000.60", 2_000_000_000),
         quote(instrument_id, "1001.00", "1001.10", 3_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     let result = engine.run(None, None, None, false);
     assert!(result.is_ok());
 
     let bt_result = engine.get_result();
     assert_eq!(bt_result.iterations, 3);
+
+    // Lifecycle getters must populate after a successful run + end.
+    assert!(engine.run_id().is_some());
+    let bt_start = engine.backtest_start().expect("backtest_start populated");
+    let bt_end = engine.backtest_end().expect("backtest_end populated");
+    assert!(bt_end >= bt_start);
 }
 
 #[rstest]
@@ -530,7 +821,7 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
         quote(instrument_id, "999.00", "1000.00", 8_000_000_000),
         quote(instrument_id, "999.00", "1000.00", 9_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
 
     let cache_rc = engine.kernel().cache();
@@ -595,7 +886,7 @@ fn test_run_with_strategy(crypto_perpetual_ethusdt: CryptoPerpetual) {
         quote(instrument_id, "1000.50", "1000.60", 2_000_000_000),
         quote(instrument_id, "1001.00", "1001.10", 3_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     let result = engine.run(None, None, None, false);
     assert!(result.is_ok());
@@ -619,7 +910,7 @@ fn test_run_with_start_end_bounds(crypto_perpetual_ethusdt: CryptoPerpetual) {
         quote(instrument_id, "1001.00", "1001.10", base + 2_000_000_000),
         quote(instrument_id, "1001.50", "1001.60", base + 3_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     // Only process quotes at t=base+1s and t=base+2s (skip first and last)
     let result = engine.run(
@@ -645,7 +936,7 @@ fn test_reset_preserves_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
         quote(instrument_id, "1000.00", "1000.10", 1_000_000_000),
         quote(instrument_id, "1000.50", "1000.60", 2_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     // First run
     engine.run(None, None, None, false).unwrap();
@@ -669,7 +960,7 @@ fn test_clear_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
     engine.add_instrument(&instrument).unwrap();
 
     let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
     engine.clear_data();
 
     engine.run(None, None, None, false).unwrap();
@@ -732,7 +1023,7 @@ fn test_ema_cross_strategy_generates_orders(crypto_perpetual_ethusdt: CryptoPerp
     }
 
     let total_quotes = quotes.len();
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     engine.run(None, None, None, false).unwrap();
 
@@ -795,6 +1086,349 @@ impl DataActor for ShutdownOnTick {
     }
 }
 
+struct ShutdownBeforeFutureTimer {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    shutdown_after: usize,
+    tick_count: usize,
+    timer_ts: u64,
+    timer_count: std::rc::Rc<Cell<u32>>,
+}
+
+impl ShutdownBeforeFutureTimer {
+    fn new(
+        instrument_id: InstrumentId,
+        shutdown_after: usize,
+        timer_ts: u64,
+        timer_count: std::rc::Rc<Cell<u32>>,
+    ) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("SHUTDOWN-TIMER-001")),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            shutdown_after,
+            tick_count: 0,
+            timer_ts,
+            timer_count,
+        }
+    }
+}
+
+nautilus_strategy!(ShutdownBeforeFutureTimer);
+
+impl Debug for ShutdownBeforeFutureTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ShutdownBeforeFutureTimer))
+            .finish()
+    }
+}
+
+impl DataActor for ShutdownBeforeFutureTimer {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        let timer_ts = self.timer_ts;
+        self.clock()
+            .set_time_alert_ns("future_timer", timer_ts.into(), None, None)?;
+        Ok(())
+    }
+
+    fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        self.tick_count += 1;
+        if self.tick_count == self.shutdown_after {
+            self.shutdown_system(Some("shutdown before future timer".to_string()));
+        }
+        Ok(())
+    }
+
+    fn on_time_event(&mut self, _event: &TimeEvent) -> anyhow::Result<()> {
+        self.timer_count.set(self.timer_count.get() + 1);
+        Ok(())
+    }
+}
+
+#[rstest]
+fn test_non_streaming_shutdown_does_not_fire_future_timers(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let timer_count = std::rc::Rc::new(Cell::new(0));
+    engine
+        .add_strategy(ShutdownBeforeFutureTimer::new(
+            instrument_id,
+            2,
+            2_500_000_000,
+            timer_count.clone(),
+        ))
+        .unwrap();
+
+    let batch = vec![
+        quote(instrument_id, "1000.00", "1000.10", 1_000_000_000),
+        quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
+        quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
+    ];
+    engine.add_data(batch, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(
+        engine.get_result().iterations,
+        2,
+        "Run must stop on the shutdown tick",
+    );
+    assert_eq!(
+        timer_count.get(),
+        0,
+        "Future timer must not fire after shutdown in a non-streaming run",
+    );
+}
+
+struct ShutdownFromTimer {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    shutdown_ts: u64,
+    later_ts: u64,
+    shutdown_fired: std::rc::Rc<Cell<u32>>,
+    later_fired: std::rc::Rc<Cell<u32>>,
+    quote_count: std::rc::Rc<Cell<u32>>,
+}
+
+impl ShutdownFromTimer {
+    fn new(
+        instrument_id: InstrumentId,
+        shutdown_ts: u64,
+        later_ts: u64,
+        shutdown_fired: std::rc::Rc<Cell<u32>>,
+        later_fired: std::rc::Rc<Cell<u32>>,
+        quote_count: std::rc::Rc<Cell<u32>>,
+    ) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("SHUTDOWN-FROM-TIMER-001")),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            shutdown_ts,
+            later_ts,
+            shutdown_fired,
+            later_fired,
+            quote_count,
+        }
+    }
+}
+
+nautilus_strategy!(ShutdownFromTimer);
+
+impl Debug for ShutdownFromTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ShutdownFromTimer)).finish()
+    }
+}
+
+impl DataActor for ShutdownFromTimer {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        let shutdown_ts = self.shutdown_ts;
+        let later_ts = self.later_ts;
+        self.clock()
+            .set_time_alert_ns("shutdown_timer", shutdown_ts.into(), None, None)?;
+        self.clock()
+            .set_time_alert_ns("later_timer", later_ts.into(), None, None)?;
+        Ok(())
+    }
+
+    fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        self.quote_count.set(self.quote_count.get() + 1);
+        Ok(())
+    }
+
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        if event.name.as_str() == "shutdown_timer" {
+            self.shutdown_fired.set(self.shutdown_fired.get() + 1);
+            self.shutdown_system(Some("shutdown from timer".to_string()));
+        } else if event.name.as_str() == "later_timer" {
+            self.later_fired.set(self.later_fired.get() + 1);
+        }
+        Ok(())
+    }
+}
+
+struct ShutdownAndScheduleNewAlert {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    shutdown_ts: u64,
+    new_alert_ts: u64,
+    shutdown_fired: std::rc::Rc<Cell<u32>>,
+    new_alert_fired: std::rc::Rc<Cell<u32>>,
+}
+
+impl ShutdownAndScheduleNewAlert {
+    fn new(
+        instrument_id: InstrumentId,
+        shutdown_ts: u64,
+        new_alert_ts: u64,
+        shutdown_fired: std::rc::Rc<Cell<u32>>,
+        new_alert_fired: std::rc::Rc<Cell<u32>>,
+    ) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("SHUTDOWN-RESCHEDULE-001")),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            shutdown_ts,
+            new_alert_ts,
+            shutdown_fired,
+            new_alert_fired,
+        }
+    }
+}
+
+nautilus_strategy!(ShutdownAndScheduleNewAlert);
+
+impl Debug for ShutdownAndScheduleNewAlert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ShutdownAndScheduleNewAlert))
+            .finish()
+    }
+}
+
+impl DataActor for ShutdownAndScheduleNewAlert {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        let shutdown_ts = self.shutdown_ts;
+        self.clock()
+            .set_time_alert_ns("shutdown_timer", shutdown_ts.into(), None, None)?;
+        Ok(())
+    }
+
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        if event.name.as_str() == "shutdown_timer" {
+            self.shutdown_fired.set(self.shutdown_fired.get() + 1);
+            let new_alert_ts = self.new_alert_ts;
+            self.clock().set_time_alert_ns(
+                "post_shutdown_alert",
+                new_alert_ts.into(),
+                None,
+                None,
+            )?;
+            self.shutdown_system(Some("shutdown and reschedule".to_string()));
+        } else if event.name.as_str() == "post_shutdown_alert" {
+            self.new_alert_fired.set(self.new_alert_fired.get() + 1);
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+fn test_shutdown_handler_scheduling_new_alert_does_not_fire_it(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    // Alerts scheduled by a shutdown handler must not fire on later flushes
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let shutdown_fired = std::rc::Rc::new(Cell::new(0));
+    let new_alert_fired = std::rc::Rc::new(Cell::new(0));
+    engine
+        .add_strategy(ShutdownAndScheduleNewAlert::new(
+            instrument_id,
+            2_500_000_000,
+            2_600_000_000,
+            shutdown_fired.clone(),
+            new_alert_fired.clone(),
+        ))
+        .unwrap();
+
+    let batch = vec![
+        quote(instrument_id, "1000.00", "1000.10", 1_000_000_000),
+        quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
+        quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
+    ];
+    engine.add_data(batch, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(
+        shutdown_fired.get(),
+        1,
+        "Shutdown timer must fire once before requesting shutdown",
+    );
+    assert_eq!(
+        new_alert_fired.get(),
+        0,
+        "Alert scheduled by the shutdown handler must not fire after the stop",
+    );
+}
+
+#[rstest]
+fn test_shutdown_from_timer_during_flush_does_not_fire_later_timers(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    // A timer-triggered shutdown must drop later alerts queued for the same flush
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let shutdown_fired = std::rc::Rc::new(Cell::new(0));
+    let later_fired = std::rc::Rc::new(Cell::new(0));
+    let quote_count = std::rc::Rc::new(Cell::new(0));
+    engine
+        .add_strategy(ShutdownFromTimer::new(
+            instrument_id,
+            2_500_000_000,
+            2_800_000_000,
+            shutdown_fired.clone(),
+            later_fired.clone(),
+            quote_count.clone(),
+        ))
+        .unwrap();
+
+    let batch = vec![
+        quote(instrument_id, "1000.00", "1000.10", 1_000_000_000),
+        quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
+        quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
+    ];
+    engine.add_data(batch, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(
+        shutdown_fired.get(),
+        1,
+        "Shutdown timer must fire once before requesting shutdown",
+    );
+    assert_eq!(
+        later_fired.get(),
+        0,
+        "Later timer must not fire after a timer-initiated shutdown",
+    );
+    assert_eq!(
+        quote_count.get(),
+        2,
+        "Quote arriving after a timer-initiated shutdown must not be delivered",
+    );
+    assert_eq!(
+        engine.kernel().clock.borrow().timestamp_ns().as_u64(),
+        2_500_000_000,
+        "Engine clock must anchor at the shutdown timer ts, not the skipped data ts",
+    );
+}
+
 #[rstest]
 fn test_streaming_shutdown_finalizes_engine(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let mut engine = create_engine();
@@ -811,7 +1445,7 @@ fn test_streaming_shutdown_finalizes_engine(crypto_perpetual_ethusdt: CryptoPerp
         quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
         quote(instrument_id, "1003.00", "1003.10", 4_000_000_000),
     ];
-    engine.add_data(batch, None, true, true);
+    engine.add_data(batch, None, true, true).unwrap();
 
     engine.run(None, None, None, true).unwrap();
 
@@ -846,7 +1480,7 @@ fn test_streaming_shutdown_on_last_tick_finalizes_engine(
         quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
         quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
     ];
-    engine.add_data(batch, None, true, true);
+    engine.add_data(batch, None, true, true).unwrap();
 
     engine.run(None, None, None, true).unwrap();
 
@@ -870,7 +1504,7 @@ fn test_streaming_mode_processes_data_in_batches(crypto_perpetual_ethusdt: Crypt
         quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
         quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
     ];
-    engine.add_data(batch1, None, true, true);
+    engine.add_data(batch1, None, true, true).unwrap();
     engine.run(None, None, None, true).unwrap(); // streaming=true
 
     let result1 = engine.get_result();
@@ -882,7 +1516,7 @@ fn test_streaming_mode_processes_data_in_batches(crypto_perpetual_ethusdt: Crypt
         quote(instrument_id, "1003.00", "1003.10", 4_000_000_000),
         quote(instrument_id, "1004.00", "1004.10", 5_000_000_000),
     ];
-    engine.add_data(batch2, None, true, true);
+    engine.add_data(batch2, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap(); // streaming=false, finalizes
 
     let result2 = engine.get_result();
@@ -905,8 +1539,8 @@ fn test_multiple_add_data_batches_merged(crypto_perpetual_ethusdt: CryptoPerpetu
         quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
         quote(instrument_id, "1003.00", "1003.10", 4_000_000_000),
     ];
-    engine.add_data(batch1, None, true, true);
-    engine.add_data(batch2, None, true, true);
+    engine.add_data(batch1, None, true, true).unwrap();
+    engine.add_data(batch2, None, true, true).unwrap();
 
     engine.run(None, None, None, false).unwrap();
 
@@ -963,7 +1597,7 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
         quote(eth_id, "1001.00", "1001.10", 3_000_000_000),
         quote_with_size(btc_id, "50100.5", "50101.0", "1", 4_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     engine.run(None, None, None, false).unwrap();
 
@@ -1013,7 +1647,7 @@ fn test_strategy_receives_only_subscribed_quotes(crypto_perpetual_ethusdt: Crypt
         ));
     }
 
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
 
     let bt_result = engine.get_result();
@@ -1037,7 +1671,7 @@ fn test_reset_run_produces_same_results(crypto_perpetual_ethusdt: CryptoPerpetua
         quote(instrument_id, "1001.00", "1001.10", 2_000_000_000),
         quote(instrument_id, "1002.00", "1002.10", 3_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     // First run
     engine.run(None, None, None, false).unwrap();
@@ -1069,7 +1703,7 @@ fn test_start_boundary_skips_earlier_data(crypto_perpetual_ethusdt: CryptoPerpet
         quote(instrument_id, "1003.00", "1003.10", 4_000_000_000),
         quote(instrument_id, "1004.00", "1004.10", 5_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     // Start at t=3, should skip first 2 quotes
     engine
@@ -1097,7 +1731,7 @@ fn test_end_boundary_stops_before_later_data(crypto_perpetual_ethusdt: CryptoPer
         quote(instrument_id, "1003.00", "1003.10", 4_000_000_000),
         quote(instrument_id, "1004.00", "1004.10", 5_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     // End at t=3, should process only first 3
     engine
@@ -1129,7 +1763,7 @@ fn test_ema_cross_with_batched_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let flat: Vec<Data> = (0..10u64)
         .map(|i| quote(instrument_id, "1000.00", "1000.10", base_ts + i * interval))
         .collect();
-    engine.add_data(flat, None, true, true);
+    engine.add_data(flat, None, true, true).unwrap();
 
     // Add ramp-up in a separate batch
     let ramp_up: Vec<Data> = (0..15u64)
@@ -1143,7 +1777,7 @@ fn test_ema_cross_with_batched_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
             )
         })
         .collect();
-    engine.add_data(ramp_up, None, true, true);
+    engine.add_data(ramp_up, None, true, true).unwrap();
 
     engine.run(None, None, None, false).unwrap();
 
@@ -1259,7 +1893,7 @@ fn test_cascading_stop_loss_on_fill_settled_same_tick(crypto_perpetual_ethusdt: 
         quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
         quote(instrument_id, "1000.50", "1001.50", 2_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     engine.run(None, None, None, false).unwrap();
 
@@ -1359,7 +1993,7 @@ fn test_all_same_timestamp_timer_commands_settled(crypto_perpetual_ethusdt: Cryp
         quote(instrument_id, "1000.00", "1001.00", 0),
         quote(instrument_id, "1000.50", "1001.50", 60_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
 
     engine.run(None, None, None, false).unwrap();
 
@@ -1427,7 +2061,7 @@ fn test_streaming_no_dummy_bars_past_batch_data(crypto_perpetual_ethusdt: Crypto
     let batch1: Vec<Data> = (1..=10u64)
         .map(|i| quote(instrument_id, "1000.00", "1000.10", i * 1_000_000_000))
         .collect();
-    engine.add_data(batch1, None, true, true);
+    engine.add_data(batch1, None, true, true).unwrap();
 
     // Run with end far past data (100s), streaming=true.
     // Without the fix, timers fire from 10s to 100s producing ~18 dummy bars.
@@ -1450,7 +2084,7 @@ fn test_streaming_no_dummy_bars_past_batch_data(crypto_perpetual_ethusdt: Crypto
     let batch2: Vec<Data> = (20..=30u64)
         .map(|i| quote(instrument_id, "1001.00", "1001.10", i * 1_000_000_000))
         .collect();
-    engine.add_data(batch2, None, true, true);
+    engine.add_data(batch2, None, true, true).unwrap();
     engine
         .run(None, Some(UnixNanos::from(30_000_000_000u64)), None, false)
         .unwrap();
@@ -1484,7 +2118,7 @@ fn test_streaming_end_flushes_tail_timers(crypto_perpetual_ethusdt: CryptoPerpet
     let batch: Vec<Data> = (1..=10u64)
         .map(|i| quote(instrument_id, "1000.00", "1000.10", i * 1_000_000_000))
         .collect();
-    engine.add_data(batch, None, true, true);
+    engine.add_data(batch, None, true, true).unwrap();
 
     // Node-style workflow: all batches use streaming=true, finalize with end()
     let end = Some(UnixNanos::from(20_000_000_000u64));
@@ -1589,7 +2223,7 @@ fn test_iteration_advances_with_data(crypto_perpetual_ethusdt: CryptoPerpetual) 
         quote(instrument_id, "1000.50", "1000.60", 2_000_000_000),
         quote(instrument_id, "1001.00", "1001.10", 3_000_000_000),
     ];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
 
     assert_eq!(engine.iteration(), 3);
@@ -1617,7 +2251,7 @@ fn test_add_venue_with_queue_position(crypto_perpetual_ethusdt: CryptoPerpetual)
     engine.add_instrument(&instrument).unwrap();
 
     let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
     assert_eq!(engine.get_result().iterations, 1);
 }
@@ -1644,7 +2278,7 @@ fn test_add_venue_with_oto_full_trigger(crypto_perpetual_ethusdt: CryptoPerpetua
     engine.add_instrument(&instrument).unwrap();
 
     let quotes = vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)];
-    engine.add_data(quotes, None, true, true);
+    engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
     assert_eq!(engine.get_result().iterations, 1);
 }

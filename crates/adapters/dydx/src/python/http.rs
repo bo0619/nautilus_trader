@@ -52,12 +52,15 @@ impl DydxHttpClient {
     /// - Provides standard cache methods: `cache_instruments()`, `cache_instrument()`, `get_instrument()`.
     /// - Tracks cache initialization state for optimizations.
     #[new]
-    #[pyo3(signature = (base_url=None, network=DydxNetwork::Mainnet))]
-    fn py_new(base_url: Option<String>, network: DydxNetwork) -> PyResult<Self> {
+    #[pyo3(signature = (base_url=None, network=DydxNetwork::Mainnet, proxy_url=None))]
+    fn py_new(
+        base_url: Option<String>,
+        network: DydxNetwork,
+        proxy_url: Option<String>,
+    ) -> PyResult<Self> {
         Self::new(
-            base_url, 60,   // timeout_secs
-            None, // proxy_url
-            network, None, // retry_config
+            base_url, 60, // timeout_secs
+            proxy_url, network, None, // retry_config
         )
         .map_err(to_pyvalue_err)
     }
@@ -451,6 +454,43 @@ impl DydxHttpClient {
 
             Python::attach(|py| {
                 let pylist = PyList::new(py, trades.into_iter().map(|t| t.into_py_any_unwrap(py)))?;
+                Ok(pylist.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Requests historical funding rates for an instrument.
+    ///
+    /// Fetches funding rate data from the dYdX Indexer API's
+    /// `/v4/historicalFunding/:ticker` endpoint and converts them to Nautilus
+    /// `FundingRateUpdate` objects.
+    ///
+    /// Results are returned in chronological order (oldest first).
+    #[pyo3(name = "request_funding_rates")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None))]
+    fn py_request_funding_rates<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let funding_rates = client
+                .request_funding_rates(instrument_id, start, end, limit)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist = PyList::new(
+                    py,
+                    funding_rates
+                        .into_iter()
+                        .map(|rate| rate.into_py_any_unwrap(py)),
+                )?;
                 Ok(pylist.into_py_any_unwrap(py))
             })
         })

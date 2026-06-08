@@ -96,8 +96,11 @@ pub fn duration_since_unix_epoch() -> Duration {
 /// Returns the current wall-clock time as [`SystemTime`].
 ///
 /// Under simulation (`simulation` + `cfg(madsim)`), returns virtual wall-clock
-/// time from the madsim deterministic scheduler. Under normal builds, returns
-/// [`SystemTime::now()`].
+/// time from the madsim deterministic scheduler when called from inside a
+/// madsim runtime. When called outside a runtime (e.g. plain `#[rstest]` test
+/// bodies), falls back to [`SystemTime::now()`], which under `cfg(madsim)` is
+/// libc-intercepted by madsim and resolves to the same real syscall it would
+/// in a normal build. Under normal builds, returns [`SystemTime::now()`].
 ///
 /// This is the wall-clock seam. It preserves Unix-epoch semantics (unlike
 /// `tokio::time::Instant` which is monotonic and carries no epoch).
@@ -110,7 +113,15 @@ fn wall_clock_now() -> SystemTime {
     }
     #[cfg(all(feature = "simulation", madsim))]
     {
-        madsim::time::TimeHandle::current().now_time()
+        // `try_current` returns `None` when no madsim runtime is active.
+        // Falling back to `SystemTime::now()` matches what madsim's own libc
+        // shim does for `clock_gettime` outside a runtime; production paths
+        // running under simulation are always inside a runtime, so they
+        // continue to receive virtual time.
+        match madsim::time::TimeHandle::try_current() {
+            Some(handle) => handle.now_time(),
+            None => SystemTime::now(),
+        }
     }
 }
 
@@ -839,5 +850,26 @@ mod tests {
 
         // Ensure the reader actually observed updates (not vacuously satisfied)
         assert!(max_observed > 0, "Reader must observe writer updates");
+    }
+
+    // The wall-clock seam (`wall_clock_now`) routes through madsim's virtual
+    // clock under simulation. Sleeping for 60 virtual seconds must advance
+    // the value returned by `nanos_since_unix_epoch` by 60s in wall-clock
+    // terms. If the cfg gate fell through to `SystemTime::now()`, the elapsed
+    // value would only reflect real wall-clock time (~0ms) and the assertion
+    // would fail.
+    #[cfg(all(feature = "simulation", madsim))]
+    #[madsim::test]
+    async fn test_wall_clock_advances_with_virtual_time() {
+        let before = nanos_since_unix_epoch();
+        madsim::time::sleep(std::time::Duration::from_secs(60)).await;
+        let after = nanos_since_unix_epoch();
+
+        let elapsed_ns = after.saturating_sub(before);
+        let sixty_seconds_ns = 60 * NANOSECONDS_IN_SECOND;
+        assert!(
+            elapsed_ns >= sixty_seconds_ns,
+            "wall clock did not advance by full virtual sleep: elapsed={elapsed_ns}ns"
+        );
     }
 }

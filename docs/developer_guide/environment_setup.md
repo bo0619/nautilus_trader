@@ -22,6 +22,58 @@ mind (use `std::path::Path`, avoid Bash-isms in shell scripts, etc.).
 
 The following steps are for UNIX-like systems, and only need to be completed once.
 
+### Quick setup
+
+Use this as a compact setup path for a new Linux or macOS development machine. The detailed
+sections below explain each step and cover alternatives.
+
+Install platform tools first:
+
+```bash tab="Ubuntu"
+sudo apt-get update
+sudo apt-get install -y build-essential clang lld curl git make pkg-config
+```
+
+```bash tab="macOS"
+xcode-select --install
+```
+
+Then clone the repository and install the pinned project tools:
+
+```bash
+git clone --branch develop https://github.com/nautechsystems/nautilus_trader
+cd nautilus_trader
+
+curl https://sh.rustup.rs -sSf | sh
+source "$HOME/.cargo/env"
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+cargo install cargo-binstall --locked
+make install-tools
+./scripts/install-capnp.sh
+
+uv sync --all-groups --all-extras
+source .venv/bin/activate
+
+export PYO3_PYTHON="$PWD/.venv/bin/python"
+
+if [ "$(uname -s)" = "Linux" ]; then
+  PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+  export LD_LIBRARY_PATH="$PYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+export PYTHONHOME="$("$PYO3_PYTHON" -c 'import sys; print(sys.base_prefix)')"
+
+prek install
+make build-debug
+```
+
+Windows users should follow the source installation steps in the
+[installation guide](../getting_started/installation.md#from-source), then use the relevant commands
+from this guide.
+
 ### 1. Install dependencies
 
 Follow the [installation guide](../getting_started/installation.md) to set up the project with a modification to the final command to install development and test dependencies:
@@ -109,19 +161,19 @@ Make sure the Rust compiler reports **zero errors** -- broken builds slow everyo
 
 ### 4. Configure environment variables
 
-**Required for Rust/PyO3 (Linux and macOS)**: When using Python installed via `uv` on Linux or macOS, set the following environment variables:
+**Required for Rust/PyO3 (Linux and macOS)**: When using Python installed via `uv` on Linux or
+macOS, set the following environment variables from the repository root after `uv sync`:
 
 ```bash
-# Add to your shell configuration (e.g., ~/.zshrc or ~/.bashrc)
-
-# Linux only: Set the library path for the Python interpreter
-export LD_LIBRARY_PATH="$(python -c 'import sys; print(sys.base_prefix)')/lib:$LD_LIBRARY_PATH"
-
 # Set the Python executable path for PyO3
-export PYO3_PYTHON=$(pwd)/.venv/bin/python
+export PYO3_PYTHON="$PWD/.venv/bin/python"
+
+# Linux only: Set the library path for the uv-managed Python runtime
+PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+export LD_LIBRARY_PATH="$PYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Set the Python home path (required for Rust tests)
-export PYTHONHOME=$(python -c "import sys; print(sys.base_prefix)")
+export PYTHONHOME="$("$PYO3_PYTHON" -c 'import sys; print(sys.base_prefix)')"
 ```
 
 :::note
@@ -146,22 +198,36 @@ echo "PYTHONHOME: $PYTHONHOME"
 Python dependencies are managed by [uv](https://docs.astral.sh/uv). The `[tool.uv]` section in
 `pyproject.toml` enforces two supply chain safety settings:
 
-- **`required-version = "==0.11.2"`**: all developers and CI use the same uv version. The version
-  is extracted by `scripts/uv-version.sh` for Makefile, CI, and Docker builds.
+- **`required-version = "==0.11.8"`**: all developers and CI use the same uv version. The version
+  is extracted by `scripts/uv-version.sh` for Makefile, CI, and Docker builds. If your local uv
+  drifts off the pin, `uv lock`/`uv sync` will fail with `Required uv version ... does not match the
+  running version ...`. Run `make update-uv` to install the pinned version (or follow uv's own
+  `uv self update <version>` hint).
 - **`exclude-newer = "3 days"`**: `uv lock` ignores package versions published within the last
   3 days. This gives the community time to detect and quarantine compromised releases before they
-  enter the lockfile.
+  enter the lockfile. The value accepts an RFC 3339 timestamp (`"2026-03-30T00:00:00Z"`), a friendly
+  duration (`"3 days"`, `"1 week"`, `"24 hours"`), or an ISO 8601 duration (`"P3D"`, `"P1W"`,
+  `"PT24H"`). uv 0.11.8+ stores the friendly/ISO form as `exclude-newer-span` inside `uv.lock` and
+  emits a sentinel `exclude-newer` timestamp alongside it for backwards compatibility; both
+  lockfiles in this repo use that format.
 
 ### Bypassing the cooldown
 
 When a security patch or critical bug fix must be pulled in immediately, override `exclude-newer`
-on the command line:
+on the command line. All forms accept a timestamp, friendly duration, or ISO duration; package
+overrides additionally accept `false` to exempt a package from the cooldown entirely.
 
 ```bash
-# Disable the cooldown for a single package
+# Shorten the cooldown for a single package (friendly duration)
+uv lock --exclude-newer-package "somepackage=1 day"
+
+# Pin a single package to an absolute cutoff
 uv lock --exclude-newer-package "somepackage=2026-03-30T00:00:00Z"
 
-# Disable the cooldown entirely for this resolution
+# Exempt a single package from the cooldown entirely
+uv lock --exclude-newer-package "somepackage=false"
+
+# Disable the cooldown for the whole resolution
 uv lock --exclude-newer "0 seconds"
 ```
 
@@ -171,7 +237,8 @@ unchanged for subsequent runs.
 ### Updating uv
 
 To update the pinned uv version, change `required-version` in both `pyproject.toml` and
-`python/pyproject.toml`, then update the `rev` in `.pre-commit-config.yaml` to match.
+`python/pyproject.toml`, then update the `rev` in `.pre-commit-config.yaml` to match. Run
+`make update-uv` to install the new pinned version locally.
 
 ## Builds
 

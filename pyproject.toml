@@ -1,6 +1,6 @@
 [project]
 name = "nautilus_trader"
-version = "1.226.0"
+version = "1.227.0"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
@@ -76,12 +76,12 @@ generate-setup-file = false
 [project.optional-dependencies]
 betfair = ["betfair-parser==0.19.1"] # Pinned to 0.19.1 for stability
 ib = [
-  "defusedxml>=0.7.1,<1.0.0; python_version < '3.14'",
-  "nautilus-ibapi==10.45.1; python_version < '3.14'",
-  "protobuf==5.29.5; python_version < '3.14'", # Pinned to 5.29.5 (fixes GHSA-8qvm-5x2c-j2w7)
+  "defusedxml>=0.7.1,<1.0.0",
+  "nautilus-ibapi==10.45.1",
+  "protobuf==5.29.5", # Pinned to 5.29.5 (fixes GHSA-8qvm-5x2c-j2w7)
 ]
 docker = ["docker>=7.1.0,<8.0.0"]
-polymarket = ["py-clob-client>=0.34.6,<1.0.0"]
+polymarket = ["py-clob-client-v2>=1.0.0,<2.0.0"]
 visualization = [
   "plotly>=6.7.0,<7.0.0",
   "kaleido>=1.2.0,<2.0.0",
@@ -93,9 +93,9 @@ dev = [
   "cython==3.2.4", # Pinned to 3.2.4 for stability
   "jupytext>=1.19.1,<2.0.0",
   "setuptools>=82",
-  "mypy==1.20.1,<2.0.0", # Pinned to 1.20.1 (keep in line with .pre-commit-config.yaml)
+  "mypy==1.20.2,<2.0.0", # Pinned to 1.20.2 (keep in line with .pre-commit-config.yaml)
   "pandas-stubs>=2.3.3,<3.0.0",
-  "ruff==0.15.11", # Pinned to 0.15.11 (keep in line with .pre-commit-config.yaml)
+  "ruff==0.15.12", # Pinned to 0.15.12 (keep in line with .pre-commit-config.yaml)
   "types-pytz>=2026.1,<2027.0",
   "types-toml>=0.10.2,<1.0.0",
 ]
@@ -121,7 +121,7 @@ docs = [
 ]
 
 [tool.uv]
-required-version = "==0.11.7"
+required-version = "==0.11.8"
 exclude-newer = "3 days"
 
 [tool.isort]

@@ -208,7 +208,7 @@ impl HyperliquidExecutionClient {
         let mut http_client = HyperliquidHttpClient::with_secrets(
             &secrets,
             config.http_timeout_secs,
-            config.http_proxy_url.clone(),
+            config.proxy_url.clone(),
         )
         .context("failed to create Hyperliquid HTTP client")?;
 
@@ -227,8 +227,13 @@ impl HyperliquidExecutionClient {
         }
 
         let ws_url = config.base_url_ws.clone();
-        let ws_client =
-            HyperliquidWebSocketClient::new(ws_url, config.environment, Some(core.account_id));
+        let ws_client = HyperliquidWebSocketClient::new(
+            ws_url,
+            config.environment,
+            Some(core.account_id),
+            config.transport_backend,
+            config.proxy_url.clone(),
+        );
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -451,13 +456,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
         self.core.set_started();
 
         log::info!(
-            "Started: client_id={}, account_id={}, environment={:?}, vault_address={:?}, http_proxy_url={:?}, ws_proxy_url={:?}",
+            "Started: client_id={}, account_id={}, environment={:?}, vault_address={:?}, proxy_url={:?}",
             self.core.client_id,
             self.core.account_id,
             self.config.environment,
             self.config.vault_address,
-            self.config.http_proxy_url,
-            self.config.ws_proxy_url,
+            self.config.proxy_url,
         );
 
         Ok(())
@@ -942,6 +946,13 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let client_order_id = cmd.client_order_id;
         let old_venue_order_id = venue_order_id;
 
+        // Mark the old venue_order_id as in-flight before the HTTP await so
+        // the WS cancel handler can suppress the cancel-replace old leg even
+        // when the WS message arrives before the HTTP response. The marker is
+        // cleared on any failure path so a failed modify never leaves stale
+        // race state behind.
+        dispatch_state.mark_pending_modify(client_order_id, old_venue_order_id);
+
         self.spawn_task("modify_order", async move {
             let action = HyperliquidExecAction::Modify {
                 modify: HyperliquidExecModifyOrderRequest {
@@ -955,22 +966,19 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     if response.is_ok() {
                         if let Some(inner_error) = extract_inner_error(&response) {
                             log::warn!("Order modification rejected by exchange: {inner_error}");
+                            dispatch_state.clear_pending_modify(&client_order_id);
                         } else {
-                            // Mark the old venue_order_id as in-flight only
-                            // after a confirmed HTTP success. A failed modify
-                            // never leaves stale race state behind, so the
-                            // cancel-before-accept branch never fires on a
-                            // cancel following an independent failed modify.
-                            dispatch_state.mark_pending_modify(client_order_id, old_venue_order_id);
                             log::info!("Order modified successfully: {response:?}");
                         }
                     } else {
                         let error_msg = extract_error_message(&response);
                         log::warn!("Order modification rejected by exchange: {error_msg}");
+                        dispatch_state.clear_pending_modify(&client_order_id);
                     }
                 }
                 Err(e) => {
                     log::warn!("Order modification HTTP request failed: {e}");
+                    dispatch_state.clear_pending_modify(&client_order_id);
                 }
             }
 
@@ -1901,10 +1909,11 @@ fn handle_execution_report(
                 emitter.send_fill_report(fill_report);
             }
 
-            // If this fill matches a deferred FILLED marker, drop the cloid
-            // mapping now that the fill has landed.
+            // Skip cleanup while a cancel-replace fill is buffered; the
+            // replacement ACCEPTED still needs to resolve the cloid (GH-3972).
             if let Some(id) = client_order_id
                 && pending_filled_cloids.contains(&id)
+                && dispatch_state.buffered_fill_count(&id) == 0
             {
                 pending_filled_cloids.remove(&id);
                 let cloid = Cloid::from_client_order_id(id);
@@ -1934,6 +1943,7 @@ mod tests {
         reports::{FillReport, OrderStatusReport},
         types::{Currency, Money, Price, Quantity},
     };
+    use nautilus_network::websocket::TransportBackend;
     use rstest::rstest;
     use ustr::Ustr;
 
@@ -1980,6 +1990,8 @@ mod tests {
         HyperliquidWebSocketClient::new(
             Some("wss://test.invalid".to_string()),
             HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
             None,
         )
     }
@@ -2387,6 +2399,67 @@ mod tests {
         ));
         // Deferred cleanup fires once the fill lands.
         assert_eq!(ws_client.get_cloid_mapping(&cloid_for("O-HER-FILL")), None);
+    }
+
+    /// GH-3972: when a status-only `FILLED` marker arrives before both the
+    /// buffered fill and the replacement `ACCEPTED(new_voi)`, the cloid
+    /// mapping must NOT be evicted on the buffered fill: otherwise the later
+    /// `ACCEPTED` cannot resolve the cloid and the buffered fill is stranded.
+    #[rstest]
+    fn test_handle_execution_report_buffered_fill_preserves_cloid_under_filled_marker() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-BUF");
+        state.register_identity(cid, test_identity());
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new("old-voi"));
+        state.mark_pending_modify(cid, VenueOrderId::new("old-voi"));
+
+        ws_client.cache_cloid_mapping(cloid_for("O-HER-BUF"), cid);
+
+        // Status-only FILLED marker arrives first; defers cloid eviction.
+        let status_marker = make_status_report(Some("O-HER-BUF"), "new-voi", OrderStatus::Filled);
+        handle_execution_report(
+            ExecutionReport::Order(status_marker),
+            &state,
+            &emitter,
+            &ws_client,
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+        assert!(pending_cloids.contains(&cid));
+        assert_eq!(
+            ws_client.get_cloid_mapping(&cloid_for("O-HER-BUF")),
+            Some(cid)
+        );
+
+        // Fill carrying the new venue_order_id arrives before ACCEPTED. It is
+        // buffered; the cloid mapping must be preserved so the eventual
+        // ACCEPTED can still resolve and drain the buffer.
+        let fill = make_fill_report(Some("O-HER-BUF"), "new-voi", "trade-buf");
+        handle_execution_report(
+            ExecutionReport::Fill(fill),
+            &state,
+            &emitter,
+            &ws_client,
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        assert_eq!(state.buffered_fill_count(&cid), 1);
+        assert!(drain_events(&mut rx).is_empty());
+        assert!(
+            pending_cloids.contains(&cid),
+            "deferred cleanup must remain armed until the buffered fill drains",
+        );
+        assert_eq!(
+            ws_client.get_cloid_mapping(&cloid_for("O-HER-BUF")),
+            Some(cid),
+            "cloid mapping must survive a buffered fill so the later ACCEPTED resolves",
+        );
     }
 
     #[rstest]

@@ -120,7 +120,7 @@ impl OKXExecutionClient {
             config.retry_delay_initial_ms,
             config.retry_delay_max_ms,
             config.environment,
-            config.http_proxy_url.clone(),
+            config.proxy_url.clone(),
         )?;
 
         let account_id = core.account_id;
@@ -133,6 +133,8 @@ impl OKXExecutionClient {
             Some(account_id),
             Some(OKX_WS_HEARTBEAT_SECS),
             None,
+            config.transport_backend,
+            config.proxy_url.clone(),
         )
         .context("failed to construct OKX private websocket client")?;
 
@@ -144,6 +146,8 @@ impl OKXExecutionClient {
             Some(account_id),
             Some(OKX_WS_HEARTBEAT_SECS),
             None,
+            config.transport_backend,
+            config.proxy_url.clone(),
         )
         .context("failed to construct OKX business websocket client")?;
 
@@ -1170,7 +1174,7 @@ impl ExecutionClient for OKXExecutionClient {
         });
 
         log::info!(
-            "Started: client_id={}, account_id={}, account_type={:?}, trade_mode={:?}, instrument_types={:?}, use_fills_channel={}, environment={}, http_proxy_url={:?}, ws_proxy_url={:?}",
+            "Started: client_id={}, account_id={}, account_type={:?}, trade_mode={:?}, instrument_types={:?}, use_fills_channel={}, environment={}, proxy_url={:?}",
             self.core.client_id,
             self.core.account_id,
             self.core.account_type,
@@ -1178,8 +1182,7 @@ impl ExecutionClient for OKXExecutionClient {
             self.config.instrument_types,
             self.config.use_fills_channel,
             self.config.environment,
-            self.config.http_proxy_url,
-            self.config.ws_proxy_url,
+            self.config.proxy_url,
         );
         Ok(())
     }

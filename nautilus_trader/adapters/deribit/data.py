@@ -163,6 +163,7 @@ class DeribitDataClient(LiveMarketDataClient):
             api_secret=config.api_secret,
             heartbeat_interval=DERIBIT_WS_HEARTBEAT_SECS,
             environment=environment,
+            proxy_url=config.proxy_url,
         )
         self._ws_client_futures: set[asyncio.Future] = set()
 
@@ -695,7 +696,6 @@ class DeribitDataClient(LiveMarketDataClient):
             )
         except Exception as e:
             self._log.error(f"Failed to request forward prices for {request.underlying}: {e}")
-            # Send empty response so engine can fall back
             self._handle_forward_prices([], request.id, request.params or {})
             return
 

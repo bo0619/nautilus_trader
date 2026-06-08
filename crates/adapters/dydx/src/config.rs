@@ -18,7 +18,7 @@
 use std::num::NonZeroU32;
 
 use nautilus_model::identifiers::{AccountId, TraderId};
-use nautilus_network::ratelimiter::quota::Quota;
+use nautilus_network::{ratelimiter::quota::Quota, websocket::TransportBackend};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -121,6 +121,13 @@ pub struct DydxAdapterConfig {
     /// When `None`, rate limiting is disabled.
     #[serde(default = "default_grpc_rate_limit_per_second")]
     pub grpc_rate_limit_per_second: Option<u32>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[serde(default)]
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 fn default_max_retries() -> u32 {
@@ -266,10 +273,12 @@ pub struct DydxDataClientConfig {
     #[serde(default)]
     #[builder(default)]
     pub network: DydxNetwork,
-    /// HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[serde(default)]
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl DydxDataClientConfig {
@@ -350,6 +359,12 @@ pub struct DydxExecClientConfig {
     /// When `None`, rate limiting is disabled.
     #[serde(default = "default_grpc_rate_limit_per_second")]
     pub grpc_rate_limit_per_second: Option<u32>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[serde(default)]
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for DydxExecClientConfig {

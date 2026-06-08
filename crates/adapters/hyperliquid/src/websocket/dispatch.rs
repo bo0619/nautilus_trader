@@ -41,16 +41,15 @@
 //! observe a spurious termination.
 //!
 //! The pending-modify marker (keyed on `client_order_id`) is set by
-//! `modify_order` only after a successful HTTP round-trip and cleared on the
-//! matching `ACCEPTED`. It lets dispatch skip an early
-//! `CANCELED(old_voi)` that arrives before the replacement `ACCEPTED(new_voi)`
-//! on the WebSocket. The documented transport-timeout + WS-race window still
-//! applies: if the modify HTTP call fails but the venue actually accepted it,
-//! no marker is set, so a cancel-before-accept race in that window would
-//! surface as `OrderCanceled`. This matches the Python behaviour we are
-//! porting and is the simplest correct answer; verifying the venue-side
-//! outcome before emitting would require speculative waiting that drops
-//! latency without improving correctness.
+//! `modify_order` before the HTTP call and cleared on either the matching
+//! `ACCEPTED(new_voi)` or any modify failure. It lets dispatch skip an
+//! early `CANCELED(old_voi)` that arrives before the replacement
+//! `ACCEPTED(new_voi)` on the WebSocket, regardless of whether the WS
+//! message races ahead of the HTTP response.
+//!
+//! [`dispatch_fill_report`] buffers fills for in-flight cancel-replace
+//! modifies into [`WsDispatchState::buffered_fills`]; `handle_accepted`
+//! drains them on the replacement ACCEPTED. See GH-3972.
 
 use std::{
     collections::VecDeque,
@@ -203,12 +202,18 @@ pub struct WsDispatchState {
     /// replacement leg of a Hyperliquid modify and emitted as `OrderUpdated`.
     pub cached_venue_order_ids: DashMap<ClientOrderId, VenueOrderId>,
     /// Maps `client_order_id` to the old venue order id of an in-flight
-    /// modify. Populated by `modify_order` only after a successful HTTP
-    /// round-trip and cleared on the matching `ACCEPTED(new_voi)`. A
-    /// `CANCELED(old_voi)` arriving while the marker is set is treated as
-    /// the cancel leg of a cancel-before-accept race and suppressed so the
-    /// later `ACCEPTED(new_voi)` can flow through the `OrderUpdated` path.
+    /// modify. Populated by `modify_order` before the HTTP call so the WS
+    /// cancel handler sees the marker even when `CANCELED(old_voi)` arrives
+    /// before the HTTP response. Cleared on the matching `ACCEPTED(new_voi)`
+    /// or on any modify failure. A `CANCELED(old_voi)` arriving while the
+    /// marker is set is treated as the cancel leg of a cancel-before-accept
+    /// race and suppressed so the later `ACCEPTED(new_voi)` can flow through
+    /// the `OrderUpdated` path.
     pub pending_modify_keys: DashMap<ClientOrderId, VenueOrderId>,
+    /// `FillReport`s buffered while a cancel-replace modify is in flight,
+    /// drained by the cancel-replace branch of `handle_accepted`. See
+    /// GH-3972.
+    pub buffered_fills: DashMap<ClientOrderId, Vec<FillReport>>,
     /// Cumulative filled quantity per tracked order. Compared against
     /// `OrderIdentity::quantity` to decide when to clean up tracked state.
     pub order_filled_qty: DashMap<ClientOrderId, Quantity>,
@@ -224,6 +229,7 @@ impl Default for WsDispatchState {
             emitted_trades: Mutex::new(BoundedDedup::new(DEDUP_CAPACITY)),
             cached_venue_order_ids: DashMap::new(),
             pending_modify_keys: DashMap::new(),
+            buffered_fills: DashMap::new(),
             order_filled_qty: DashMap::new(),
             clearing: AtomicBool::new(false),
         }
@@ -330,6 +336,31 @@ impl WsDispatchState {
         self.pending_modify_keys.get(client_order_id).map(|r| *r)
     }
 
+    /// Buffers a `FillReport` arrived during an in-flight cancel-replace.
+    pub fn buffer_fill(&self, client_order_id: ClientOrderId, fill: FillReport) {
+        self.buffered_fills
+            .entry(client_order_id)
+            .or_default()
+            .push(fill);
+    }
+
+    /// Removes and returns buffered fills for the cid, in arrival order.
+    #[must_use]
+    pub fn drain_buffered_fills(&self, client_order_id: &ClientOrderId) -> Vec<FillReport> {
+        self.buffered_fills
+            .remove(client_order_id)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    /// Number of buffered fills for the cid.
+    #[must_use]
+    pub fn buffered_fill_count(&self, client_order_id: &ClientOrderId) -> usize {
+        self.buffered_fills
+            .get(client_order_id)
+            .map_or(0, |r| r.len())
+    }
+
     /// Records cumulative filled quantity for a tracked order.
     pub fn record_filled_qty(&self, client_order_id: ClientOrderId, qty: Quantity) {
         self.order_filled_qty.insert(client_order_id, qty);
@@ -350,6 +381,7 @@ impl WsDispatchState {
         self.emitted_accepted.remove(client_order_id);
         self.cached_venue_order_ids.remove(client_order_id);
         self.pending_modify_keys.remove(client_order_id);
+        self.buffered_fills.remove(client_order_id);
         self.order_filled_qty.remove(client_order_id);
     }
 
@@ -478,6 +510,24 @@ pub fn dispatch_fill_report(
         return DispatchOutcome::External;
     };
 
+    // Buffer fills for an in-flight cancel-replace. Marker required so a
+    // stale old-leg fill after promotion falls through instead of being
+    // stranded; a delayed earlier-leg fill during a chained modify is a
+    // known limitation. See GH-3972.
+    if state.pending_modify(&client_order_id).is_some()
+        && let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
+        && report.venue_order_id != cached_voi
+    {
+        log::debug!(
+            "Buffering cancel-replace fill for {client_order_id}: \
+             report_voi={}, cached_voi={cached_voi}, trade_id={}",
+            report.venue_order_id,
+            report.trade_id,
+        );
+        state.buffer_fill(client_order_id, report.clone());
+        return DispatchOutcome::Tracked;
+    }
+
     if state.check_and_insert_trade(report.trade_id) {
         log::debug!(
             "Skipping duplicate fill for {client_order_id}: trade_id={}",
@@ -585,6 +635,13 @@ fn handle_accepted(
             false,
         );
         emitter.send_order_event(OrderEventAny::Updated(updated));
+
+        // Drain buffered fills. Bypasses `handle_execution_report`;
+        // FIFO-bounded caches make any residue benign. See GH-3972.
+        let buffered = state.drain_buffered_fills(&client_order_id);
+        for fill in buffered {
+            dispatch_fill_report(&fill, state, emitter, ts_init);
+        }
         return DispatchOutcome::Tracked;
     }
 
@@ -686,9 +743,9 @@ fn handle_canceled(
 
     // Cancel-before-accept race: an in-flight modify may deliver
     // CANCELED(old_voi) before the replacement ACCEPTED(new_voi). The
-    // pending marker (set only after a confirmed modify HTTP success) lets
-    // us suppress the old leg so the later ACCEPTED can route through
-    // OrderUpdated. See GH-3827.
+    // pending marker (set before the modify HTTP call and cleared on
+    // failure) lets us suppress the old leg so the later ACCEPTED can route
+    // through OrderUpdated. See GH-3827.
     if let Some(pending_old) = state.pending_modify(&client_order_id)
         && pending_old == venue_order_id
     {

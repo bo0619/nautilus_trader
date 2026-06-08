@@ -16,6 +16,7 @@
 //! Configuration structures for the Coinbase adapter.
 
 use nautilus_model::enums::AccountType;
+use nautilus_network::websocket::TransportBackend;
 
 use crate::common::{
     enums::{CoinbaseEnvironment, CoinbaseMarginType},
@@ -41,10 +42,8 @@ pub struct CoinbaseDataClientConfig {
     pub base_url_rest: Option<String>,
     /// Override for the WebSocket market data URL.
     pub base_url_ws: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The Coinbase environment to connect to.
     #[builder(default)]
     pub environment: CoinbaseEnvironment,
@@ -63,6 +62,9 @@ pub struct CoinbaseDataClientConfig {
     /// from periodic `/products/{id}` fetches.
     #[builder(default = 15)]
     pub derivatives_poll_interval_secs: u64,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for CoinbaseDataClientConfig {
@@ -126,10 +128,8 @@ pub struct CoinbaseExecClientConfig {
     pub base_url_rest: Option<String>,
     /// Override for the WebSocket user data URL.
     pub base_url_ws: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The Coinbase environment to connect to.
     #[builder(default)]
     pub environment: CoinbaseEnvironment,
@@ -145,8 +145,8 @@ pub struct CoinbaseExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 5000)]
     pub retry_delay_max_ms: u64,
-    /// Nautilus account type for the factory. The Cash factory ignores this and
-    /// hardcodes Cash; the derivatives factory sets it to Margin.
+    /// Selects the execution scope: `Cash` for spot, `Margin` for CFM
+    /// derivatives. `CoinbaseExecutionClientFactory` rejects other values.
     #[builder(default = AccountType::Cash)]
     pub account_type: AccountType,
     /// Optional default margin type applied to derivatives orders. Ignored on
@@ -155,6 +155,14 @@ pub struct CoinbaseExecClientConfig {
     /// Optional default leverage applied to derivatives orders. Ignored on
     /// Cash accounts.
     pub default_leverage: Option<rust_decimal::Decimal>,
+    /// CDP retail portfolio UUID required when the API key is bound to a
+    /// non-default portfolio. When unset, the venue uses the key's default
+    /// portfolio. Coinbase rejects orders with `"account is not available"`
+    /// if the portfolio is non-default and this field is omitted.
+    pub retail_portfolio_id: Option<String>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for CoinbaseExecClientConfig {

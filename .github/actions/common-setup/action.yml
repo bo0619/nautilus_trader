@@ -35,6 +35,18 @@ inputs:
       runners using a persistent on-disk CARGO_TARGET_DIR).
     required: false
     default: "true"
+  uv-cache-enabled:
+    description: >-
+      Whether to persist the uv cache with GitHub Actions cache: true, false, or
+      auto (enabled on GitHub-hosted runners, disabled on self-hosted runners).
+    required: false
+    default: "auto"
+  prek-cache-enabled:
+    description: >-
+      Whether to persist the prek cache with GitHub Actions cache: true, false, or
+      auto (enabled on GitHub-hosted runners, disabled on self-hosted runners).
+    required: false
+    default: "auto"
 
 runs:
   using: "composite"
@@ -112,7 +124,7 @@ runs:
       shell: bash
       run: |
         sudo apt-get update -o Acquire::Retries=5
-        sudo apt-get install -y curl clang git make pkg-config ripgrep -o Acquire::Retries=5
+        sudo apt-get install -y curl clang lld git make pkg-config ripgrep -o Acquire::Retries=5
         sudo apt-get install -y python3-dev libpython3-dev -o Acquire::Retries=5
         sudo apt-get clean
         sudo rm -rf /var/lib/apt/lists/*
@@ -137,7 +149,7 @@ runs:
 
     # https://github.com/actions-rust-lang/setup-rust-toolchain
     - name: Set up Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
       with:
         toolchain: ${{ env.TOOLCHAIN }}
         components: clippy,rustfmt
@@ -168,7 +180,7 @@ runs:
     - name: Install cargo-nextest
       if: inputs.build-type != 'pre-commit' && runner.os != 'macOS'
       # https://github.com/taiki-e/install-action
-      uses: taiki-e/install-action@0d865d5cc6d507df4765f1f866bfae8bab4e2a73 # v2.69.7
+      uses: taiki-e/install-action@b651345a718c8f44efa2460560b3dbf29cbd7ee1 # v2.75.26
       with:
         tool: cargo-nextest@${{ env.CARGO_NEXTEST_VERSION }}
 
@@ -195,18 +207,12 @@ runs:
       run: |
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-    - name: Get cache scope and uv lock hash
+    - name: Get cache scope
       shell: bash
       env:
         CACHE_SCOPE: ${{ runner.os }}-${{ runner.arch }}-py${{ inputs.python-version }}
       run: |
         echo "CACHE_SCOPE=$CACHE_SCOPE" >> "$GITHUB_ENV"
-        python - <<'PY' >> "$GITHUB_ENV"
-        import hashlib
-        from pathlib import Path
-
-        print(f"UV_LOCK_HASH={hashlib.sha256(Path('uv.lock').read_bytes()).hexdigest()}")
-        PY
 
     - name: Get pre-commit config hash
       if: inputs.build-type == 'pre-commit'
@@ -238,39 +244,61 @@ runs:
 
     - name: Install uv
       # https://github.com/astral-sh/setup-uv
-      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       with:
         version: ${{ env.UV_VERSION }}
+        enable-cache: ${{ inputs.uv-cache-enabled }}
+        cache-suffix: ${{ env.CACHE_SCOPE }}-uv-${{ env.UV_VERSION }}
+        prune-cache: true
 
     - name: Set uv cache-dir
       shell: bash
       run: |
         echo "UV_CACHE_DIR=$(uv cache dir)" >> $GITHUB_ENV
 
-    - name: Cached uv
-      # Skip on macOS: hashFiles() broken in composite actions after Nov 20 runner update
-      # See: https://github.com/actions/runner/issues/3765
-      if: runner.os != 'macOS'
-      id: cached-uv
-      # https://github.com/actions/cache
-      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-      with:
-        path: ${{ env.UV_CACHE_DIR }}
-        key: ${{ env.CACHE_SCOPE }}-uv-${{ env.UV_VERSION }}-${{ env.UV_LOCK_HASH }}
-        restore-keys: |
-          ${{ env.CACHE_SCOPE }}-uv-${{ env.UV_VERSION }}-
+    # Self-hosted runners skip setup-uv's save-cache (and its built-in prune) under auto.
+    - name: Prune uv cache
+      shell: bash
+      run: uv cache prune --ci
 
     # > --------------------------------------------------
     # > prek (pre-commit hook environments)
     - name: Cached pre-commit environments
-      if: inputs.build-type == 'pre-commit' && runner.os != 'macOS'
-      # Skip on macOS: hashFiles() broken in composite actions after Nov 20 runner update
-      # See: https://github.com/actions/runner/issues/3765
+      # Skip on macOS: hashFiles() broken in composite actions, see actions/runner#3765
+      if: >-
+        inputs.build-type == 'pre-commit'
+        && runner.os != 'macOS'
+        && (inputs.prek-cache-enabled == 'true'
+            || (inputs.prek-cache-enabled == 'auto'
+                && runner.environment != 'self-hosted'))
       id: cached-prek
       # https://github.com/actions/cache
-      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ~/.cache/prek
         key: ${{ env.CACHE_SCOPE }}-prek-${{ env.PRE_COMMIT_CONFIG_HASH }}
         restore-keys: |
           ${{ env.CACHE_SCOPE }}-prek-
+
+    # > --------------------------------------------------
+    # > Cache footprint
+    - name: Report cache footprint
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        {
+          echo "## Cache footprint"
+          echo
+          echo '```'
+          df -h "$HOME" 2>/dev/null || df -h /
+          echo
+          for path in \
+            "$HOME/.cache/uv" \
+            "$HOME/.cache/prek" \
+            "$HOME/.cache/cargo-target" \
+            "$HOME/.cargo/registry" \
+            "$HOME/.cargo/git"; do
+            [ -d "$path" ] && du -sh "$path" 2>/dev/null || true
+          done
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -107,7 +107,7 @@ The following integrations are currently supported; see [docs/integrations/](htt
 | [AX Exchange](https://architect.exchange)                                    | `AX`                  | Perpetuals Exchange     | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/architect_ax.md) |
 | [Betfair](https://betfair.com)                                               | `BETFAIR`             | Sports Betting Exchange | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/betfair.md)      |
 | [Binance](https://binance.com)                                               | `BINANCE`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/binance.md)      |
-| [Coinbase](https://coinbase.com)                                             | `COINBASE`            | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/building-orange) | [Guide](docs/integrations/coinbase.md)     |
+| [Coinbase](https://coinbase.com)                                             | `COINBASE`            | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/beta-yellow)     | [Guide](docs/integrations/coinbase.md)     |
 | [BitMEX](https://www.bitmex.com)                                             | `BITMEX`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/bitmex.md)       |
 | [Bybit](https://www.bybit.com)                                               | `BYBIT`               | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/bybit.md)        |
 | [Databento](https://databento.com)                                           | `DATABENTO`           | Data Provider           | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/databento.md)    |
@@ -361,10 +361,10 @@ It's possible to install from source using pip if you first install the build de
      - Start a new PowerShell
 
 3. Install [clang](https://clang.llvm.org/) (a C language frontend for LLVM):
-   - Linux:
+   - Linux (also installs [lld](https://lld.llvm.org/), used as the Rust linker for faster builds):
 
        ```bash
-       sudo apt-get install clang
+       sudo apt-get install clang lld
        ```
 
    - macOS:
@@ -411,17 +411,19 @@ It's possible to install from source using pip if you first install the build de
 >
 > The `--depth 1` flag fetches just the latest commit for a faster, lightweight clone.
 
-6. Set environment variables for PyO3 compilation (Linux and macOS only):
+6. Set environment variables for PyO3 compilation (Linux and macOS only). Run these commands from
+   the repository root after `uv sync`:
 
     ```bash
-    # Linux only: Set the library path for the Python interpreter
-    export LD_LIBRARY_PATH="$(python -c 'import sys; print(sys.base_prefix)')/lib:$LD_LIBRARY_PATH"
-
     # Set the Python executable path for PyO3
-    export PYO3_PYTHON=$(pwd)/.venv/bin/python
+    export PYO3_PYTHON="$PWD/.venv/bin/python"
+
+    # Linux only: Set the library path for the uv-managed Python runtime
+    PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    export LD_LIBRARY_PATH="$PYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
     # Required for Rust tests when using uv-installed Python
-    export PYTHONHOME=$(python -c "import sys; print(sys.base_prefix)")
+    export PYTHONHOME="$("$PYO3_PYTHON" -c 'import sys; print(sys.base_prefix)')"
     ```
 
 > [!NOTE]

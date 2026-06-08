@@ -541,9 +541,11 @@ impl Display for MarketToLimitOrder {
     }
 }
 
-impl From<OrderInitialized> for MarketToLimitOrder {
-    fn from(event: OrderInitialized) -> Self {
-        Self::new(
+impl TryFrom<OrderInitialized> for MarketToLimitOrder {
+    type Error = OrderError;
+
+    fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
+        Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -577,7 +579,7 @@ mod tests {
     use super::*;
     use crate::{
         enums::{OrderSide, OrderType, TimeInForce},
-        events::order::{filled::OrderFilledBuilder, initialized::OrderInitializedBuilder},
+        events::order::spec::{OrderFilledSpec, OrderInitializedSpec},
         identifiers::{InstrumentId, TradeId, VenueOrderId},
         instruments::{CurrencyPair, stubs::*},
         orders::{builder::OrderTestBuilder, stubs::TestOrderStubs},
@@ -697,13 +699,12 @@ mod tests {
     #[rstest]
     fn test_market_to_limit_order_from_order_initialized() {
         // Create an OrderInitialized event with all required fields for a MarketToLimitOrder
-        let order_initialized = OrderInitializedBuilder::default()
+        let order_initialized = OrderInitializedSpec::builder()
             .order_type(OrderType::MarketToLimit)
-            .build()
-            .unwrap();
+            .build();
 
         // Convert the OrderInitialized event into a MarketToLimitOrder
-        let order: MarketToLimitOrder = order_initialized.clone().into();
+        let order: MarketToLimitOrder = order_initialized.clone().try_into().unwrap();
 
         // Assert essential fields match the OrderInitialized fields
         assert_eq!(order.trader_id(), order_initialized.trader_id);
@@ -748,7 +749,7 @@ mod tests {
         let fill_quantity = accepted_order.quantity();
         let fill_price = Price::new(98.50, 2);
 
-        let order_filled_event = OrderFilledBuilder::default()
+        let order_filled_event = OrderFilledSpec::builder()
             .client_order_id(accepted_order.client_order_id())
             .strategy_id(accepted_order.strategy_id())
             .instrument_id(accepted_order.instrument_id())
@@ -757,8 +758,7 @@ mod tests {
             .last_px(fill_price)
             .venue_order_id(VenueOrderId::from("TEST-001"))
             .trade_id(TradeId::from("TRADE-001"))
-            .build()
-            .unwrap();
+            .build();
 
         // Apply the fill event
         accepted_order

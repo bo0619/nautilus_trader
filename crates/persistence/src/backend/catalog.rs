@@ -73,7 +73,11 @@ use std::{
 };
 
 use ahash::AHashMap;
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::{
+    array::{Array, UInt64Array},
+    compute::{SortOptions, concat_batches, sort_to_indices, take_record_batch},
+    record_batch::RecordBatch,
+};
 use futures::StreamExt;
 use itertools::Itertools;
 use nautilus_common::live::get_runtime;
@@ -114,7 +118,10 @@ use super::{
     },
     session::{self, DataBackendSession, QueryResult, build_query},
 };
-use crate::parquet::{read_parquet_from_object_store, write_batches_to_object_store};
+use crate::parquet::{
+    is_remote_uri_scheme, read_parquet_from_object_store, remote_full_uri, remote_store_root_url,
+    write_batches_to_object_store,
+};
 
 /// A high-performance data catalog for storing and retrieving financial market data using Apache Parquet format.
 ///
@@ -306,13 +313,13 @@ impl ParquetDataCatalog {
         let compression = compression.unwrap_or(parquet::basic::Compression::SNAPPY);
         let max_row_group_size = max_row_group_size.unwrap_or(5000);
 
-        let (object_store, base_path, original_uri) =
-            crate::parquet::create_object_store_from_path(uri, storage_options)?;
+        let location =
+            crate::parquet::create_object_store_location_from_path(uri, storage_options)?;
 
         Ok(Self {
-            base_path,
-            original_uri,
-            object_store,
+            base_path: location.base_path,
+            original_uri: location.original_uri,
+            object_store: location.object_store,
             session: session::DataBackendSession::new(batch_size),
             batch_size,
             compression,
@@ -527,7 +534,7 @@ impl ParquetDataCatalog {
         let directory = self.make_path(T::path_prefix(), identifier.as_deref())?;
         let filename = timestamps_to_filename(start_ts, end_ts);
         let path = PathBuf::from(format!("{directory}/{filename}"));
-        let object_path = self.to_object_path(&path.to_string_lossy());
+        let object_path = self.to_object_path(&path.to_string_lossy())?;
 
         let file_exists = self.execute_async(async {
             let exists: bool = self.object_store.head(&object_path).await.is_ok();
@@ -616,7 +623,7 @@ impl ParquetDataCatalog {
         let directory = self.make_path_custom_data(&type_name, identifier.as_deref())?;
         let filename = timestamps_to_filename(start_ts, end_ts);
         let path = PathBuf::from(format!("{directory}/{filename}"));
-        let object_path = self.to_object_path(&path.to_string_lossy());
+        let object_path = self.to_object_path(&path.to_string_lossy())?;
 
         let file_exists = self.execute_async(async {
             let exists: bool = self.object_store.head(&object_path).await.is_ok();
@@ -729,7 +736,7 @@ impl ParquetDataCatalog {
             let directory = self.make_path("instruments", Some(instrument_id.as_str()))?;
             let filename = timestamps_to_filename(start_ts, end_ts);
             let path = PathBuf::from(format!("{directory}/{filename}"));
-            let object_path = self.to_object_path(&path.to_string_lossy());
+            let object_path = self.to_object_path(&path.to_string_lossy())?;
 
             let file_exists = self
                 .execute_async(async { Ok(self.object_store.head(&object_path).await.is_ok()) })?;
@@ -1350,13 +1357,15 @@ impl ParquetDataCatalog {
     /// Helper method to reconstruct full URI for remote object store paths
     #[must_use]
     pub fn reconstruct_full_uri(&self, path_str: &str) -> String {
+        if path_str.contains("://") {
+            return path_str.to_string();
+        }
+
         // Check if this is a remote URI scheme that needs reconstruction
         if self.is_remote_uri() {
-            // Extract the base URL (scheme + host) from the original URI
-            if let Ok(url) = url::Url::parse(&self.original_uri)
-                && let Some(host) = url.host_str()
-            {
-                return format!("{}://{}/{}", url.scheme(), host, path_str);
+            let path = self.path_under_base(path_str);
+            if let Ok(uri) = remote_full_uri(&self.original_uri, &path) {
+                return uri;
             }
         }
 
@@ -1450,13 +1459,9 @@ impl ParquetDataCatalog {
     /// Helper method to check if the original URI uses a remote object store scheme
     #[must_use]
     pub fn is_remote_uri(&self) -> bool {
-        self.original_uri.starts_with("s3://")
-            || self.original_uri.starts_with("gs://")
-            || self.original_uri.starts_with("gcs://")
-            || self.original_uri.starts_with("az://")
-            || self.original_uri.starts_with("abfs://")
-            || self.original_uri.starts_with("http://")
-            || self.original_uri.starts_with("https://")
+        self.original_uri
+            .split_once("://")
+            .is_some_and(|(scheme, _)| is_remote_uri_scheme(scheme))
     }
 
     /// Executes a query against the catalog to retrieve market data of a specific type.
@@ -1555,15 +1560,7 @@ impl ParquetDataCatalog {
         // For local file:// we do not register: we pass full file URLs to register_parquet
         // so DataFusion's default file provider handles them (avoids path doubling on Windows
         // where a registered store would receive a path that gets prefixed again).
-        if self.is_remote_uri() {
-            let url = url::Url::parse(&self.original_uri)?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("Remote URI missing host/bucket name"))?;
-            let base_url = url::Url::parse(&format!("{}://{}", url.scheme(), host))?;
-            self.session
-                .register_object_store(&base_url, self.object_store.clone());
-        }
+        self.register_remote_object_store()?;
 
         let files_list = if let Some(files) = files {
             files
@@ -1774,15 +1771,7 @@ impl ParquetDataCatalog {
     {
         self.reset_session();
 
-        if self.is_remote_uri() {
-            let url = url::Url::parse(&self.original_uri)?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("Remote URI missing host/bucket name"))?;
-            let base_url = url::Url::parse(&format!("{}://{}", url.scheme(), host))?;
-            self.session
-                .register_object_store(&base_url, self.object_store.clone());
-        }
+        self.register_remote_object_store()?;
 
         let files_list = if let Some(files) = files {
             files
@@ -1888,12 +1877,15 @@ impl ParquetDataCatalog {
         _optimize_file_loading: bool,
     ) -> anyhow::Result<Vec<Data>> {
         self.reset_session();
+
+        self.register_remote_object_store()?;
+
         let path_prefix = format!("custom/{type_name}");
 
         let files = if let Some(f) = files {
             f.into_iter()
-                .map(|p| self.to_object_path(&p).to_string())
-                .collect::<Vec<_>>()
+                .map(|p| self.to_object_path(&p).map(|op| op.to_string()))
+                .collect::<anyhow::Result<Vec<_>>>()?
         } else {
             self.list_parquet_files_with_criteria(&path_prefix, identifiers, start, end)?
         };
@@ -2637,9 +2629,9 @@ impl ParquetDataCatalog {
     pub fn get_directory_intervals(&self, directory: &str) -> anyhow::Result<Vec<(u64, u64)>> {
         // Use object store for all operations
         // Convert directory to object path format (consistent with how files are written)
-        // For local stores with empty base_path, to_object_path returns path as-is
-        // For remote stores, to_object_path strips the base_path prefix
-        let object_dir = self.to_object_path(directory);
+        // For local stores with empty base_path, to_object_path returns path as-is.
+        // For remote stores, to_object_path preserves or prepends the catalog base path.
+        let object_dir = self.to_object_path(directory)?;
         let list_result = self.execute_async(async {
             // Ensure trailing slash for directory listing
             let dir_str = format!("{}/", object_dir.as_ref());
@@ -2751,12 +2743,12 @@ impl ParquetDataCatalog {
         let old_filename =
             timestamps_to_filename(UnixNanos::from(old_start), UnixNanos::from(old_end));
         let old_path = format!("{directory}/{old_filename}");
-        let old_object_path = self.to_object_path(&old_path);
+        let old_object_path = self.to_object_path(&old_path)?;
 
         let new_filename =
             timestamps_to_filename(UnixNanos::from(new_start), UnixNanos::from(new_end));
         let new_path = format!("{directory}/{new_filename}");
-        let new_object_path = self.to_object_path(&new_path);
+        let new_object_path = self.to_object_path(&new_path)?;
 
         self.move_file(&old_object_path, &new_object_path)
     }
@@ -2764,8 +2756,8 @@ impl ParquetDataCatalog {
     /// Converts a catalog path string to an [`ObjectPath`] for object store operations.
     ///
     /// This method handles the conversion between catalog-relative paths and object store paths,
-    /// taking into account the catalog's base path configuration. It automatically strips the
-    /// base path prefix when present to create the correct object store path.
+    /// taking into account the catalog's base path configuration. It automatically preserves the
+    /// base path prefix for remote catalogs and strips it for local catalog paths.
     ///
     /// # Parameters
     ///
@@ -2778,46 +2770,51 @@ impl ParquetDataCatalog {
     /// # Path Handling
     ///
     /// - If `base_path` is empty, the path is used as-is.
-    /// - If `base_path` is set, it's stripped from the path if present.
+    /// - If `base_path` is set for a remote catalog, it's preserved or prepended.
+    /// - If `base_path` is set for a local catalog, it's stripped from the path if present.
     /// - Trailing slashes and backslashes are automatically handled.
     /// - The resulting path is relative to the object store root.
     /// - All paths are normalized to use forward slashes (object store convention).
     ///
+    /// # Errors
+    ///
+    /// Returns an error for remote catalogs when `path` is a full URI whose scheme/host
+    /// does not match the catalog's own root (cross-bucket misuse). Without this guard
+    /// the caller could silently write to or read from the wrong bucket.
+    ///
     /// # Examples
+    ///
+    /// Local catalog paths (absolute or relative) strip the catalog's base directory:
     ///
     /// ```rust,no_run
     /// use nautilus_persistence::backend::catalog::ParquetDataCatalog;
-    ///
-    /// let catalog = ParquetDataCatalog::new(/* ... */);
-    ///
-    /// // Convert a full catalog path
-    /// let object_path = catalog.to_object_path("/base/data/quotes/file.parquet");
-    /// // Returns: ObjectPath("data/quotes/file.parquet") if base_path is "/base"
-    ///
-    /// // Convert a relative path
-    /// let object_path = catalog.to_object_path("data/trades/file.parquet");
-    /// // Returns: ObjectPath("data/trades/file.parquet")
+    /// # let catalog: ParquetDataCatalog = unimplemented!();
+    /// let object_path = catalog.to_object_path("/base/data/quotes/file.parquet")?;
+    /// // ObjectPath("data/quotes/file.parquet")
+    /// # Ok::<(), anyhow::Error>(())
     /// ```
-    #[must_use]
-    pub fn to_object_path(&self, path: &str) -> ObjectPath {
-        // Normalize path separators to forward slashes for object store
-        let normalized_path = path.replace('\\', "/");
+    ///
+    /// Remote catalog paths (relative or full URI) preserve or prepend the base prefix:
+    ///
+    /// ```rust,no_run
+    /// use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+    /// # let catalog: ParquetDataCatalog = unimplemented!();
+    /// let object_path = catalog.to_object_path("data/trades/file.parquet")?;
+    /// // ObjectPath("base/data/trades/file.parquet")
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn to_object_path(&self, path: &str) -> anyhow::Result<ObjectPath> {
+        Ok(ObjectPath::from(self.object_store_path(path)?))
+    }
 
-        if self.base_path.is_empty() {
-            return ObjectPath::from(normalized_path);
+    fn register_remote_object_store(&mut self) -> anyhow::Result<()> {
+        if self.is_remote_uri() {
+            let base_url = remote_store_root_url(&self.original_uri)?;
+            self.session
+                .register_object_store(&base_url, self.object_store.clone());
         }
 
-        // Normalize base path separators as well
-        let normalized_base = self.base_path.replace('\\', "/");
-        let base = normalized_base.trim_end_matches('/');
-
-        // Remove the catalog base prefix if present
-        let without_base = normalized_path
-            .strip_prefix(&format!("{base}/"))
-            .or_else(|| normalized_path.strip_prefix(base))
-            .unwrap_or(&normalized_path);
-
-        ObjectPath::from(without_base)
+        Ok(())
     }
 
     /// Converts a path string to [`ObjectPath`] using parse (no percent-encoding).
@@ -2825,21 +2822,101 @@ impl ParquetDataCatalog {
     /// Use this for paths that were returned by the object store (e.g. from `list()`),
     /// which may already be percent-encoded. Using [`Self::to_object_path`] (which uses
     /// `Path::from`) on such paths would double-encode (e.g. `%5E` -> `%255E`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the same cross-bucket case as [`Self::to_object_path`], or
+    /// when the resulting string fails [`ObjectPath::parse`].
     pub fn to_object_path_parsed(&self, path: &str) -> anyhow::Result<ObjectPath> {
+        let to_parse = self.object_store_path(path)?;
+        ObjectPath::parse(&to_parse).map_err(anyhow::Error::from)
+    }
+
+    fn object_store_path(&self, path: &str) -> anyhow::Result<String> {
         let normalized_path = path.replace('\\', "/");
 
-        let to_parse = if self.base_path.is_empty() {
-            normalized_path.as_str()
-        } else {
-            let normalized_base = self.base_path.replace('\\', "/");
-            let base = normalized_base.trim_end_matches('/');
-            normalized_path
-                .strip_prefix(&format!("{base}/"))
-                .or_else(|| normalized_path.strip_prefix(base))
-                .unwrap_or(normalized_path.as_str())
-        };
+        if self.is_remote_uri() {
+            if normalized_path.contains("://") {
+                let path_under_root = self.remote_uri_object_path(&normalized_path)?;
+                return Ok(self.path_under_base(&path_under_root));
+            }
 
-        ObjectPath::parse(to_parse).map_err(anyhow::Error::from)
+            return Ok(self.path_under_base(&normalized_path));
+        }
+
+        Ok(self.path_without_local_base(&normalized_path))
+    }
+
+    fn remote_uri_object_path(&self, path: &str) -> anyhow::Result<String> {
+        let path_url = url::Url::parse(path)
+            .map_err(|e| anyhow::anyhow!("Failed to parse object store URI {path}: {e}"))?;
+        if !is_remote_uri_scheme(path_url.scheme()) {
+            anyhow::bail!(
+                "URI {path} uses non-remote scheme {} for remote catalog at {}",
+                path_url.scheme(),
+                self.original_uri,
+            );
+        }
+
+        let catalog_root = remote_store_root_url(&self.original_uri)?;
+        let path_root = remote_store_root_url(path)?;
+        if catalog_root.as_str().trim_end_matches('/') != path_root.as_str().trim_end_matches('/') {
+            anyhow::bail!(
+                "Cross-store URI {path} (root {}) does not belong to catalog rooted at {} ({})",
+                path_root.as_str().trim_end_matches('/'),
+                self.original_uri,
+                catalog_root.as_str().trim_end_matches('/'),
+            );
+        }
+
+        // The URL crate keeps the path component percent-encoded (e.g. `%5E`),
+        // so preserve that encoding for `ObjectPath::parse` round-trips through
+        // `object_store::list`/`get`.
+        Ok(path_url.path().trim_start_matches('/').to_string())
+    }
+
+    fn path_without_local_base(&self, path: &str) -> String {
+        let base_path = if self.base_path.is_empty() {
+            self.native_base_path_string()
+        } else {
+            self.base_path.clone()
+        };
+        let normalized_base = base_path.replace('\\', "/");
+        let base = normalized_base.trim_end_matches('/');
+
+        if base.is_empty() {
+            path.to_string()
+        } else if path == base {
+            String::new()
+        } else if let Some(without_base) = path.strip_prefix(&format!("{base}/")) {
+            without_base.to_string()
+        } else {
+            path.to_string()
+        }
+    }
+
+    fn path_under_base(&self, path: &str) -> String {
+        let normalized_path = path.replace('\\', "/");
+        let path = normalized_path
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+
+        if self.base_path.is_empty() {
+            return path.to_string();
+        }
+
+        let normalized_base = self.base_path.replace('\\', "/");
+        let base = normalized_base
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+
+        if base.is_empty() || path == base || path.starts_with(&format!("{base}/")) {
+            path.to_string()
+        } else if path.is_empty() {
+            base.to_string()
+        } else {
+            make_object_store_path(base, &[path])
+        }
     }
 
     #[allow(dead_code)]
@@ -3397,16 +3474,16 @@ impl ParquetDataCatalog {
     /// - The instance ID doesn't exist.
     /// - Feather file listing fails.
     /// - Feather file reading fails.
-    /// - Data deserialization fails.
     /// - Writing to parquet fails.
     ///
     /// # Note
     ///
-    /// This method is currently not fully implemented. It requires:
+    /// This method converts directly between Arrow IPC stream batches and Parquet batches without
+    /// materializing Nautilus data objects. It requires:
     /// - Listing feather files in the specified subdirectory
     /// - Reading feather files (Arrow IPC stream reading)
-    /// - Converting Arrow tables to Nautilus data objects
-    /// - Writing data to the catalog using existing write methods
+    /// - Applying table-only stream conversion transforms
+    /// - Writing Arrow batches to the catalog
     ///
     /// # Examples
     ///
@@ -3436,62 +3513,74 @@ impl ParquetDataCatalog {
         data_name: &str,
         identifiers: Option<&[String]>,
     ) -> anyhow::Result<Vec<String>> {
-        // Construct the base directory path: {subdirectory}/{instance_id}/{data_name}
         let base_dir = make_object_store_path(&self.base_path, &[subdirectory, instance_id]);
-        let data_dir = make_object_store_path(&base_dir, &[data_name]);
 
         let mut files = Vec::new();
 
-        // Try to list files in the data directory (for per-instrument subdirectories)
-        let subdir_prefix = ObjectPath::from(format!("{data_dir}/"));
         let list_result = self.execute_async(async {
-            let mut stream = self.object_store.list(Some(&subdir_prefix));
-            let mut subdirs = Vec::new();
-            let mut flat_files = Vec::new();
+            let prefix = ObjectPath::from(format!("{base_dir}/"));
+            let mut stream = self.object_store.list(Some(&prefix));
+            let mut feather_files = Vec::new();
 
             while let Some(object) = stream.next().await {
                 let object = object?;
                 let path_str = object.location.to_string();
 
-                // Check if this is a subdirectory (per-instrument) or a flat file
-                if let Some(relative_path) = path_str.strip_prefix(&format!("{data_dir}/")) {
-                    if relative_path.ends_with(".feather") {
-                        // Flat file format: {data_name}_*.feather
-                        if path_str.contains(&format!("{data_name}_")) {
-                            flat_files.push(path_str);
-                        }
-                    } else {
-                        // This might be a subdirectory - check if it contains feather files
-                        let subdir_path = format!("{path_str}/");
-                        let mut subdir_stream = self
-                            .object_store
-                            .list(Some(&ObjectPath::from(subdir_path.as_str())));
+                if !path_str.ends_with(".feather") {
+                    continue;
+                }
 
-                        while let Some(subdir_object) = subdir_stream.next().await {
-                            let subdir_object = subdir_object?;
-                            let subdir_file_path = subdir_object.location.to_string();
+                let Some(relative_path) = path_str.strip_prefix(&format!("{base_dir}/")) else {
+                    continue;
+                };
 
-                            if subdir_file_path.ends_with(".feather") {
-                                // Check identifier filter if provided
-                                if let Some(identifiers) = identifiers {
-                                    let subdir_name = relative_path.split('/').next().unwrap_or("");
-                                    if !identifiers.iter().any(|id| subdir_name.contains(id)) {
-                                        continue;
-                                    }
-                                }
-                                subdirs.push(subdir_file_path);
-                            }
+                if let Some(data_relative_path) =
+                    relative_path.strip_prefix(&format!("{data_name}/"))
+                {
+                    if let Some(identifiers) = identifiers {
+                        let identifier_path = data_relative_path
+                            .split_once('/')
+                            .map_or(data_relative_path, |(identifier, _)| identifier);
+
+                        if !Self::stream_identifier_matches(identifier_path, identifiers) {
+                            continue;
                         }
                     }
+
+                    feather_files.push(path_str);
+                } else if Self::is_flat_stream_file(relative_path, data_name) {
+                    feather_files.push(path_str);
                 }
             }
 
-            Ok::<Vec<String>, anyhow::Error>([subdirs, flat_files].concat())
+            Ok::<Vec<String>, anyhow::Error>(feather_files)
         })?;
 
         files.extend(list_result);
         files.sort();
         Ok(files)
+    }
+
+    fn is_flat_stream_file(relative_path: &str, data_name: &str) -> bool {
+        if relative_path.contains('/') {
+            return false;
+        }
+
+        let Some(file_stem) = relative_path.strip_suffix(".feather") else {
+            return false;
+        };
+        let Some(timestamp) = file_stem.strip_prefix(&format!("{data_name}_")) else {
+            return false;
+        };
+
+        !timestamp.is_empty() && timestamp.chars().all(|ch| ch.is_ascii_digit())
+    }
+
+    fn stream_identifier_matches(candidate: &str, identifiers: &[String]) -> bool {
+        identifiers.iter().any(|id| {
+            let safe_id = urisafe_instrument_id(id);
+            candidate.contains(id) || candidate.contains(&safe_id)
+        })
     }
 
     /// Reads a feather file and returns all RecordBatches.
@@ -3558,24 +3647,22 @@ impl ParquetDataCatalog {
             return Ok(Vec::new());
         }
 
-        // Get schema and metadata from first batch
         let schema = batches[0].schema();
         let mut metadata = schema.metadata().clone();
 
-        // Convert bar_type from INTERNAL to EXTERNAL if requested
         if convert_bar_type_to_external
             && let Some(bar_type_str) = metadata.get("bar_type").cloned()
             && bar_type_str.ends_with("-INTERNAL")
         {
-            let external = bar_type_str.replace("-INTERNAL", "-EXTERNAL");
-            metadata.insert("bar_type".to_string(), external);
+            metadata.insert(
+                "bar_type".to_string(),
+                bar_type_str.replace("-INTERNAL", "-EXTERNAL"),
+            );
         }
 
-        // Process each batch
         let mut all_data = Vec::new();
 
         for mut batch in batches {
-            // Handle ts_event/ts_init replacement if requested
             if use_ts_event_for_ts_init {
                 let column_names: Vec<String> =
                     schema.fields().iter().map(|f| f.name().clone()).collect();
@@ -3589,23 +3676,19 @@ impl ParquetDataCatalog {
                     .position(|n| n == "ts_init")
                     .ok_or_else(|| anyhow::anyhow!("ts_init column not found"))?;
 
-                // Create new arrays with ts_init replaced by ts_event
                 let mut new_columns = batch.columns().to_vec();
                 new_columns[ts_init_idx] = new_columns[ts_event_idx].clone();
 
-                // Create new batch with updated columns
                 batch = RecordBatch::try_new(schema.clone(), new_columns)
                     .map_err(|e| anyhow::anyhow!("Failed to create new batch: {e}"))?;
             }
 
-            // Decode the batch to Data objects
             let data_vec = T::decode_data_batch(&metadata, batch)
                 .map_err(|e| anyhow::anyhow!("Failed to decode batch: {e}"))?;
 
             all_data.extend(data_vec);
         }
 
-        // Convert Data enum to specific type T
         Ok(to_variant::<T>(all_data))
     }
 
@@ -3631,20 +3714,6 @@ impl ParquetDataCatalog {
         }
 
         Ok(all_data)
-    }
-
-    fn write_typed_batches<T>(&self, batches: Vec<RecordBatch>) -> anyhow::Result<()>
-    where
-        T: DecodeTypedFromRecordBatch + EncodeToRecordBatch + CatalogPathPrefix + HasTsInit,
-    {
-        let mut data: Vec<T> = self.convert_record_batches_to_typed(batches)?;
-
-        if !is_monotonically_increasing_by_init(&data) {
-            data.sort_by_key(|item| item.ts_init());
-        }
-
-        self.write_to_parquet(data, None, None, None)?;
-        Ok(())
     }
 
     pub fn convert_stream_to_data(
@@ -3674,205 +3743,299 @@ impl ParquetDataCatalog {
             return Ok(());
         }
 
+        if !Self::is_supported_stream_data_type(&data_name) {
+            anyhow::bail!("Unknown data class: {data_cls}");
+        }
+
         // Process each feather file independently so that each file's identifier
         // (instrument_id or bar_type from schema metadata) is preserved when writing
         // to parquet. This matches the Python _convert_feather_table_to_parquet approach.
-        let convert_bar_type = data_cls == "bars";
-
         for file_path in feather_files {
             let batches = self.read_feather_file(&file_path)?;
-
-            if batches.is_empty() {
-                continue;
-            }
-
-            match data_cls {
-                "quotes" => {
-                    let mut data: Vec<QuoteTick> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "trades" => {
-                    let mut data: Vec<TradeTick> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "order_book_deltas" => {
-                    let mut data: Vec<OrderBookDelta> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "order_book_depths" => {
-                    let mut data: Vec<OrderBookDepth10> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "bars" => {
-                    let mut data: Vec<Bar> = self
-                        .convert_record_batches_to_data_with_bar_type_conversion(
-                            batches,
-                            use_ts_event_for_ts_init,
-                            convert_bar_type,
-                        )?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "index_prices" => {
-                    let mut data: Vec<IndexPriceUpdate> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "mark_prices" => {
-                    let mut data: Vec<MarkPriceUpdate> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "instrument_status" => {
-                    self.write_typed_batches::<InstrumentStatus>(batches)?;
-                }
-                "instrument_closes" => {
-                    let mut data: Vec<InstrumentClose> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "funding_rate_update" => {
-                    self.write_typed_batches::<FundingRateUpdate>(batches)?;
-                }
-                "account_state" => {
-                    self.write_typed_batches::<AccountState>(batches)?;
-                }
-                "order_initialized" => {
-                    self.write_typed_batches::<OrderInitialized>(batches)?;
-                }
-                "order_denied" => {
-                    self.write_typed_batches::<OrderDenied>(batches)?;
-                }
-                "order_emulated" => {
-                    self.write_typed_batches::<OrderEmulated>(batches)?;
-                }
-                "order_submitted" => {
-                    self.write_typed_batches::<OrderSubmitted>(batches)?;
-                }
-                "order_accepted" => {
-                    self.write_typed_batches::<OrderAccepted>(batches)?;
-                }
-                "order_rejected" => {
-                    self.write_typed_batches::<OrderRejected>(batches)?;
-                }
-                "order_pending_cancel" => {
-                    self.write_typed_batches::<OrderPendingCancel>(batches)?;
-                }
-                "order_canceled" => {
-                    self.write_typed_batches::<OrderCanceled>(batches)?;
-                }
-                "order_cancel_rejected" => {
-                    self.write_typed_batches::<OrderCancelRejected>(batches)?;
-                }
-                "order_expired" => {
-                    self.write_typed_batches::<OrderExpired>(batches)?;
-                }
-                "order_triggered" => {
-                    self.write_typed_batches::<OrderTriggered>(batches)?;
-                }
-                "order_pending_update" => {
-                    self.write_typed_batches::<OrderPendingUpdate>(batches)?;
-                }
-                "order_released" => {
-                    self.write_typed_batches::<OrderReleased>(batches)?;
-                }
-                "order_modify_rejected" => {
-                    self.write_typed_batches::<OrderModifyRejected>(batches)?;
-                }
-                "order_updated" => {
-                    self.write_typed_batches::<OrderUpdated>(batches)?;
-                }
-                "order_filled" => {
-                    self.write_typed_batches::<OrderFilled>(batches)?;
-                }
-                "position_opened" => {
-                    self.write_typed_batches::<PositionOpened>(batches)?;
-                }
-                "position_changed" => {
-                    self.write_typed_batches::<PositionChanged>(batches)?;
-                }
-                "position_closed" => {
-                    self.write_typed_batches::<PositionClosed>(batches)?;
-                }
-                "position_adjusted" => {
-                    self.write_typed_batches::<PositionAdjusted>(batches)?;
-                }
-                "order_snapshot" => {
-                    self.write_typed_batches::<OrderSnapshot>(batches)?;
-                }
-                "position_snapshot" => {
-                    self.write_typed_batches::<PositionSnapshot>(batches)?;
-                }
-                "order_status_report" => {
-                    self.write_typed_batches::<OrderStatusReport>(batches)?;
-                }
-                "fill_report" => {
-                    self.write_typed_batches::<FillReport>(batches)?;
-                }
-                "position_status_report" => {
-                    self.write_typed_batches::<PositionStatusReport>(batches)?;
-                }
-                "execution_mass_status" => {
-                    self.write_typed_batches::<ExecutionMassStatus>(batches)?;
-                }
-                _ => {
-                    if data_cls.starts_with("custom/") {
-                        let data =
-                            self.decode_custom_batches_to_data(batches, use_ts_event_for_ts_init)?;
-                        let custom_items: Vec<CustomData> = data
-                            .into_iter()
-                            .filter_map(|d| match d {
-                                Data::Custom(c) => Some(c),
-                                _ => None,
-                            })
-                            .collect();
-
-                        if !custom_items.is_empty() {
-                            self.write_custom_data_batch(custom_items, None, None, None)?;
-                        }
-                    } else {
-                        anyhow::bail!("Unknown data class: {data_cls}");
-                    }
-                }
-            }
+            self.convert_feather_batches_to_parquet(
+                &data_name,
+                &file_path,
+                batches,
+                use_ts_event_for_ts_init,
+            )?;
         }
 
         Ok(())
+    }
+
+    fn convert_feather_batches_to_parquet(
+        &self,
+        data_name: &str,
+        feather_path: &str,
+        batches: Vec<RecordBatch>,
+        use_ts_event_for_ts_init: bool,
+    ) -> anyhow::Result<()> {
+        let Some(batch) = Self::apply_stream_conversion_transforms(
+            batches,
+            use_ts_event_for_ts_init,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to apply stream conversion transforms for {feather_path}: {e}")
+        })?
+        else {
+            return Ok(());
+        };
+
+        let (start_ts, end_ts) = Self::ts_init_range(&batch).map_err(|e| {
+            anyhow::anyhow!("Failed to determine ts_init range for {feather_path}: {e}")
+        })?;
+        let identifier = Self::identifier_from_batch_or_path(&batch, data_name, feather_path);
+        let directory = if let Some(type_name) = data_name.strip_prefix("custom/") {
+            self.make_path_custom_data(type_name, identifier.as_deref())?
+        } else {
+            self.make_path(data_name, identifier.as_deref())?
+        };
+        let filename = timestamps_to_filename(UnixNanos::from(start_ts), UnixNanos::from(end_ts));
+        let path = PathBuf::from(format!("{directory}/{filename}"));
+        let object_path = self.to_object_path(&path.to_string_lossy())?;
+
+        let file_exists = self.execute_async(async {
+            let exists = self.object_store.head(&object_path).await.is_ok();
+            Ok::<_, anyhow::Error>(exists)
+        })?;
+
+        if file_exists {
+            log::info!("File {} already exists, skipping write", path.display());
+            return Ok(());
+        }
+
+        let current_intervals = self.get_directory_intervals(&directory)?;
+        let mut new_intervals = current_intervals.clone();
+        new_intervals.push((start_ts, end_ts));
+
+        if !are_intervals_disjoint(&new_intervals) {
+            anyhow::bail!(
+                "Writing file {filename} with interval ({start_ts}, {end_ts}) would create \
+                non-disjoint intervals. Existing intervals: {current_intervals:?}"
+            );
+        }
+
+        let batches = vec![batch];
+        self.execute_async(async {
+            write_batches_to_object_store(
+                &batches,
+                self.object_store.clone(),
+                &object_path,
+                Some(self.compression),
+                Some(self.max_row_group_size),
+                None,
+            )
+            .await
+        })?;
+
+        Ok(())
+    }
+
+    fn apply_stream_conversion_transforms(
+        mut batches: Vec<RecordBatch>,
+        use_ts_event_for_ts_init: bool,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        if batches.is_empty() {
+            return Ok(None);
+        }
+
+        let schema = batches[0].schema();
+        let mut metadata = schema.metadata().clone();
+        let mut metadata_changed = false;
+
+        if let Some(bar_type_str) = metadata.get("bar_type").cloned()
+            && bar_type_str.ends_with("-INTERNAL")
+        {
+            metadata.insert(
+                "bar_type".to_string(),
+                bar_type_str.replace("-INTERNAL", "-EXTERNAL"),
+            );
+            metadata_changed = true;
+        }
+
+        let schema = if metadata_changed {
+            Arc::new(schema.as_ref().clone().with_metadata(metadata))
+        } else {
+            schema
+        };
+
+        if use_ts_event_for_ts_init {
+            let ts_event_idx = schema
+                .index_of("ts_event")
+                .map_err(|_| anyhow::anyhow!("ts_event column not found"))?;
+            let ts_init_idx = schema
+                .index_of("ts_init")
+                .map_err(|_| anyhow::anyhow!("ts_init column not found"))?;
+
+            for batch in &mut batches {
+                let mut columns = batch.columns().to_vec();
+                columns[ts_init_idx] = columns[ts_event_idx].clone();
+
+                *batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                    anyhow::anyhow!("Failed to create stream conversion batch: {e}")
+                })?;
+            }
+        } else if metadata_changed {
+            for batch in &mut batches {
+                *batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).map_err(
+                    |e| anyhow::anyhow!("Failed to create stream conversion batch: {e}"),
+                )?;
+            }
+        }
+
+        let mut batch = concat_batches(&schema, batches.iter())
+            .map_err(|e| anyhow::anyhow!("Failed to concatenate stream batches: {e}"))?;
+
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        if !Self::is_record_batch_monotonic_by_ts_init(&batch)? {
+            let indices = sort_to_indices(
+                Self::ts_init_array(&batch)?,
+                Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to sort stream conversion batch: {e}"))?;
+            batch = take_record_batch(&batch, &indices)
+                .map_err(|e| anyhow::anyhow!("Failed to reorder stream conversion batch: {e}"))?;
+        }
+
+        let ts_init = Self::ts_init_array(&batch)?;
+        if ts_init.null_count() > 0 {
+            anyhow::bail!("ts_init column contains null values");
+        }
+
+        Ok(Some(batch))
+    }
+
+    fn is_record_batch_monotonic_by_ts_init(batch: &RecordBatch) -> anyhow::Result<bool> {
+        let ts_init = Self::ts_init_array(batch)?;
+        if ts_init.null_count() > 0 {
+            anyhow::bail!("ts_init column contains null values");
+        }
+
+        for idx in 1..ts_init.len() {
+            if ts_init.value(idx) < ts_init.value(idx - 1) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn ts_init_range(batch: &RecordBatch) -> anyhow::Result<(u64, u64)> {
+        let ts_init = Self::ts_init_array(batch)?;
+        if ts_init.is_empty() {
+            anyhow::bail!("Cannot convert empty stream batch to parquet");
+        }
+
+        if ts_init.null_count() > 0 {
+            anyhow::bail!("ts_init column contains null values");
+        }
+
+        Ok((ts_init.value(0), ts_init.value(ts_init.len() - 1)))
+    }
+
+    fn ts_init_array(batch: &RecordBatch) -> anyhow::Result<&UInt64Array> {
+        let ts_init_idx = batch
+            .schema()
+            .index_of("ts_init")
+            .map_err(|_| anyhow::anyhow!("ts_init column not found"))?;
+        batch
+            .column(ts_init_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow::anyhow!("ts_init column is not UInt64"))
+    }
+
+    fn identifier_from_batch_or_path(
+        batch: &RecordBatch,
+        data_name: &str,
+        feather_path: &str,
+    ) -> Option<String> {
+        let metadata = batch.schema().metadata().clone();
+        if let Some(bar_type) = metadata.get("bar_type") {
+            return Some(bar_type.clone());
+        }
+
+        if let Some(instrument_id) = metadata.get("instrument_id") {
+            return Some(instrument_id.clone());
+        }
+
+        let parts: Vec<&str> = feather_path.trim_matches('/').split('/').collect();
+        if let Some(type_name) = data_name.strip_prefix("custom/") {
+            return Self::custom_identifier_from_path(&parts, type_name);
+        }
+
+        // Stream data currently uses .../{data_name}/{identifier}/{file}.feather.
+        // Keep this fallback explicit because it depends on data_name being one path segment.
+        if parts.len() >= 3 && parts[parts.len() - 3] == data_name {
+            return Some(parts[parts.len() - 2].to_string());
+        }
+
+        None
+    }
+
+    fn custom_identifier_from_path(parts: &[&str], type_name: &str) -> Option<String> {
+        let type_idx = parts
+            .windows(2)
+            .position(|window| window[0] == "custom" && window[1] == type_name)?
+            + 1;
+        let identifier_start = type_idx + 1;
+        let file_idx = parts.len().checked_sub(1)?;
+
+        if identifier_start >= file_idx {
+            return None;
+        }
+
+        Some(parts[identifier_start..file_idx].join("/"))
+    }
+
+    fn is_supported_stream_data_type(data_name: &str) -> bool {
+        data_name.starts_with("custom/")
+            || matches!(
+                data_name,
+                "quotes"
+                    | "trades"
+                    | "order_book_deltas"
+                    | "order_book_depths"
+                    | "bars"
+                    | "index_prices"
+                    | "mark_prices"
+                    | "instrument_status"
+                    | "instrument_closes"
+                    | "funding_rate_update"
+                    | "account_state"
+                    | "order_initialized"
+                    | "order_denied"
+                    | "order_emulated"
+                    | "order_submitted"
+                    | "order_accepted"
+                    | "order_rejected"
+                    | "order_pending_cancel"
+                    | "order_canceled"
+                    | "order_cancel_rejected"
+                    | "order_expired"
+                    | "order_triggered"
+                    | "order_pending_update"
+                    | "order_released"
+                    | "order_modify_rejected"
+                    | "order_updated"
+                    | "order_filled"
+                    | "position_opened"
+                    | "position_changed"
+                    | "position_closed"
+                    | "position_adjusted"
+                    | "order_snapshot"
+                    | "position_snapshot"
+                    | "order_status_report"
+                    | "fill_report"
+                    | "position_status_report"
+                    | "execution_mass_status"
+            )
     }
 }
 

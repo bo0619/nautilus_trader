@@ -37,6 +37,7 @@
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `extension-module`: Builds the crate as a Python extension module.
 //! - `turmoil`: Enables deterministic network simulation testing with [turmoil](https://github.com/tokio-rs/turmoil).
+//! - `transport-sockudo`: Adds the [sockudo-ws](https://crates.io/crates/sockudo-ws) WebSocket backend, selectable via `WebSocketConfig.backend`. Enabled by default; disable with `default-features = false` to drop the dependency.
 //!
 //! # Testing
 //!
@@ -94,6 +95,7 @@ pub mod mode;
 pub mod net;
 pub mod retry;
 pub mod socket;
+pub mod transport;
 pub mod websocket;
 
 mod logging;
@@ -104,6 +106,8 @@ pub mod python;
 
 pub mod error;
 pub mod ratelimiter;
+
+pub use transport::{Message, TransportError};
 
 /// Sentinel message to signal reconnection completion to Rust consumers.
 pub const RECONNECTED: &str = "__RECONNECTED__";

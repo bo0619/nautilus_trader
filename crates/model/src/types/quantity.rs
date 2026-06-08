@@ -61,7 +61,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::fixed::{
     FIXED_PRECISION, FIXED_SCALAR, MAX_FLOAT_PRECISION, check_fixed_precision,
-    mantissa_exponent_to_fixed_i128,
+    mantissa_exponent_to_fixed_i128, raw_scales_match,
 };
 #[cfg(not(feature = "high-precision"))]
 use super::fixed::{f64_to_fixed_u64, fixed_u64_to_f64};
@@ -276,6 +276,52 @@ impl Quantity {
         Ok(Self { raw, precision })
     }
 
+    /// Performs a checked addition, returning `None` on raw integer overflow, when the
+    /// result exceeds `QUANTITY_RAW_MAX`, when either operand is `QUANTITY_UNDEF`, or
+    /// when the operands have mixed raw scales (one at `FIXED_PRECISION` scale, the
+    /// other at a defi `WEI_PRECISION` scale).
+    ///
+    /// Precision follows the `Add` implementation: uses the maximum precision of both operands.
+    #[must_use]
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        if self.raw == QUANTITY_UNDEF || rhs.raw == QUANTITY_UNDEF {
+            return None;
+        }
+
+        if !raw_scales_match(self.precision, rhs.precision) {
+            return None;
+        }
+        let raw = self.raw.checked_add(rhs.raw)?;
+        if raw > QUANTITY_RAW_MAX {
+            return None;
+        }
+        Some(Self {
+            raw,
+            precision: self.precision.max(rhs.precision),
+        })
+    }
+
+    /// Performs a checked subtraction, returning `None` if `rhs` is greater than `self`,
+    /// when either operand is `QUANTITY_UNDEF`, or when the operands have mixed raw
+    /// scales (one at `FIXED_PRECISION` scale, the other at a defi `WEI_PRECISION` scale).
+    ///
+    /// Precision follows the `Sub` implementation: uses the maximum precision of both operands.
+    #[must_use]
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        if self.raw == QUANTITY_UNDEF || rhs.raw == QUANTITY_UNDEF {
+            return None;
+        }
+
+        if !raw_scales_match(self.precision, rhs.precision) {
+            return None;
+        }
+        let raw = self.raw.checked_sub(rhs.raw)?;
+        Some(Self {
+            raw,
+            precision: self.precision.max(rhs.precision),
+        })
+    }
+
     /// Computes a saturating subtraction between two quantities, logging when clamped.
     ///
     /// When `rhs` is greater than `self`, the result is clamped to zero and a warning is logged.
@@ -391,22 +437,34 @@ impl Quantity {
     /// - The decimal value is negative.
     /// - The decimal value cannot be converted to the raw representation.
     /// - Overflow occurs during scaling.
-    pub fn from_decimal_dp(decimal: Decimal, precision: u8) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            decimal.mantissa() >= 0,
-            "Decimal value '{decimal}' is negative, Quantity must be non-negative"
-        );
+    pub fn from_decimal_dp(decimal: Decimal, precision: u8) -> CorrectnessResult<Self> {
+        if decimal.mantissa() < 0 {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Decimal value '{decimal}' is negative, Quantity must be non-negative"
+                ),
+            });
+        }
 
         let exponent = -(decimal.scale() as i8);
         let raw_i128 = mantissa_exponent_to_fixed_i128(decimal.mantissa(), exponent, precision)?;
 
-        let raw: QuantityRaw = raw_i128.try_into().map_err(|_| {
-            anyhow::anyhow!("Decimal value exceeds QuantityRaw range [0, {QUANTITY_RAW_MAX}]")
-        })?;
-        anyhow::ensure!(
-            raw <= QUANTITY_RAW_MAX,
-            "Raw value {raw} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX} for Quantity"
-        );
+        let raw: QuantityRaw =
+            raw_i128
+                .try_into()
+                .map_err(|_| CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "Decimal value exceeds QuantityRaw range [0, {QUANTITY_RAW_MAX}]"
+                    ),
+                })?;
+
+        if raw > QUANTITY_RAW_MAX {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Raw value {raw} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX} for Quantity"
+                ),
+            });
+        }
 
         Ok(Self { raw, precision })
     }
@@ -422,7 +480,7 @@ impl Quantity {
     /// - The inferred precision exceeds [`FIXED_PRECISION`].
     /// - The decimal value cannot be converted to the raw representation.
     /// - Overflow occurs during scaling.
-    pub fn from_decimal(decimal: Decimal) -> anyhow::Result<Self> {
+    pub fn from_decimal(decimal: Decimal) -> CorrectnessResult<Self> {
         let precision = decimal.scale() as u8;
         Self::from_decimal_dp(decimal, precision)
     }
@@ -465,29 +523,31 @@ impl Quantity {
     /// - Overflow occurs during scaling when precision is less than [`FIXED_PRECISION`].
     /// - The scaled U256 amount exceeds the `QuantityRaw` range.
     #[cfg(feature = "defi")]
-    pub fn from_u256(amount: U256, precision: u8) -> anyhow::Result<Self> {
+    pub fn from_u256(amount: U256, precision: u8) -> CorrectnessResult<Self> {
         // Quantity expects raw values scaled to at least FIXED_PRECISION or higher(WEI)
         let scaled_amount = if precision < FIXED_PRECISION {
             amount
                 .checked_mul(U256::from(
                     10u128.pow(u32::from(FIXED_PRECISION - precision)),
                 ))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message: format!(
                         "Amount overflow during scaling to fixed precision: {} * 10^{}",
                         amount,
                         FIXED_PRECISION - precision
-                    )
+                    ),
                 })?
         } else {
             amount
         };
 
         let raw = QuantityRaw::try_from(scaled_amount).map_err(|_| {
-            anyhow::anyhow!("U256 scaled amount {scaled_amount} exceeds QuantityRaw range")
+            CorrectnessError::PredicateViolation {
+                message: format!("U256 scaled amount {scaled_amount} exceeds QuantityRaw range"),
+            }
         })?;
 
-        Ok(Self::from_raw(raw, precision))
+        Self::from_raw_checked(raw, precision)
     }
 }
 
@@ -1259,6 +1319,22 @@ mod tests {
     }
 
     #[rstest]
+    fn test_from_decimal_dp_negative_returns_typed_error_with_stable_display() {
+        let error = Quantity::from_decimal_dp(dec!(-1.5), 2).unwrap_err();
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: "Decimal value '-1.5' is negative, Quantity must be non-negative"
+                    .to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "Decimal value '-1.5' is negative, Quantity must be non-negative",
+        );
+    }
+
+    #[rstest]
     fn test_add() {
         let a = 1.0;
         let b = 2.0;
@@ -1276,6 +1352,73 @@ mod tests {
         let quantity2 = Quantity::new(b, 0);
         let quantity3 = quantity1 - quantity2;
         assert_eq!(quantity3.raw, Quantity::new(a - b, 0).raw);
+    }
+
+    #[rstest]
+    fn test_quantity_checked_add_within_bounds() {
+        let a = Quantity::new(10.0, 2);
+        let b = Quantity::new(5.0, 2);
+        assert_eq!(a.checked_add(b), Some(Quantity::new(15.0, 2)));
+    }
+
+    #[rstest]
+    fn test_quantity_checked_add_above_max_returns_none() {
+        let near_max = Quantity::from_raw(QUANTITY_RAW_MAX, 0);
+        let one = Quantity::new(1.0, 0);
+        assert_eq!(near_max.checked_add(one), None);
+    }
+
+    #[rstest]
+    fn test_quantity_checked_sub_within_bounds() {
+        let a = Quantity::new(10.0, 2);
+        let b = Quantity::new(3.0, 2);
+        assert_eq!(a.checked_sub(b), Some(Quantity::new(7.0, 2)));
+    }
+
+    #[rstest]
+    fn test_quantity_checked_sub_underflow_returns_none() {
+        let a = Quantity::new(3.0, 2);
+        let b = Quantity::new(10.0, 2);
+        assert_eq!(a.checked_sub(b), None);
+    }
+
+    #[rstest]
+    fn test_quantity_checked_sub_to_zero() {
+        let a = Quantity::new(5.0, 2);
+        assert_eq!(a.checked_sub(a), Some(Quantity::zero(2)));
+    }
+
+    #[rstest]
+    fn test_quantity_checked_arith_rejects_undef() {
+        let undef = Quantity::from_raw(QUANTITY_UNDEF, 0);
+        let one = Quantity::new(1.0, 0);
+        assert_eq!(undef.checked_add(one), None);
+        assert_eq!(one.checked_add(undef), None);
+        assert_eq!(undef.checked_sub(one), None);
+        assert_eq!(one.checked_sub(undef), None);
+    }
+
+    #[rstest]
+    fn test_quantity_checked_add_at_exact_max_returns_some() {
+        let near_max = Quantity::from_raw(QUANTITY_RAW_MAX - 1, 0);
+        let one_unit = Quantity::from_raw(1, 0);
+        assert_eq!(
+            near_max.checked_add(one_unit),
+            Some(Quantity::from_raw(QUANTITY_RAW_MAX, 0)),
+        );
+    }
+
+    #[rstest]
+    fn test_quantity_checked_arith_uses_max_precision() {
+        let a = Quantity::new(10.5, 1);
+        let b = Quantity::new(2.25, 2);
+        let sum = a.checked_add(b).unwrap();
+        assert_eq!(sum.precision, 2);
+        assert_eq!(sum.as_f64(), 12.75);
+
+        let diff = a.checked_sub(b).unwrap();
+        assert_eq!(diff.precision, 2);
+        assert_eq!(diff.as_f64(), 8.25);
     }
 
     #[rstest]
@@ -1526,6 +1669,54 @@ mod tests {
         assert_eq!(qty.precision, precision);
         assert_eq!(qty.as_decimal().to_string(), expected_str);
     }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_from_u256_overflow_returns_typed_error_with_stable_display() {
+        let error = Quantity::from_u256(U256::MAX, 0).unwrap_err();
+        match error {
+            CorrectnessError::PredicateViolation { ref message } => {
+                assert!(
+                    message.contains("Amount overflow during scaling to fixed precision"),
+                    "unexpected message: {message:?}",
+                );
+            }
+            _ => panic!("expected PredicateViolation, was {error:?}"),
+        }
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_from_u256_invalid_precision_returns_typed_error() {
+        let error = Quantity::from_u256(U256::from(1u8), 19).unwrap_err();
+        match error {
+            CorrectnessError::PredicateViolation { ref message } => {
+                assert!(
+                    message.contains("WEI_PRECISION"),
+                    "unexpected message: {message:?}",
+                );
+            }
+            _ => panic!("expected PredicateViolation, was {error:?}"),
+        }
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_from_u256_raw_above_max_returns_typed_error() {
+        // Pick a U256 value whose scaled raw lies between QUANTITY_RAW_MAX and
+        // QuantityRaw::MAX so try_from succeeds but from_raw_checked rejects it.
+        let raw = QUANTITY_RAW_MAX + 1;
+        let error = Quantity::from_u256(U256::from(raw), FIXED_PRECISION).unwrap_err();
+        match error {
+            CorrectnessError::PredicateViolation { ref message } => {
+                assert!(
+                    message.contains("QUANTITY_RAW_MAX"),
+                    "unexpected message: {message:?}",
+                );
+            }
+            _ => panic!("expected PredicateViolation, was {error:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1668,6 +1859,41 @@ mod property_tests {
                     // (base + delta) - delta should equal base exactly using raw arithmetic
                     prop_assert_eq!(result_raw, q_base.raw, "Inverse operation failed in raw arithmetic");
                 }
+        }
+
+        /// Property: checked_add agrees with raw checked_add when result is in bounds and
+        /// no operand is QUANTITY_UNDEF; returns None otherwise.
+        #[rstest]
+        fn prop_quantity_checked_add_matches_spec(
+            a in quantity_value_strategy(),
+            b in quantity_value_strategy(),
+            precision in precision_strategy()
+        ) {
+            let q_a = Quantity::new(a, precision);
+            let q_b = Quantity::new(b, precision);
+            let expected = q_a.raw
+                .checked_add(q_b.raw)
+                .filter(|r| *r <= QUANTITY_RAW_MAX)
+                .filter(|_| q_a.raw != QUANTITY_UNDEF && q_b.raw != QUANTITY_UNDEF)
+                .map(|raw| Quantity { raw, precision: q_a.precision.max(q_b.precision) });
+            prop_assert_eq!(q_a.checked_add(q_b), expected);
+        }
+
+        /// Property: checked_sub agrees with raw checked_sub when no operand is
+        /// QUANTITY_UNDEF; returns None otherwise.
+        #[rstest]
+        fn prop_quantity_checked_sub_matches_spec(
+            a in quantity_value_strategy(),
+            b in quantity_value_strategy(),
+            precision in precision_strategy()
+        ) {
+            let q_a = Quantity::new(a, precision);
+            let q_b = Quantity::new(b, precision);
+            let expected = q_a.raw
+                .checked_sub(q_b.raw)
+                .filter(|_| q_a.raw != QUANTITY_UNDEF && q_b.raw != QUANTITY_UNDEF)
+                .map(|raw| Quantity { raw, precision: q_a.precision.max(q_b.precision) });
+            prop_assert_eq!(q_a.checked_sub(q_b), expected);
         }
 
         /// Property: Quantity ordering should be transitive

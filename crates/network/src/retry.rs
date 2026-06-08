@@ -420,6 +420,14 @@ mod test_utils {
     }
 }
 
+// Retry tests run under both real tokio (`#[tokio::test]`, paused-clock when
+// the test relies on virtual time advance) and madsim (`#[madsim::test]`,
+// virtual time always paused). `tokio::time::advance` has no direct madsim
+// equivalent, so explicit clock advances route through `advance_clock` below;
+// time reads and sleeps go through the `dst::time` re-export so they pick up
+// the runtime-appropriate clock. madsim auto-advances virtual time when all
+// tasks block, but `yield_until`-style busy-yield loops keep the runtime
+// non-idle, so explicit advances are still needed where they were before.
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -427,13 +435,29 @@ mod tests {
         atomic::{AtomicU32, Ordering},
     };
 
+    #[cfg(all(feature = "simulation", madsim))]
+    use madsim::task::{spawn, yield_now};
     use nautilus_core::MUTEX_POISONED;
     use rstest::rstest;
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    use tokio::task::{spawn, yield_now};
 
     use super::{test_utils::*, *};
+    use crate::dst::time;
 
     const MAX_WAIT_ITERS: usize = 10_000;
     const MAX_ADVANCE_ITERS: usize = 10_000;
+
+    #[cfg(all(feature = "simulation", madsim))]
+    pub(crate) async fn advance_clock(d: Duration) {
+        madsim::time::advance(d);
+        madsim::task::yield_now().await;
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    pub(crate) async fn advance_clock(d: Duration) {
+        tokio::time::advance(d).await;
+    }
 
     pub(crate) async fn yield_until<F>(mut condition: F)
     where
@@ -443,7 +467,7 @@ mod tests {
             if condition() {
                 return;
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
 
         panic!("yield_until timed out waiting for condition");
@@ -457,8 +481,8 @@ mod tests {
             if condition() {
                 return;
             }
-            tokio::time::advance(Duration::from_millis(1)).await;
-            tokio::task::yield_now().await;
+            advance_clock(Duration::from_millis(1)).await;
+            yield_now().await;
         }
 
         panic!("advance_until timed out waiting for condition");
@@ -480,7 +504,8 @@ mod tests {
         assert_eq!(config.max_elapsed_ms, None);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_retry_manager_success_first_attempt() {
         let manager = RetryManager::new(RetryConfig::default());
 
@@ -496,7 +521,8 @@ mod tests {
         assert_eq!(result.unwrap(), 42);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_retry_manager_non_retryable_error() {
         let manager = RetryManager::new(RetryConfig::default());
 
@@ -513,7 +539,8 @@ mod tests {
         assert!(matches!(result.unwrap_err(), TestError::NonRetryable(_)));
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_retry_manager_retryable_error_exhausted() {
         let config = RetryConfig {
             max_retries: 2,
@@ -540,7 +567,8 @@ mod tests {
         assert!(matches!(result.unwrap_err(), TestError::Retryable(_)));
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_timeout_path() {
         let config = RetryConfig {
             max_retries: 2,
@@ -558,7 +586,7 @@ mod tests {
             .execute_with_retry(
                 "test_timeout",
                 || async {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    time::sleep(Duration::from_millis(100)).await;
                     Ok::<i32, TestError>(42)
                 },
                 should_retry_test_error,
@@ -570,7 +598,8 @@ mod tests {
         assert!(matches!(result.unwrap_err(), TestError::Timeout(_)));
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_max_elapsed_time_budget() {
         let config = RetryConfig {
             max_retries: 10,
@@ -584,7 +613,7 @@ mod tests {
         };
         let manager = RetryManager::new(config);
 
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
         let result = manager
             .execute_with_retry(
                 "test_budget",
@@ -601,7 +630,8 @@ mod tests {
         assert!(elapsed.as_millis() < 1000);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_budget_exceeded_message_format() {
         let config = RetryConfig {
             max_retries: 5,
@@ -644,7 +674,11 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_budget_exceeded_edge_cases() {
         let config = RetryConfig {
             max_retries: 2,
@@ -661,7 +695,7 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = spawn(async move {
             manager
                 .execute_with_retry(
                     "test_first_attempt",
@@ -682,8 +716,8 @@ mod tests {
         yield_until(|| attempt_count.load(Ordering::SeqCst) >= 1).await;
 
         // Advance past budget to trigger check at loop start before second attempt
-        tokio::time::advance(Duration::from_millis(101)).await;
-        tokio::task::yield_now().await;
+        advance_clock(Duration::from_millis(101)).await;
+        yield_now().await;
 
         let result = handle.await.unwrap();
         assert!(result.is_err());
@@ -696,7 +730,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_budget_exceeded_no_overflow() {
         let config = RetryConfig {
             max_retries: u32::MAX,
@@ -743,7 +778,8 @@ mod tests {
         assert_eq!(manager.config.max_elapsed_ms, Some(120_000));
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_timeout_respects_retry_predicate() {
         let config = RetryConfig {
             max_retries: 3,
@@ -764,7 +800,7 @@ mod tests {
             .execute_with_retry(
                 "test_timeout_non_retryable",
                 || async {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    time::sleep(Duration::from_millis(100)).await;
                     Ok::<i32, TestError>(42)
                 },
                 should_not_retry_timeouts,
@@ -777,7 +813,8 @@ mod tests {
         assert!(matches!(result.unwrap_err(), TestError::Timeout(_)));
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_timeout_retries_when_predicate_allows() {
         let config = RetryConfig {
             max_retries: 2,
@@ -794,12 +831,12 @@ mod tests {
         // Test with retry predicate that allows timeouts
         let should_retry_timeouts = |error: &TestError| matches!(error, TestError::Timeout(_));
 
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
         let result = manager
             .execute_with_retry(
                 "test_timeout_retryable",
                 || async {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    time::sleep(Duration::from_millis(100)).await;
                     Ok::<i32, TestError>(42)
                 },
                 should_retry_timeouts,
@@ -816,7 +853,8 @@ mod tests {
         assert!(elapsed.as_millis() > 80); // More than just one timeout
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_successful_retry_after_failures() {
         let config = RetryConfig {
             max_retries: 3,
@@ -856,7 +894,11 @@ mod tests {
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_immediate_first_retry() {
         let config = RetryConfig {
             max_retries: 2,
@@ -872,9 +914,9 @@ mod tests {
 
         let attempt_times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let times_clone = attempt_times.clone();
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
 
-        let handle = tokio::spawn({
+        let handle = spawn({
             let times_clone = times_clone.clone();
             async move {
                 let _ = manager
@@ -898,8 +940,8 @@ mod tests {
         yield_until(|| attempt_times.lock().expect(MUTEX_POISONED).len() >= 2).await;
 
         // Advance time for the next backoff interval
-        tokio::time::advance(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
+        advance_clock(Duration::from_millis(100)).await;
+        yield_now().await;
 
         // Wait for the final retry to be recorded
         yield_until(|| attempt_times.lock().expect(MUTEX_POISONED).len() >= 3).await;
@@ -916,7 +958,8 @@ mod tests {
         assert!(times[2] <= Duration::from_millis(110));
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_operation_without_timeout() {
         let config = RetryConfig {
             max_retries: 2,
@@ -930,12 +973,12 @@ mod tests {
         };
         let manager = RetryManager::new(config);
 
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
         let result = manager
             .execute_with_retry(
                 "test_no_timeout",
                 || async {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    time::sleep(Duration::from_millis(50)).await;
                     Ok::<i32, TestError>(42)
                 },
                 should_retry_test_error,
@@ -950,7 +993,8 @@ mod tests {
         assert!(elapsed.as_millis() < 200);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_zero_retries() {
         let config = RetryConfig {
             max_retries: 0,
@@ -987,7 +1031,11 @@ mod tests {
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_jitter_applied() {
         let config = RetryConfig {
             max_retries: 2,
@@ -1003,10 +1051,10 @@ mod tests {
 
         let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
         let delays_clone = delays.clone();
-        let last_time = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+        let last_time = Arc::new(std::sync::Mutex::new(time::Instant::now()));
         let last_time_clone = last_time.clone();
 
-        let handle = tokio::spawn({
+        let handle = spawn({
             let delays_clone = delays_clone.clone();
             async move {
                 let _ = manager
@@ -1016,7 +1064,7 @@ mod tests {
                             let delays = delays_clone.clone();
                             let last_time = last_time_clone.clone();
                             async move {
-                                let now = tokio::time::Instant::now();
+                                let now = time::Instant::now();
                                 let delay = {
                                     let mut last = last_time.lock().expect(MUTEX_POISONED);
                                     let d = now.duration_since(*last);
@@ -1050,7 +1098,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_max_elapsed_stops_early() {
         let config = RetryConfig {
             max_retries: 100, // Very high retry count
@@ -1067,7 +1116,7 @@ mod tests {
         let attempt_counter = Arc::new(AtomicU32::new(0));
         let counter_clone = attempt_counter.clone();
 
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
         let result = manager
             .execute_with_retry(
                 "test_elapsed_limit",
@@ -1093,7 +1142,8 @@ mod tests {
         assert!(elapsed.as_millis() >= 100);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_mixed_errors_retry_behavior() {
         let config = RetryConfig {
             max_retries: 5,
@@ -1136,7 +1186,8 @@ mod tests {
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_cancellation_during_retry_delay() {
         use tokio_util::sync::CancellationToken;
 
@@ -1156,15 +1207,15 @@ mod tests {
         let token_clone = token.clone();
 
         // Cancel after a short delay
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        spawn(async move {
+            time::sleep(Duration::from_millis(100)).await;
             token_clone.cancel();
         });
 
         let attempt_counter = Arc::new(AtomicU32::new(0));
         let counter_clone = attempt_counter.clone();
 
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
         let result = manager
             .execute_with_retry_with_cancel(
                 "test_cancellation",
@@ -1196,7 +1247,8 @@ mod tests {
         assert!(attempts >= 1);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_cancellation_during_operation_execution() {
         use tokio_util::sync::CancellationToken;
 
@@ -1216,18 +1268,18 @@ mod tests {
         let token_clone = token.clone();
 
         // Cancel after a short delay
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        spawn(async move {
+            time::sleep(Duration::from_millis(50)).await;
             token_clone.cancel();
         });
 
-        let start = tokio::time::Instant::now();
+        let start = time::Instant::now();
         let result = manager
             .execute_with_retry_with_cancel(
                 "test_cancellation_during_op",
                 || async {
                     // Long-running operation
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    time::sleep(Duration::from_millis(200)).await;
                     Ok::<i32, TestError>(42)
                 },
                 should_retry_test_error,
@@ -1247,7 +1299,8 @@ mod tests {
         assert!(elapsed.as_millis() < 250);
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_cancellation_error_message() {
         use tokio_util::sync::CancellationToken;
 
@@ -1280,16 +1333,37 @@ mod proptest_tests {
         atomic::{AtomicU32, Ordering},
     };
 
+    #[cfg(all(feature = "simulation", madsim))]
+    use madsim::task::spawn;
     use nautilus_core::MUTEX_POISONED;
     use proptest::prelude::*;
     // Import rstest attribute macro used within proptest! tests
     use rstest::rstest;
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    use tokio::task::spawn;
 
-    use super::{
-        test_utils::*,
-        tests::{advance_until, yield_until},
-        *,
-    };
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    use super::tests::{advance_until, yield_until};
+    use super::{test_utils::*, tests::advance_clock, *};
+    use crate::dst::time;
+
+    // Each proptest case constructs a runtime to drive the manager via
+    // `block_on`. Under tokio, that runtime is paused so virtual sleeps
+    // auto-advance; under madsim, the runtime is the deterministic sim
+    // runtime, which also runs in virtual time. Both expose `block_on`.
+    #[cfg(all(feature = "simulation", madsim))]
+    fn build_paused_runtime() -> madsim::runtime::Runtime {
+        madsim::runtime::Runtime::new()
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    fn build_paused_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
 
     proptest! {
         #[rstest]
@@ -1327,10 +1401,7 @@ mod proptest_tests {
             initial_delay_ms in 1u64..10,
             backoff_factor in 1.0f64..2.0,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries,
@@ -1370,11 +1441,7 @@ mod proptest_tests {
             timeout_ms in 10u64..50,
             operation_delay_ms in 60u64..100,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries: 0, // No retries to isolate timeout behavior
@@ -1393,7 +1460,7 @@ mod proptest_tests {
                 let operation_future = manager.execute_with_retry(
                     "timeout_test",
                     move || async move {
-                        tokio::time::sleep(Duration::from_millis(operation_delay_ms)).await;
+                        time::sleep(Duration::from_millis(operation_delay_ms)).await;
                         Ok::<i32, TestError>(42)
                     },
                     |_: &TestError| true,
@@ -1401,7 +1468,7 @@ mod proptest_tests {
                 );
 
                 // Advance time to trigger timeout
-                tokio::time::advance(Duration::from_millis(timeout_ms + 10)).await;
+                advance_clock(Duration::from_millis(timeout_ms + 10)).await;
                 operation_future.await
             });
 
@@ -1416,11 +1483,7 @@ mod proptest_tests {
             delay_per_retry in 15u64..30,
             max_retries in 10u32..20,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             // Set up config where we would exceed max_elapsed_ms before max_retries
             let config = RetryConfig {
@@ -1453,7 +1516,7 @@ mod proptest_tests {
                 );
 
                 // Advance time past max_elapsed_ms
-                tokio::time::advance(Duration::from_millis(max_elapsed_ms + delay_per_retry)).await;
+                advance_clock(Duration::from_millis(max_elapsed_ms + delay_per_retry)).await;
                 operation_future.await
             });
 
@@ -1472,11 +1535,7 @@ mod proptest_tests {
             jitter_ms in 0u64..20,
             base_delay_ms in 10u64..30,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries: 2,
@@ -1494,12 +1553,13 @@ mod proptest_tests {
             let attempt_times_for_block = attempt_times.clone();
 
             rt.block_on(async move {
+                #[cfg(not(all(feature = "simulation", madsim)))]
                 let attempt_times_for_wait = attempt_times_for_block.clone();
-                let handle = tokio::spawn({
+                let handle = spawn({
                     let attempt_times_for_task = attempt_times_for_block.clone();
                     let manager = manager;
                     async move {
-                        let start_time = tokio::time::Instant::now();
+                        let start_time = time::Instant::now();
                         let _ = manager
                             .execute_with_retry(
                                 "jitter_test",
@@ -1520,9 +1580,16 @@ mod proptest_tests {
                     }
                 });
 
-                yield_until(|| !attempt_times_for_wait.lock().expect(MUTEX_POISONED).is_empty()).await;
-                advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 2).await;
-                advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 3).await;
+                // Under tokio paused clock, drive virtual time forward in 1ms
+                // ticks to release the manager's sleeps; under madsim the
+                // runtime auto-advances when all tasks block on virtual time,
+                // so awaiting the handle is enough and yields exact timings.
+                #[cfg(not(all(feature = "simulation", madsim)))]
+                {
+                    yield_until(|| !attempt_times_for_wait.lock().expect(MUTEX_POISONED).is_empty()).await;
+                    advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 2).await;
+                    advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 3).await;
+                }
 
                 handle.await.unwrap();
             });
@@ -1564,11 +1631,7 @@ mod proptest_tests {
             immediate_first in any::<bool>(),
             initial_delay_ms in 10u64..30,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries: 2,
@@ -1586,12 +1649,13 @@ mod proptest_tests {
             let attempt_times_for_block = attempt_times.clone();
 
             rt.block_on(async move {
+                #[cfg(not(all(feature = "simulation", madsim)))]
                 let attempt_times_for_wait = attempt_times_for_block.clone();
-                let handle = tokio::spawn({
+                let handle = spawn({
                     let attempt_times_for_task = attempt_times_for_block.clone();
                     let manager = manager;
                     async move {
-                        let start = tokio::time::Instant::now();
+                        let start = time::Instant::now();
                         let _ = manager
                             .execute_with_retry(
                                 "immediate_test",
@@ -1610,9 +1674,15 @@ mod proptest_tests {
                     }
                 });
 
-                yield_until(|| !attempt_times_for_wait.lock().expect(MUTEX_POISONED).is_empty()).await;
-                advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 2).await;
-                advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 3).await;
+                // See test_jitter_bounds: madsim auto-advances virtual time
+                // when all tasks block on it, so awaiting the handle suffices
+                // and avoids the 1ms-tick driver's added scheduler overhead.
+                #[cfg(not(all(feature = "simulation", madsim)))]
+                {
+                    yield_until(|| !attempt_times_for_wait.lock().expect(MUTEX_POISONED).is_empty()).await;
+                    advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 2).await;
+                    advance_until(|| attempt_times_for_wait.lock().expect(MUTEX_POISONED).len() >= 3).await;
+                }
 
                 handle.await.unwrap();
             });
@@ -1638,10 +1708,7 @@ mod proptest_tests {
             attempt_before_non_retryable in 0usize..3,
             max_retries in 3u32..5,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries,
@@ -1690,11 +1757,7 @@ mod proptest_tests {
         ) {
             use tokio_util::sync::CancellationToken;
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries: 10,
@@ -1713,8 +1776,8 @@ mod proptest_tests {
 
             let result: Result<i32, TestError> = rt.block_on(async {
                 // Spawn cancellation task
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(cancel_after_ms)).await;
+                spawn(async move {
+                    time::sleep(Duration::from_millis(cancel_after_ms)).await;
                     token_clone.cancel();
                 });
 
@@ -1729,7 +1792,7 @@ mod proptest_tests {
                 );
 
                 // Advance time to trigger cancellation
-                tokio::time::advance(Duration::from_millis(cancel_after_ms + 10)).await;
+                advance_clock(Duration::from_millis(cancel_after_ms + 10)).await;
                 operation_future.await
             });
 
@@ -1744,11 +1807,7 @@ mod proptest_tests {
             max_elapsed_ms in 10u64..30,
             delay_per_retry in 20u64..50,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             // Configure so that first retry delay would exceed budget
             let config = RetryConfig {
@@ -1776,7 +1835,7 @@ mod proptest_tests {
                 );
 
                 // Advance time past max_elapsed_ms
-                tokio::time::advance(Duration::from_millis(max_elapsed_ms + delay_per_retry)).await;
+                advance_clock(Duration::from_millis(max_elapsed_ms + delay_per_retry)).await;
                 operation_future.await
             });
 
@@ -1789,11 +1848,7 @@ mod proptest_tests {
             k in 1usize..5,
             initial_delay_ms in 5u64..20,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .start_paused(true)
-                .build()
-                .unwrap();
+            let rt = build_paused_runtime();
 
             let config = RetryConfig {
                 max_retries: 10, // More than k
@@ -1812,7 +1867,7 @@ mod proptest_tests {
             let target_k = k;
 
             let (result, _elapsed) = rt.block_on(async {
-                let start = tokio::time::Instant::now();
+                let start = time::Instant::now();
 
                 let operation_future = manager.execute_with_retry(
                     "kth_attempt_test",
@@ -1833,7 +1888,7 @@ mod proptest_tests {
 
                 // Advance time to allow enough retries
                 for _ in 0..k {
-                    tokio::time::advance(Duration::from_millis(initial_delay_ms * 4)).await;
+                    advance_clock(Duration::from_millis(initial_delay_ms * 4)).await;
                 }
 
                 let result = operation_future.await;

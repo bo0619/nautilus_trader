@@ -37,20 +37,31 @@ use futures_util::{SinkExt, StreamExt};
 use http::HeaderName;
 use nautilus_core::CleanDrop;
 use nautilus_cryptography::providers::install_cryptographic_provider;
+#[cfg(any(feature = "turmoil", feature = "transport-sockudo"))]
+use rustls::ClientConfig;
+#[cfg(feature = "transport-sockudo")]
+use sockudo_ws::{
+    Config as SockudoConfig, Http1, Role, Stream as SockudoStream,
+    WebSocketStream as SockudoWebSocketStream,
+};
+#[cfg(feature = "transport-sockudo")]
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(any(feature = "turmoil", feature = "transport-sockudo"))]
+use tokio_rustls::TlsConnector;
 #[cfg(feature = "turmoil")]
 use tokio_tungstenite::MaybeTlsStream;
 #[cfg(feature = "turmoil")]
 use tokio_tungstenite::client_async;
 #[cfg(not(feature = "turmoil"))]
 use tokio_tungstenite::connect_async_with_config;
-use tokio_tungstenite::tungstenite::{
-    Error, Message, client::IntoClientRequest, http::HeaderValue,
-};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
 use ustr::Ustr;
 
+#[cfg(not(feature = "turmoil"))]
+use super::proxy::{ProxiedStream, ProxyKind, WsTarget, tunnel_via_proxy};
 use super::{
     auth::{AuthState, AuthTracker},
-    config::WebSocketConfig,
+    config::{TransportBackend, WebSocketConfig},
     consts::{
         CONNECTION_STATE_CHECK_INTERVAL_MS, GRACEFUL_SHUTDOWN_DELAY_MS,
         GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
@@ -59,6 +70,12 @@ use super::{
 };
 #[cfg(feature = "turmoil")]
 use crate::net::TcpConnector;
+#[cfg(feature = "transport-sockudo")]
+use crate::net::TcpStream;
+#[cfg(feature = "transport-sockudo")]
+use crate::transport::sockudo::{
+    PrefixedIo, SockudoTransport, client_handshake_with_headers, validate_extra_headers,
+};
 use crate::{
     RECONNECTED,
     backoff::ExponentialBackoff,
@@ -67,6 +84,7 @@ use crate::{
     logging::{log_task_aborted, log_task_started, log_task_stopped},
     mode::ConnectionMode,
     ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
+    transport::{BoxedWsTransport, Message, TransportError, tungstenite::TungsteniteTransport},
 };
 
 /// `WebSocketClient` connects to a websocket server to read and send messages.
@@ -133,7 +151,7 @@ impl WebSocketClientInner {
     pub async fn new_with_writer(
         config: WebSocketConfig,
         writer: MessageWriter,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, TransportError> {
         install_cryptographic_provider();
 
         let connection_mode = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
@@ -150,7 +168,9 @@ impl WebSocketClientInner {
             100,
             true,
         )
-        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+        .map_err(|e| {
+            TransportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
 
         let auth_tracker = Arc::new(OnceLock::new());
         let reconnect_buffer_waits_for_auth = Arc::new(AtomicBool::new(false));
@@ -210,18 +230,18 @@ impl WebSocketClientInner {
         config: WebSocketConfig,
         message_handler: Option<MessageHandler>,
         ping_handler: Option<PingHandler>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, TransportError> {
         install_cryptographic_provider();
 
         if config.heartbeat == Some(0) {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Heartbeat interval cannot be zero",
             )));
         }
 
         if config.idle_timeout_ms == Some(0) {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Idle timeout cannot be zero",
             )));
@@ -231,8 +251,13 @@ impl WebSocketClientInner {
         let is_stream_mode = message_handler.is_none();
         let reconnect_max_attempts = config.reconnect_max_attempts;
 
-        let (writer, reader) =
-            Self::connect_with_server(&config.url, config.headers.clone()).await?;
+        let (writer, reader) = Box::pin(Self::connect_with_server(
+            &config.url,
+            config.headers.clone(),
+            config.backend,
+            config.proxy_url.as_deref(),
+        ))
+        .await?;
 
         let connection_mode = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
         let state_notify = Arc::new(tokio::sync::Notify::new());
@@ -282,7 +307,9 @@ impl WebSocketClientInner {
             config.reconnect_jitter_ms.unwrap_or(100),
             true, // immediate-first
         )
-        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+        .map_err(|e| {
+            TransportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
 
         Ok(Self {
             config,
@@ -305,76 +332,202 @@ impl WebSocketClientInner {
         })
     }
 
-    /// Connects with the server creating a tokio-tungstenite websocket stream.
-    /// Production version that uses `connect_async_with_config` convenience helper.
+    /// Connect to the server and return the split halves of the active transport.
+    ///
+    /// Dispatches on `backend` to the matching backend helper. The
+    /// [`TransportBackend::Tungstenite`] backend is always available; the
+    /// [`TransportBackend::Sockudo`] backend requires the `transport-sockudo`
+    /// Cargo feature (enabled by default) and uses a custom HTTP/1.1 handshake
+    /// path for upgrade headers.
+    ///
+    /// When `proxy_url` is `Some`, the Tungstenite backend establishes an HTTP
+    /// `CONNECT` tunnel through the proxy before performing the WebSocket
+    /// handshake. The Sockudo backend does not yet support proxying; when it
+    /// is selected together with a proxy URL, this method logs a warning and
+    /// transparently falls back to Tungstenite so omitted-backend Python
+    /// configurations keep working.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The URL cannot be parsed into a valid client request.
-    /// - Header values are invalid.
-    /// - The WebSocket connection fails.
+    /// Returns a [`TransportError`] if the URL is invalid, headers fail to
+    /// parse, the TCP / TLS layer cannot be established, the proxy refuses
+    /// the tunnel, or the WebSocket handshake is rejected by the peer. When
+    /// the Sockudo backend is selected without the `transport-sockudo`
+    /// feature, returns [`TransportError::Other`].
     #[inline]
-    #[cfg(not(feature = "turmoil"))]
     pub async fn connect_with_server(
         url: &str,
         headers: Vec<(String, String)>,
-    ) -> Result<(MessageWriter, MessageReader), Error> {
-        let mut request = url.into_client_request()?;
+        backend: TransportBackend,
+        proxy_url: Option<&str>,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        // Sockudo does not yet support proxy tunnels. When a proxy URL is supplied,
+        // route through Tungstenite so configurations that rely on the runtime
+        // default keep working (notably the Python `WebSocketConfig` binding,
+        // which exposes `proxy_url` but no `backend` selector).
+        if matches!(backend, TransportBackend::Sockudo)
+            && let Some(proxy) = proxy_url
+        {
+            log::warn!("Sockudo backend does not support proxy_url; falling back to Tungstenite");
+            return Box::pin(Self::connect_tungstenite_via_proxy(url, headers, proxy)).await;
+        }
+
+        match backend {
+            TransportBackend::Tungstenite => match proxy_url {
+                Some(proxy) => {
+                    Box::pin(Self::connect_tungstenite_via_proxy(url, headers, proxy)).await
+                }
+                None => Self::connect_tungstenite(url, headers).await,
+            },
+            TransportBackend::Sockudo => {
+                #[cfg(feature = "transport-sockudo")]
+                {
+                    Self::connect_sockudo(url, headers).await
+                }
+                #[cfg(not(feature = "transport-sockudo"))]
+                {
+                    Err(TransportError::Other(
+                        "sockudo backend selected but the transport-sockudo \
+                         Cargo feature is not enabled"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Connects with the server creating a tokio-tungstenite websocket stream.
+    /// Production version that uses `connect_async_with_config` convenience helper.
+    #[inline]
+    #[cfg(not(feature = "turmoil"))]
+    async fn connect_tungstenite(
+        url: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        let mut request = url.into_client_request().map_err(TransportError::from)?;
         let req_headers = request.headers_mut();
 
-        let mut header_names: Vec<HeaderName> = Vec::new();
-
         for (key, val) in headers {
-            let header_value = HeaderValue::from_str(&val)?;
-            let header_name: HeaderName = key.parse()?;
-            header_names.push(header_name.clone());
+            let header_value = HeaderValue::from_str(&val)
+                .map_err(|e| TransportError::Handshake(format!("invalid header value: {e}")))?;
+            let header_name: HeaderName = key
+                .parse()
+                .map_err(|e| TransportError::Handshake(format!("invalid header name: {e}")))?;
             req_headers.insert(header_name, header_value);
         }
 
-        connect_async_with_config(request, None, true)
+        let (stream, _resp) = connect_async_with_config(request, None, true)
             .await
-            .map(|resp| resp.0.split())
+            .map_err(TransportError::from)?;
+        let transport: BoxedWsTransport = Box::pin(TungsteniteTransport::new(stream));
+        Ok(transport.split())
+    }
+
+    /// Connects via an HTTP `CONNECT` proxy and performs the WebSocket
+    /// handshake over the resulting tunnel.
+    ///
+    /// Recognised but unsupported proxy schemes (currently SOCKS) log a
+    /// warning and fall back to a direct connection so existing REST proxy
+    /// configs remain usable. Only available in production builds; the
+    /// turmoil simulator does not model arbitrary outbound TCP via a proxy.
+    #[inline]
+    #[cfg(not(feature = "turmoil"))]
+    async fn connect_tungstenite_via_proxy(
+        url: &str,
+        headers: Vec<(String, String)>,
+        proxy_url: &str,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        let proxy = match ProxyKind::parse(proxy_url)? {
+            ProxyKind::Http(target) => target,
+            ProxyKind::Unsupported { scheme } => {
+                log::warn!(
+                    "WebSocket proxy_url scheme '{scheme}' is not yet supported; \
+                     connecting without a WebSocket proxy"
+                );
+                return Self::connect_tungstenite(url, headers).await;
+            }
+        };
+
+        let mut request = url.into_client_request().map_err(TransportError::from)?;
+        let req_headers = request.headers_mut();
+
+        for (key, val) in headers {
+            let header_value = HeaderValue::from_str(&val)
+                .map_err(|e| TransportError::Handshake(format!("invalid header value: {e}")))?;
+            let header_name: HeaderName = key
+                .parse()
+                .map_err(|e| TransportError::Handshake(format!("invalid header name: {e}")))?;
+            req_headers.insert(header_name, header_value);
+        }
+
+        let target = WsTarget::parse(url)?;
+        let stream = tunnel_via_proxy(&target, &proxy).await?;
+
+        // Each ProxiedStream variant carries a distinct concrete stream type,
+        // so we monomorphize the handshake through `proxied_ws_handshake`
+        // rather than duplicating the body four times. The arms are
+        // syntactically identical post-deref, but each call instantiates a
+        // different generic; the `match_same_arms` lint is a false positive
+        // here. The futures are boxed because `client_async` produces a
+        // large state machine.
+        #[allow(clippy::match_same_arms)]
+        let transport: BoxedWsTransport = match stream {
+            ProxiedStream::Plain(tcp) => Box::pin(proxied_ws_handshake(request, tcp)).await?,
+            ProxiedStream::PlainOverTlsProxy(s) => {
+                Box::pin(proxied_ws_handshake(request, *s)).await?
+            }
+            ProxiedStream::Tls(s) => Box::pin(proxied_ws_handshake(request, *s)).await?,
+            ProxiedStream::TlsOverTlsProxy(s) => {
+                Box::pin(proxied_ws_handshake(request, *s)).await?
+            }
+        };
+
+        Ok(transport.split())
+    }
+
+    /// Turmoil simulator variant: HTTP `CONNECT` tunneling is not supported
+    /// under the simulator so any proxy URL is rejected up front.
+    #[inline]
+    #[cfg(feature = "turmoil")]
+    #[expect(
+        clippy::unused_async,
+        reason = "signature mirrors the production variant; both are awaited in the dispatcher"
+    )]
+    async fn connect_tungstenite_via_proxy(
+        _url: &str,
+        _headers: Vec<(String, String)>,
+        _proxy_url: &str,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        Err(TransportError::Other(
+            "proxy_url is not supported under the turmoil simulator".to_string(),
+        ))
     }
 
     /// Connects with the server creating a tokio-tungstenite websocket stream.
     /// Turmoil version that uses the lower-level `client_async` API with injected stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The URL cannot be parsed into a valid client request.
-    /// - The URL is missing a hostname.
-    /// - Header values are invalid.
-    /// - The TCP connection fails.
-    /// - TLS setup fails (for wss:// URLs).
-    /// - The WebSocket handshake fails.
     #[inline]
     #[cfg(feature = "turmoil")]
-    pub async fn connect_with_server(
+    async fn connect_tungstenite(
         url: &str,
         headers: Vec<(String, String)>,
-    ) -> Result<(MessageWriter, MessageReader), Error> {
-        use rustls::ClientConfig;
-        use tokio_rustls::TlsConnector;
-
-        let mut request = url.into_client_request()?;
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        let mut request = url.into_client_request().map_err(TransportError::from)?;
         let req_headers = request.headers_mut();
 
-        let mut header_names: Vec<HeaderName> = Vec::new();
-
         for (key, val) in headers {
-            let header_value = HeaderValue::from_str(&val)?;
-            let header_name: HeaderName = key.parse()?;
-            header_names.push(header_name.clone());
+            let header_value = HeaderValue::from_str(&val)
+                .map_err(|e| TransportError::Handshake(format!("invalid header value: {e}")))?;
+            let header_name: HeaderName = key
+                .parse()
+                .map_err(|e| TransportError::Handshake(format!("invalid header name: {e}")))?;
             req_headers.insert(header_name, header_value);
         }
 
         let uri = request.uri();
         let scheme = uri.scheme_str().unwrap_or("ws");
-        let host = uri.host().ok_or_else(|| {
-            Error::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName)
-        })?;
+        let host = uri
+            .host()
+            .ok_or_else(|| TransportError::InvalidUrl("missing hostname".to_string()))?;
 
         // Determine port: use explicit port if specified, otherwise default based on scheme
         let port = uri
@@ -401,26 +554,209 @@ impl WebSocketClientInner {
                 .with_no_client_auth();
 
             let tls_connector = TlsConnector::from(std::sync::Arc::new(config));
-            let domain =
-                rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| {
-                    Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid DNS name: {e}"),
-                    ))
-                })?;
+            let domain = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| TransportError::Tls(format!("Invalid DNS name: {e}")))?;
 
-            let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
+            let tls_stream = tls_connector
+                .connect(domain, tcp_stream)
+                .await
+                .map_err(TransportError::Io)?;
             MaybeTlsStream::Rustls(tls_stream)
         } else {
             MaybeTlsStream::Plain(tcp_stream)
         };
 
         // Use client_async with the stream (plain or TLS)
-        client_async(request, maybe_tls_stream)
+        let (stream, _resp) = client_async(request, maybe_tls_stream)
             .await
-            .map(|resp| resp.0.split())
+            .map_err(TransportError::from)?;
+        let transport: BoxedWsTransport = Box::pin(TungsteniteTransport::new(stream));
+        Ok(transport.split())
     }
 
+    /// Connects with the server using the sockudo-ws backend.
+    ///
+    /// Uses a local HTTP/1.1 handshake helper so error logging and stream
+    /// construction stay in our hands regardless of header count.
+    ///
+    /// Under the turmoil simulator, only plaintext `ws://` is supported (the
+    /// simulator does not model TLS), so a `wss://` URL returns
+    /// [`TransportError::Tls`] up front.
+    #[inline]
+    #[cfg(feature = "transport-sockudo")]
+    async fn connect_sockudo(
+        url: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        let target = SockudoTarget::parse(url)?;
+        validate_extra_headers(&headers).map_err(TransportError::from)?;
+
+        #[cfg(feature = "turmoil")]
+        if target.is_tls {
+            return Err(TransportError::Tls(
+                "wss:// is not supported under the turmoil simulator; use ws://".to_string(),
+            ));
+        }
+
+        let tcp_stream = TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map_err(TransportError::Io)?;
+
+        if let Err(e) = tcp_stream.set_nodelay(true) {
+            log::warn!("Failed to enable TCP_NODELAY for sockudo client: {e:?}");
+        }
+
+        #[cfg(not(feature = "turmoil"))]
+        if target.is_tls {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(std::sync::Arc::new(config));
+            let domain = rustls::pki_types::ServerName::try_from(target.host.clone())
+                .map_err(|e| TransportError::Tls(format!("Invalid DNS name: {e}")))?;
+            let tls_stream = connector
+                .connect(domain, tcp_stream)
+                .await
+                .map_err(TransportError::Io)?;
+            return Self::finish_sockudo_handshake(tls_stream, &target, &headers).await;
+        }
+
+        Self::finish_sockudo_handshake(tcp_stream, &target, &headers).await
+    }
+
+    #[cfg(feature = "transport-sockudo")]
+    async fn finish_sockudo_handshake<S>(
+        mut stream: S,
+        target: &SockudoTarget,
+        headers: &[(String, String)],
+    ) -> Result<(MessageWriter, MessageReader), TransportError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // Use our helper for both paths: uniform error logging, and we own
+        // stream construction since sockudo's high-level client drops the
+        // handshake leftover.
+        let handshake = client_handshake_with_headers(
+            &mut stream,
+            &target.host_header,
+            &target.path,
+            None,
+            headers,
+        )
+        .await
+        .map_err(TransportError::from)?;
+
+        // Reading the HTTP 101 may also read the first WebSocket frame prefix;
+        // replay it only when present so the ordinary path stays unwrapped.
+        let stream = match handshake.leftover {
+            Some(prefix) => SockudoStream::<Http1>::new(PrefixedIo::new(stream, prefix)),
+            None => SockudoStream::<Http1>::new(stream),
+        };
+        let ws = SockudoWebSocketStream::from_raw(stream, Role::Client, SockudoConfig::default());
+        let transport: BoxedWsTransport = Box::pin(SockudoTransport::new(ws));
+        Ok(transport.split())
+    }
+}
+
+/// Complete the WebSocket handshake over a stream that has already been
+/// tunneled through an HTTP `CONNECT` proxy. Generic over the concrete
+/// stream type so the four [`super::proxy::ProxiedStream`] variants share
+/// a single body.
+#[cfg(not(feature = "turmoil"))]
+async fn proxied_ws_handshake<S>(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    stream: S,
+) -> Result<BoxedWsTransport, TransportError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (ws, _resp) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .map_err(TransportError::from)?;
+    Ok(Box::pin(TungsteniteTransport::new(ws)))
+}
+
+/// Parsed components of a `ws://` / `wss://` URL needed by the sockudo backend.
+///
+/// Sockudo's HTTP/1.1 client passes the `host` argument verbatim as the
+/// HTTP `Host:` header, so it must include the explicit port when one is
+/// present in the URL (RFC 7230 section 5.4). The DNS / SNI lookup uses the bare
+/// host without the port.
+#[cfg(feature = "transport-sockudo")]
+#[derive(Debug, PartialEq, Eq)]
+struct SockudoTarget {
+    host: String,
+    /// Value to send as the HTTP `Host:` header. Includes `:port` only when
+    /// the URL specifies a non-default port explicitly.
+    host_header: String,
+    port: u16,
+    path: String,
+    is_tls: bool,
+}
+
+#[cfg(feature = "transport-sockudo")]
+impl SockudoTarget {
+    fn parse(url: &str) -> Result<Self, TransportError> {
+        let parsed =
+            url::Url::parse(url).map_err(|e| TransportError::InvalidUrl(format!("{url}: {e}")))?;
+
+        let scheme = parsed.scheme();
+        let is_tls = match scheme {
+            "ws" => false,
+            "wss" => true,
+            other => {
+                return Err(TransportError::InvalidUrl(format!(
+                    "expected ws:// or wss:// scheme, was {other}"
+                )));
+            }
+        };
+
+        let raw_host = parsed
+            .host_str()
+            .ok_or_else(|| TransportError::InvalidUrl("missing hostname".to_string()))?;
+
+        // url::Url stores IPv6 hosts in their bracketed form (e.g. `[::1]`).
+        // Brackets are correct for the HTTP `Host:` header but invalid for
+        // DNS/TCP and TLS SNI, so we keep two representations: a bracketed
+        // `host_header` for the upgrade, and a bare `host` for socket dialing.
+        let is_bracketed = raw_host.starts_with('[') && raw_host.ends_with(']');
+        let host = if is_bracketed {
+            raw_host[1..raw_host.len() - 1].to_string()
+        } else {
+            raw_host.to_string()
+        };
+
+        let explicit_port = parsed.port();
+        let port = explicit_port.unwrap_or(if is_tls { 443 } else { 80 });
+        let host_header = match explicit_port {
+            Some(p) => format!("{raw_host}:{p}"),
+            None => raw_host.to_string(),
+        };
+
+        let path = if parsed.path().is_empty() {
+            "/".to_string()
+        } else {
+            let mut p = parsed.path().to_string();
+            if let Some(query) = parsed.query() {
+                p.push('?');
+                p.push_str(query);
+            }
+            p
+        };
+
+        Ok(Self {
+            host,
+            host_header,
+            port,
+            path,
+            is_tls,
+        })
+    }
+}
+
+impl WebSocketClientInner {
     /// Reconnect with server.
     ///
     /// Make a new connection with server. Use the new read and write halves
@@ -435,7 +771,7 @@ impl WebSocketClientInner {
     /// Returns an error if:
     /// - The reconnection attempt times out.
     /// - The connection to the server fails.
-    pub async fn reconnect(&mut self) -> Result<(), Error> {
+    pub async fn reconnect(&mut self) -> Result<(), TransportError> {
         log::debug!("Reconnecting");
 
         if self.is_stream_mode {
@@ -456,8 +792,13 @@ impl WebSocketClientInner {
 
         dst::time::timeout(self.reconnect_timeout, async {
             // Attempt to connect; abort early if a disconnect was requested
-            let (new_writer, reader) =
-                Self::connect_with_server(&self.config.url, self.config.headers.clone()).await?;
+            let (new_writer, reader) = Self::connect_with_server(
+                &self.config.url,
+                self.config.headers.clone(),
+                self.config.backend,
+                self.config.proxy_url.as_deref(),
+            )
+            .await?;
 
             if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
                 log::debug!("Reconnect aborted mid-flight (after connect)");
@@ -469,7 +810,7 @@ impl WebSocketClientInner {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if let Err(e) = self.writer_tx.send(WriterCommand::Update(new_writer, tx)) {
                 log::error!("{e}");
-                return Err(Error::Io(std::io::Error::new(
+                return Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     format!("Failed to send update command: {e}"),
                 )));
@@ -480,13 +821,13 @@ impl WebSocketClientInner {
                 Ok(true) => log::debug!("Writer confirmed socket update"),
                 Ok(false) => {
                     log::warn!("Writer rejected socket update, aborting reconnect");
-                    return Err(Error::Io(std::io::Error::other(
+                    return Err(TransportError::Io(std::io::Error::other(
                         "Failed to update reconnection writer",
                     )));
                 }
                 Err(e) => {
                     log::error!("Writer dropped update channel: {e}");
-                    return Err(Error::Io(std::io::Error::new(
+                    return Err(TransportError::Io(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "Writer task dropped response channel",
                     )));
@@ -542,7 +883,7 @@ impl WebSocketClientInner {
         })
         .await
         .map_err(|_| {
-            Error::Io(std::io::Error::new(
+            TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "reconnection timed out after {}s",
@@ -601,7 +942,7 @@ impl WebSocketClientInner {
                         }
                     }
                     Ok(Some(Ok(Message::Text(data)))) => {
-                        log::trace!("Received message: {data}");
+                        log::trace!("Received message: {data:?}");
                         last_data_time = dst::time::Instant::now();
 
                         if let Some(ref handler) = message_handler {
@@ -625,7 +966,6 @@ impl WebSocketClientInner {
                         log::debug!("Received close message - terminating");
                         break;
                     }
-                    Ok(Some(Ok(_))) => (),
                     Ok(Some(Err(e))) => {
                         log::error!("Received error message - terminating: {e}");
                         break;
@@ -1021,12 +1361,17 @@ impl WebSocketClient {
         keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
         post_reconnect: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> Result<(MessageReader, Self), Error> {
+    ) -> Result<(MessageReader, Self), TransportError> {
         install_cryptographic_provider();
 
         // Create a single connection and split it, respecting configured headers
-        let (writer, reader) =
-            WebSocketClientInner::connect_with_server(&config.url, config.headers.clone()).await?;
+        let (writer, reader) = WebSocketClientInner::connect_with_server(
+            &config.url,
+            config.headers.clone(),
+            config.backend,
+            config.proxy_url.as_deref(),
+        )
+        .await?;
 
         // Create inner without connecting (we'll provide the writer)
         let inner = WebSocketClientInner::new_with_writer(config, writer).await?;
@@ -1090,10 +1435,10 @@ impl WebSocketClient {
         post_reconnection: Option<Arc<dyn Fn() + Send + Sync>>,
         keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, TransportError> {
         // Validate that handler mode has a message handler
         if message_handler.is_none() {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Handler mode requires message_handler to be set. Use connect_stream() for stream mode without a handler.",
             )));
@@ -1634,6 +1979,7 @@ impl Drop for WebSocketClient {
 
 #[cfg(test)]
 #[cfg(not(feature = "turmoil"))]
+#[cfg(not(all(feature = "simulation", madsim)))] // transport-layer I/O not simulated
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
     use std::{num::NonZeroU32, sync::Arc};
@@ -1654,7 +2000,7 @@ mod tests {
 
     use crate::{
         ratelimiter::quota::Quota,
-        websocket::{WebSocketClient, WebSocketConfig},
+        websocket::{TransportBackend, WebSocketClient, WebSocketConfig},
     };
 
     struct TestServer {
@@ -1761,6 +2107,8 @@ mod tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
         WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
             .await
@@ -1805,6 +2153,8 @@ mod tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
         let res =
             WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
@@ -1851,6 +2201,8 @@ mod tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(
@@ -1902,6 +2254,7 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(not(feature = "turmoil"))]
+#[cfg(not(all(feature = "simulation", madsim)))] // transport-layer I/O not simulated
 mod rust_tests {
     use std::sync::{
         Arc, OnceLock,
@@ -1911,12 +2264,24 @@ mod rust_tests {
     use futures_util::{SinkExt, StreamExt};
     use nautilus_common::testing::wait_until_async;
     use rstest::rstest;
+    #[cfg(feature = "transport-sockudo")]
+    use sockudo_ws::handshake as sockudo_handshake;
+    #[cfg(feature = "transport-sockudo")]
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::{
         net::TcpListener,
         task::{self, JoinHandle},
         time::{Duration, sleep},
     };
     use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
+    #[cfg(feature = "transport-sockudo")]
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{
+            handshake::server::{self, Callback},
+            http::HeaderValue,
+        },
+    };
 
     use super::*;
     use crate::websocket::types::channel_message_handler;
@@ -1925,6 +2290,59 @@ mod rust_tests {
         task: JoinHandle<()>,
         port: u16,
         messages: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "transport-sockudo")]
+    async fn read_http_request<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "HTTP request closed before headers completed");
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                return buf;
+            }
+        }
+    }
+
+    #[cfg(feature = "transport-sockudo")]
+    fn extract_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (header_name, header_value) = line.split_once(':')?;
+            if header_name.eq_ignore_ascii_case(name) {
+                Some(header_value.trim())
+            } else {
+                None
+            }
+        })
+    }
+
+    #[cfg(feature = "transport-sockudo")]
+    #[derive(Debug, Clone)]
+    struct HeaderAssertCallback {
+        key: String,
+        value: HeaderValue,
+    }
+
+    #[cfg(feature = "transport-sockudo")]
+    impl Callback for HeaderAssertCallback {
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertion failures should fail the test"
+        )]
+        fn on_request(
+            self,
+            request: &server::Request,
+            response: server::Response,
+        ) -> Result<server::Response, server::ErrorResponse> {
+            assert_eq!(request.headers().get(&self.key), Some(&self.value));
+            Ok(response)
+        }
     }
 
     impl RecordingServer {
@@ -2007,6 +2425,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         // Connect the client
@@ -2052,6 +2472,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2102,6 +2524,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let (_reader, _client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -2149,6 +2573,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2202,7 +2628,7 @@ mod rust_tests {
             {
                 use futures_util::SinkExt;
                 let _ = ws
-                    .send(Message::Text("reconnected".to_string().into()))
+                    .send(WsMessage::Text("reconnected".to_string().into()))
                     .await;
                 sleep(Duration::from_secs(1)).await;
             }
@@ -2222,6 +2648,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(10),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2232,7 +2660,7 @@ mod rust_tests {
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(msg) = rx.try_recv()
-                    && matches!(msg, Message::Text(ref text) if AsRef::<str>::as_ref(text) == "reconnected")
+                    && matches!(msg, WsMessage::Text(ref text) if AsRef::<str>::as_ref(text) == "reconnected")
                 {
                     return true;
                 }
@@ -2264,7 +2692,7 @@ mod rust_tests {
                 && let Ok(mut ws) = accept_async(stream).await
             {
                 use futures_util::SinkExt;
-                let _ = ws.send(Message::Text("hello".to_string().into())).await;
+                let _ = ws.send(WsMessage::Text("hello".to_string().into())).await;
                 sleep(Duration::from_millis(50)).await;
                 // Connection closes when ws is dropped
             }
@@ -2282,6 +2710,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let (mut reader, client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -2294,7 +2724,7 @@ mod rust_tests {
         // Read the hello message
         let msg = reader.next().await;
         assert!(
-            matches!(msg, Some(Ok(Message::Text(ref text))) if AsRef::<str>::as_ref(text) == "hello"),
+            matches!(&msg, Some(Ok(Message::Text(bytes))) if bytes.as_ref() == b"hello"),
             "Should receive initial message"
         );
 
@@ -2365,6 +2795,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2449,6 +2881,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2534,6 +2968,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         // Very restrictive rate limit: 1 request per second, burst of 1
@@ -2625,6 +3061,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2690,6 +3128,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         // Very restrictive rate limit: 1 request per 10 seconds
@@ -2767,6 +3207,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         // Pass None for message_handler - should be rejected
@@ -2815,6 +3257,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         // Create client directly via connect_url with no handler (stream mode)
@@ -2862,6 +3306,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
             idle_timeout_ms: Some(500),
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2920,6 +3366,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
             idle_timeout_ms: Some(1_000),
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2978,6 +3426,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
             idle_timeout_ms: Some(500),
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3045,6 +3495,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
             idle_timeout_ms: Some(1_500),
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3103,6 +3555,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3172,6 +3626,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         // Very restrictive: 1 req per 60 seconds
@@ -3266,6 +3722,8 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let (_reader, client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -3313,9 +3771,14 @@ mod rust_tests {
 
         let server = RecordingServer::setup().await;
         let url = format!("ws://127.0.0.1:{}", server.port);
-        let (writer, _reader) = WebSocketClientInner::connect_with_server(&url, vec![])
-            .await
-            .unwrap();
+        let (writer, _reader) = WebSocketClientInner::connect_with_server(
+            &url,
+            vec![],
+            TransportBackend::Tungstenite,
+            None,
+        )
+        .await
+        .unwrap();
 
         let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Reconnect.as_u8()));
         let state_notify = Arc::new(tokio::sync::Notify::new());
@@ -3335,14 +3798,17 @@ mod rust_tests {
         );
 
         writer_tx
-            .send(WriterCommand::Send(WsMessage::Text(
-                "stale".to_string().into(),
-            )))
+            .send(WriterCommand::Send(Message::Text("stale".into())))
             .unwrap();
 
-        let (new_writer, _reader) = WebSocketClientInner::connect_with_server(&url, vec![])
-            .await
-            .unwrap();
+        let (new_writer, _reader) = WebSocketClientInner::connect_with_server(
+            &url,
+            vec![],
+            TransportBackend::Tungstenite,
+            None,
+        )
+        .await
+        .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send(WriterCommand::Update(new_writer, tx))
@@ -3380,9 +3846,14 @@ mod rust_tests {
     async fn test_write_task_discards_buffer_after_auth_failure() {
         let server = RecordingServer::setup().await;
         let url = format!("ws://127.0.0.1:{}", server.port);
-        let (writer, _reader) = WebSocketClientInner::connect_with_server(&url, vec![])
-            .await
-            .unwrap();
+        let (writer, _reader) = WebSocketClientInner::connect_with_server(
+            &url,
+            vec![],
+            TransportBackend::Tungstenite,
+            None,
+        )
+        .await
+        .unwrap();
 
         let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Reconnect.as_u8()));
         let state_notify = Arc::new(tokio::sync::Notify::new());
@@ -3402,14 +3873,17 @@ mod rust_tests {
         );
 
         writer_tx
-            .send(WriterCommand::Send(WsMessage::Text(
-                "stale".to_string().into(),
-            )))
+            .send(WriterCommand::Send(Message::Text("stale".into())))
             .unwrap();
 
-        let (new_writer, _reader) = WebSocketClientInner::connect_with_server(&url, vec![])
-            .await
-            .unwrap();
+        let (new_writer, _reader) = WebSocketClientInner::connect_with_server(
+            &url,
+            vec![],
+            TransportBackend::Tungstenite,
+            None,
+        )
+        .await
+        .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send(WriterCommand::Update(new_writer, tx))
@@ -3455,6 +3929,8 @@ mod rust_tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: Some(0),
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         };
 
         let result =
@@ -3465,6 +3941,368 @@ mod rust_tests {
         assert!(
             err_msg.contains("Idle timeout cannot be zero"),
             "Error should mention zero idle timeout, was: {err_msg}"
+        );
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    #[tokio::test]
+    async fn test_sockudo_backend_rejects_reserved_headers_before_connect() {
+        let (handler, _rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: "ws://127.0.0.1:1".to_string(),
+            headers: vec![("Host".to_string(), "example.com".to_string())],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: None,
+            reconnect_delay_initial_ms: None,
+            reconnect_delay_max_ms: None,
+            reconnect_backoff_factor: None,
+            reconnect_jitter_ms: None,
+            reconnect_max_attempts: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::Sockudo,
+            proxy_url: None,
+        };
+
+        let err = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .expect_err("reserved header should fail before TCP connect");
+
+        assert!(
+            err.to_string()
+                .contains("reserved upgrade header not allowed in extra_headers"),
+            "expected reserved-header failure, was: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    #[tokio::test]
+    async fn test_sockudo_backend_replays_leftover_without_custom_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8(request).unwrap();
+                let sec_websocket_key = extract_header(&request, "Sec-WebSocket-Key").unwrap();
+                let accept = sockudo_handshake::generate_accept_key(sec_websocket_key);
+                let mut response = format!(
+                    concat!(
+                        "HTTP/1.1 101 Switching Protocols\r\n",
+                        "Upgrade: websocket\r\n",
+                        "Connection: Upgrade\r\n",
+                        "Sec-WebSocket-Accept: {}\r\n",
+                        "\r\n",
+                    ),
+                    accept
+                )
+                .into_bytes();
+                response.extend_from_slice(b"\x81\x05hello");
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+
+        let (handler, mut rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}/ws"),
+            headers: vec![],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(100),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::Sockudo,
+            proxy_url: None,
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .expect("sockudo connect without custom headers");
+
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(msg) = rx.try_recv() {
+                    return msg;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("did not receive leftover frame before timeout");
+
+        match received {
+            WsMessage::Text(t) => assert_eq!(t.as_str(), "hello"),
+            other => panic!("expected text, was {other:?}"),
+        }
+
+        client.disconnect().await;
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server did not close before timeout")
+            .unwrap();
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    #[tokio::test]
+    async fn test_sockudo_backend_sends_custom_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let callback = HeaderAssertCallback {
+                    key: "X-Test".to_string(),
+                    value: HeaderValue::from_static("value"),
+                };
+
+                if let Ok(mut ws) = accept_hdr_async(stream, callback).await {
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if msg.is_text() || msg.is_binary() {
+                            if ws.send(msg).await.is_err() {
+                                break;
+                            }
+
+                            continue;
+                        }
+
+                        if msg.is_close() {
+                            let _ = ws.close(None).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (handler, mut rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![("X-Test".to_string(), "value".to_string())],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(100),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::Sockudo,
+            proxy_url: None,
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .expect("sockudo connect with custom headers");
+
+        client.send_text("ping".to_string(), None).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(msg) = rx.try_recv() {
+                    return msg;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("did not receive echo before timeout");
+
+        match received {
+            WsMessage::Text(t) => assert_eq!(t.as_str(), "ping"),
+            other => panic!("expected text, was {other:?}"),
+        }
+
+        client.disconnect().await;
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server did not close before timeout")
+            .unwrap();
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    #[tokio::test]
+    async fn test_sockudo_backend_round_trip_text() {
+        // tokio-tungstenite test peer paired with a sockudo client.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(mut ws) = accept_async(stream).await
+            {
+                while let Some(Ok(msg)) = ws.next().await {
+                    // Inner if consumes `msg`, cannot hoist into a match guard
+                    #[expect(clippy::collapsible_match)]
+                    match msg {
+                        WsMessage::Text(_) | WsMessage::Binary(_) => {
+                            if ws.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        WsMessage::Close(_) => {
+                            let _ = ws.close(None).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let (handler, mut rx) = channel_message_handler();
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(100),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::Sockudo,
+            proxy_url: None,
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .expect("sockudo connect");
+
+        client.send_text("ping".to_string(), None).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(msg) = rx.try_recv() {
+                    return msg;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("did not receive echo before timeout");
+
+        match received {
+            WsMessage::Text(t) => assert_eq!(t.as_str(), "ping"),
+            other => panic!("expected text, was {other:?}"),
+        }
+
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    #[case::ws_default_port("ws://example.com/ws", "example.com", "example.com", 80, "/ws", false)]
+    #[case::wss_default_port(
+        "wss://example.com/ws",
+        "example.com",
+        "example.com",
+        443,
+        "/ws",
+        true
+    )]
+    // url::Url normalises explicit default ports (`:80` for ws, `:443` for wss)
+    // away, so `parsed.port()` reports `None` here and Host stays unqualified.
+    #[case::ws_explicit_default(
+        "ws://example.com:80/ws",
+        "example.com",
+        "example.com",
+        80,
+        "/ws",
+        false
+    )]
+    #[case::ws_non_default(
+        "ws://example.com:8443/feed",
+        "example.com",
+        "example.com:8443",
+        8443,
+        "/feed",
+        false
+    )]
+    #[case::wss_non_default(
+        "wss://example.com:9443/feed",
+        "example.com",
+        "example.com:9443",
+        9443,
+        "/feed",
+        true
+    )]
+    #[case::root_path(
+        "ws://example.com:9000/",
+        "example.com",
+        "example.com:9000",
+        9000,
+        "/",
+        false
+    )]
+    #[case::query_string(
+        "ws://example.com/feed?token=abc&channel=trades",
+        "example.com",
+        "example.com",
+        80,
+        "/feed?token=abc&channel=trades",
+        false
+    )]
+    // IPv6: bare host strips brackets for DNS/TCP/SNI; Host header keeps them.
+    #[case::ipv6_default("ws://[::1]/feed", "::1", "[::1]", 80, "/feed", false)]
+    #[case::ipv6_explicit_port("ws://[::1]:9000/feed", "::1", "[::1]:9000", 9000, "/feed", false)]
+    #[case::ipv6_wss(
+        "wss://[2001:db8::1]:8443/",
+        "2001:db8::1",
+        "[2001:db8::1]:8443",
+        8443,
+        "/",
+        true
+    )]
+    fn sockudo_target_parses_url(
+        #[case] url: &str,
+        #[case] host: &str,
+        #[case] host_header: &str,
+        #[case] port: u16,
+        #[case] path: &str,
+        #[case] is_tls: bool,
+    ) {
+        let target = super::SockudoTarget::parse(url).expect("parse should succeed");
+        assert_eq!(target.host, host);
+        assert_eq!(target.host_header, host_header);
+        assert_eq!(target.port, port);
+        assert_eq!(target.path, path);
+        assert_eq!(target.is_tls, is_tls);
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    fn sockudo_target_rejects_unsupported_scheme() {
+        let err = super::SockudoTarget::parse("http://example.com/feed").expect_err("not a ws URL");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected ws:// or wss://"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    fn sockudo_target_rejects_malformed_url() {
+        let err = super::SockudoTarget::parse("not a url").expect_err("malformed URL");
+        assert!(
+            matches!(err, super::TransportError::InvalidUrl(_)),
+            "expected InvalidUrl, was: {err:?}"
         );
     }
 }
@@ -3519,7 +4357,7 @@ mod turmoil_tests {
 
             client
                 .writer_tx
-                .send(WriterCommand::Send(WsMessage::Text("stale".into())))
+                .send(WriterCommand::Send(Message::Text("stale".into())))
                 .unwrap();
 
             wait_until_async(|| async { client.is_active() }, Duration::from_secs(3)).await;
@@ -3590,7 +4428,7 @@ mod turmoil_tests {
 
             client
                 .writer_tx
-                .send(WriterCommand::Send(WsMessage::Text("stale".into())))
+                .send(WriterCommand::Send(Message::Text("stale".into())))
                 .unwrap();
 
             wait_until_async(|| async { client.is_active() }, Duration::from_secs(3)).await;
@@ -3635,6 +4473,8 @@ mod turmoil_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
         }
     }
 

@@ -40,13 +40,14 @@ use nautilus_model::{
     python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
+use nautilus_network::websocket::TransportBackend;
 use pyo3::{IntoPyObjectExt, prelude::*};
 use ustr::Ustr;
 
 use crate::{
     common::{
         consts::BYBIT_VENUE,
-        enums::{BybitEnvironment, BybitProductType},
+        enums::{BybitEnvironment, BybitPositionIdx, BybitProductType},
         parse::make_bybit_symbol,
     },
     python::params::{BybitWsAmendOrderParams, BybitWsCancelOrderParams, BybitWsPlaceOrderParams},
@@ -134,14 +135,22 @@ impl BybitWebSocketClient {
     /// Creates a new Bybit public WebSocket client.
     #[staticmethod]
     #[pyo3(name = "new_public")]
-    #[pyo3(signature = (product_type, environment, url=None, heartbeat=20))]
+    #[pyo3(signature = (product_type, environment, url=None, heartbeat=20, proxy_url=None))]
     fn py_new_public(
         product_type: BybitProductType,
         environment: BybitEnvironment,
         url: Option<String>,
         heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
-        Self::new_public_with(product_type, environment, url, heartbeat)
+        Self::new_public_with(
+            product_type,
+            environment,
+            url,
+            heartbeat,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     /// Creates a new Bybit private WebSocket client.
@@ -153,15 +162,24 @@ impl BybitWebSocketClient {
     /// - Mainnet: `BYBIT_API_KEY`, `BYBIT_API_SECRET`
     #[staticmethod]
     #[pyo3(name = "new_private")]
-    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20))]
+    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20, proxy_url=None))]
     fn py_new_private(
         environment: BybitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
         url: Option<String>,
         heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
-        Self::new_private(environment, api_key, api_secret, url, heartbeat)
+        Self::new_private(
+            environment,
+            api_key,
+            api_secret,
+            url,
+            heartbeat,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     /// Creates a new Bybit trade WebSocket client for order operations.
@@ -173,15 +191,24 @@ impl BybitWebSocketClient {
     /// - Mainnet: `BYBIT_API_KEY`, `BYBIT_API_SECRET`
     #[staticmethod]
     #[pyo3(name = "new_trade")]
-    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20))]
+    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20, proxy_url=None))]
     fn py_new_trade(
         environment: BybitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
         url: Option<String>,
         heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
-        Self::new_trade(environment, api_key, api_secret, url, heartbeat)
+        Self::new_trade(
+            environment,
+            api_key,
+            api_secret,
+            url,
+            heartbeat,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     #[getter]
@@ -824,6 +851,7 @@ impl BybitWebSocketClient {
         post_only=None,
         reduce_only=None,
         is_leverage=false,
+        position_idx=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
@@ -845,6 +873,7 @@ impl BybitWebSocketClient {
         post_only: Option<bool>,
         reduce_only: Option<bool>,
         is_leverage: bool,
+        position_idx: Option<BybitPositionIdx>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let pending_py_requests = Arc::clone(self.pending_py_requests());
@@ -866,6 +895,7 @@ impl BybitWebSocketClient {
                     post_only,
                     reduce_only,
                     is_leverage,
+                    position_idx,
                 )
                 .await
                 .map_err(to_pyruntime_err)?;
@@ -1002,6 +1032,7 @@ impl BybitWebSocketClient {
         is_leverage=false,
         take_profit=None,
         stop_loss=None,
+        position_idx=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_build_place_order_params(
@@ -1022,6 +1053,7 @@ impl BybitWebSocketClient {
         is_leverage: bool,
         take_profit: Option<Price>,
         stop_loss: Option<Price>,
+        position_idx: Option<BybitPositionIdx>,
     ) -> PyResult<BybitWsPlaceOrderParams> {
         let params = self
             .build_place_order_params(
@@ -1041,6 +1073,7 @@ impl BybitWebSocketClient {
                 is_leverage,
                 take_profit,
                 stop_loss,
+                position_idx,
             )
             .map_err(to_pyruntime_err)?;
         Ok(params.into())

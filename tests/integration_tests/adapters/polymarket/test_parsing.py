@@ -17,6 +17,7 @@ import pkgutil
 from decimal import Decimal
 
 import msgspec
+import pandas as pd
 import pytest
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_MAX_PRICE
@@ -49,20 +50,26 @@ from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import USDC
-from nautilus_trader.model.currencies import USDC_POS
+from nautilus_trader.model.currencies import pUSD
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import RecordFlag
 from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 
@@ -742,6 +749,29 @@ def test_parse_user_trade(data_file: str) -> None:
     assert isinstance(msg, PolymarketUserTrade)
 
 
+def test_maker_order_without_side_omits_field_in_encoded_json() -> None:
+    # PolymarketMakerOrder.side is optional because legacy / WS-channel
+    # payloads omit it; the V2 REST trade response carries it. The struct
+    # must NOT serialize the absent field as `"side": null` because that
+    # would corrupt fill `info=msg.to_dict()` payloads and the existing
+    # dict-shape regression tests. `omit_defaults=True` enforces this.
+    order = PolymarketMakerOrder(
+        asset_id="x",
+        fee_rate_bps="0",
+        maker_address="y",
+        matched_amount="1",
+        order_id="z",
+        outcome="Yes",
+        owner="o",
+        price="0.5",
+    )
+
+    encoded = msgspec.json.decode(msgspec.json.encode(order))
+
+    assert "side" not in encoded
+    assert encoded["asset_id"] == "x"
+
+
 def test_parse_user_trade_to_dict() -> None:
     # Arrange
     data = pkgutil.get_data(
@@ -989,7 +1019,7 @@ def test_parse_empty_book_snapshot_returns_none():
         {
             "activation_ns": 0,
             "asset_class": "ALTERNATIVE",
-            "currency": "USDC.e",
+            "currency": "pUSD",
             "description": "Bitcoin Up or Down - September 3, 7PM ET",
             "expiration_ns": 1756944000000000000,
             "id": "0x22025ebf02ae8bf9aae999649b145ebe9b5db6e23a36acc7abe9ef5ca184ab57-46428986054832220603415781377952331535489217742718963672459046269597594860904.POLYMARKET",
@@ -1145,7 +1175,7 @@ def test_parse_user_trade_taker_commission_with_fees() -> None:
     )
 
     # Assert
-    assert fill_report.commission == Money(0.75, USDC_POS)
+    assert fill_report.commission == Money(0.75, pUSD)
 
 
 def test_parse_user_trade_maker_commission_is_zero() -> None:
@@ -1212,7 +1242,7 @@ def test_parse_user_trade_maker_commission_is_zero() -> None:
     )
 
     # Assert
-    assert fill_report.commission == Money(0, USDC_POS)
+    assert fill_report.commission == Money(0, pUSD)
 
 
 def test_parse_user_trade_zero_commission_with_no_fees() -> None:
@@ -1274,7 +1304,7 @@ def test_parse_user_trade_zero_commission_with_no_fees() -> None:
     )
 
     # Assert
-    assert fill_report.commission == Money(0.0, USDC_POS)
+    assert fill_report.commission == Money(0.0, pUSD)
 
 
 @pytest.mark.parametrize(
@@ -1360,7 +1390,7 @@ def test_parse_empty_book_snapshot_in_backtest_engine():
         {
             "activation_ns": 0,
             "asset_class": "ALTERNATIVE",
-            "currency": "USDC.e",
+            "currency": "pUSD",
             "description": "Bitcoin Up or Down - September 3, 7PM ET",
             "expiration_ns": 1756944000000000000,
             "id": "0x22025ebf02ae8bf9aae999649b145ebe9b5db6e23a36acc7abe9ef5ca184ab57-46428986054832220603415781377952331535489217742718963672459046269597594860904.POLYMARKET",
@@ -1515,6 +1545,213 @@ def test_trade_report_get_asset_id_maker_returns_maker_order_asset_id() -> None:
     # Assert
     assert result == maker_asset_id
     assert result != taker_asset_id
+
+
+def _binary_option_size_precision_6() -> BinaryOption:
+    # The default test BinaryOption has size_precision=2; live Polymarket
+    # instruments are size_precision=6 (USDC scale). Dust scenarios live at
+    # microshare precision, so we need a precision-6 instrument here.
+    raw_symbol = Symbol(
+        "0x12a0cb60174abc437bf1178367c72d11f069e1a3add20b148fb0ab4279b772b2-92544998123698303655208967887569360731013655782348975589292031774495159624905",
+    )
+    return BinaryOption(
+        instrument_id=InstrumentId(symbol=raw_symbol, venue=Venue("POLYMARKET")),
+        raw_symbol=raw_symbol,
+        outcome="Yes",
+        description="Dust precision test option",
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USDC,
+        price_precision=3,
+        price_increment=Price.from_str("0.001"),
+        size_precision=6,
+        size_increment=Quantity.from_str("0.000001"),
+        activation_ns=0,
+        expiration_ns=pd.Timestamp("2024-01-01", tz="UTC").value,
+        max_quantity=None,
+        min_quantity=Quantity.from_int(5),
+        maker_fee=Decimal(0),
+        taker_fee=Decimal(0),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "original_size", "size_matched", "expected_filled"),
+    [
+        # CLOB cent-tick underfill at MATCHED: snap UP to original_size.
+        (PolymarketOrderStatus.MATCHED, "100.000000", "99.995000", "100.000000"),
+        # V2 BUY USDC-scale overfill at MATCHED: snap DOWN to original_size.
+        (PolymarketOrderStatus.MATCHED, "714.285710", "714.285714", "714.285710"),
+        # Underfill at exactly the band: NOT dust, leave alone.
+        (PolymarketOrderStatus.MATCHED, "100.000000", "99.990000", "99.990000"),
+        # Underfill above the band: real partial leaves, leave alone.
+        (PolymarketOrderStatus.MATCHED, "100.000000", "99.000000", "99.000000"),
+        # Same dust gap at non-MATCHED status: leave alone.
+        (PolymarketOrderStatus.LIVE, "100.000000", "99.995000", "99.995000"),
+        # Dust gap at CANCELED: leave alone (legitimate partial fill before cancel).
+        (PolymarketOrderStatus.CANCELED, "100.000000", "99.995000", "99.995000"),
+    ],
+)
+def test_parse_open_order_to_order_status_report_snaps_dust_filled_qty(
+    status,
+    original_size,
+    size_matched,
+    expected_filled,
+):
+    # See `docs/integrations/polymarket.md` (Fill quantity normalization).
+    open_order = PolymarketOpenOrder(
+        associate_trades=None,
+        id="0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
+        status=status,
+        market="0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+        original_size=original_size,
+        outcome="Yes",
+        maker_address="0xa3D82Ed56F4c68d2328Fb8c29e568Ba2cAF7d7c8",
+        owner="3e2c94ca-8124-c4c1-c7ea-be1ea21b71fe",
+        price="0.513",
+        side=PolymarketOrderSide.BUY,
+        size_matched=size_matched,
+        asset_id="21742633143463906290569050155826241533067272736897614950488156847949938836455",
+        expiration="0",
+        order_type=PolymarketOrderType.GTC,
+        created_at=1725842520,
+    )
+    instrument = _binary_option_size_precision_6()
+
+    report = open_order.parse_to_order_status_report(
+        account_id=AccountId("POLYMARKET-001"),
+        instrument=instrument,
+        client_order_id=None,
+        ts_init=0,
+    )
+
+    assert report.quantity == Quantity.from_str(original_size)
+    assert report.filled_qty == Quantity.from_str(expected_filled)
+
+
+@pytest.mark.parametrize(
+    ("status", "original_size", "size_matched", "expected_filled"),
+    [
+        # CLOB cent-tick underfill at MATCHED: snap UP to original_size.
+        (PolymarketOrderStatus.MATCHED, "100.000000", "99.995000", "100.000000"),
+        # V2 BUY USDC-scale overfill at MATCHED: snap DOWN to original_size.
+        (PolymarketOrderStatus.MATCHED, "714.285710", "714.285714", "714.285710"),
+        # Underfill at exactly the band: NOT dust, leave alone.
+        (PolymarketOrderStatus.MATCHED, "100.000000", "99.990000", "99.990000"),
+        # Underfill above the band: real partial leaves, leave alone.
+        (PolymarketOrderStatus.MATCHED, "100.000000", "99.000000", "99.000000"),
+        # Same dust gap at non-MATCHED status: leave alone.
+        (PolymarketOrderStatus.LIVE, "100.000000", "99.995000", "99.995000"),
+        # Dust gap at CANCELED: leave alone (legitimate partial fill before cancel).
+        (PolymarketOrderStatus.CANCELED, "100.000000", "99.995000", "99.995000"),
+    ],
+)
+def test_parse_user_order_to_order_status_report_snaps_dust_filled_qty(
+    status,
+    original_size,
+    size_matched,
+    expected_filled,
+):
+    # Mirrors test_parse_open_order_to_order_status_report_snaps_dust_filled_qty
+    # for the WS user-order schema. Both schemas wire in `_snap_filled_qty_to_quantity`
+    # and either path can regress independently.
+    user_order = PolymarketUserOrder(
+        asset_id="21742633143463906290569050155826241533067272736897614950488156847949938836455",
+        associate_trades=None,
+        created_at="1725842520",
+        expiration="0",
+        id="0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
+        maker_address="0xa3D82Ed56F4c68d2328Fb8c29e568Ba2cAF7d7c8",
+        market="0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+        order_owner="3e2c94ca-8124-c4c1-c7ea-be1ea21b71fe",
+        order_type=PolymarketOrderType.GTC,
+        original_size=original_size,
+        outcome="Yes",
+        owner="3e2c94ca-8124-c4c1-c7ea-be1ea21b71fe",
+        price="0.513",
+        side=PolymarketOrderSide.BUY,
+        size_matched=size_matched,
+        status=status,
+        timestamp="1725842520000",
+        type=PolymarketEventType.UPDATE,
+    )
+    instrument = _binary_option_size_precision_6()
+
+    report = user_order.parse_to_order_status_report(
+        account_id=AccountId("POLYMARKET-001"),
+        instrument=instrument,
+        client_order_id=None,
+        ts_init=0,
+    )
+
+    assert report.quantity == Quantity.from_str(original_size)
+    assert report.filled_qty == Quantity.from_str(expected_filled)
+
+
+def test_parse_open_order_to_order_status_report_zero_expiration_is_none():
+    # `expiration="0"` is the V2 sentinel for non-GTD orders; it must
+    # surface as `expire_time=None`, not 1970-01-01.
+    open_order = PolymarketOpenOrder(
+        associate_trades=None,
+        id="0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
+        status=PolymarketOrderStatus.LIVE,
+        market="0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+        original_size="5",
+        outcome="Yes",
+        maker_address="0xa3D82Ed56F4c68d2328Fb8c29e568Ba2cAF7d7c8",
+        owner="3e2c94ca-8124-c4c1-c7ea-be1ea21b71fe",
+        price="0.513",
+        side=PolymarketOrderSide.BUY,
+        size_matched="0",
+        asset_id="21742633143463906290569050155826241533067272736897614950488156847949938836455",
+        expiration="0",
+        order_type=PolymarketOrderType.GTC,
+        created_at=1725842520,
+    )
+    instrument = TestInstrumentProvider.binary_option()
+
+    report = open_order.parse_to_order_status_report(
+        account_id=AccountId("POLYMARKET-001"),
+        instrument=instrument,
+        client_order_id=None,
+        ts_init=0,
+    )
+
+    assert report.expire_time is None
+
+
+def test_parse_open_order_to_order_status_report_nonzero_expiration_is_seconds():
+    # V2 emits expiration as Unix seconds. 1735689600 == 2025-01-01 00:00:00 UTC.
+    # Pre-fix this was parsed as ms and produced 1970-01-21.
+    open_order = PolymarketOpenOrder(
+        associate_trades=None,
+        id="0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
+        status=PolymarketOrderStatus.LIVE,
+        market="0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+        original_size="5",
+        outcome="Yes",
+        maker_address="0xa3D82Ed56F4c68d2328Fb8c29e568Ba2cAF7d7c8",
+        owner="3e2c94ca-8124-c4c1-c7ea-be1ea21b71fe",
+        price="0.513",
+        side=PolymarketOrderSide.BUY,
+        size_matched="0",
+        asset_id="21742633143463906290569050155826241533067272736897614950488156847949938836455",
+        expiration="1735689600",
+        order_type=PolymarketOrderType.GTD,
+        created_at=1725842520,
+    )
+    instrument = TestInstrumentProvider.binary_option()
+
+    report = open_order.parse_to_order_status_report(
+        account_id=AccountId("POLYMARKET-001"),
+        instrument=instrument,
+        client_order_id=None,
+        ts_init=0,
+    )
+
+    expected = pd.Timestamp(1735689600, unit="s", tz="UTC")
+    assert report.expire_time == expected
 
 
 def test_parse_open_order_to_order_status_report_ts_accepted():

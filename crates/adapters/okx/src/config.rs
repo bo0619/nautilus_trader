@@ -16,6 +16,7 @@
 //! Configuration structures for the OKX adapter.
 
 use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_network::websocket::TransportBackend;
 
 use crate::common::{
     credential::credential_env_vars,
@@ -57,13 +58,8 @@ pub struct OKXDataClientConfig {
     pub base_url_ws_public: Option<String>,
     /// Optional override for the business WebSocket URL.
     pub base_url_ws_business: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The API environment (live or demo).
     #[builder(default)]
     pub environment: OKXEnvironment,
@@ -84,6 +80,9 @@ pub struct OKXDataClientConfig {
     pub update_instruments_interval_mins: u64,
     /// Optional VIP level that unlocks additional subscriptions.
     pub vip_level: Option<OKXVipLevel>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for OKXDataClientConfig {
@@ -180,13 +179,8 @@ pub struct OKXExecClientConfig {
     pub base_url_ws_private: Option<String>,
     /// Optional override for the business WebSocket URL.
     pub base_url_ws_business: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The API environment (live or demo).
     #[builder(default)]
     pub environment: OKXEnvironment,
@@ -213,6 +207,9 @@ pub struct OKXExecClientConfig {
     /// Enables margin/leverage for SPOT trading when true.
     #[builder(default)]
     pub use_spot_margin: bool,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for OKXExecClientConfig {

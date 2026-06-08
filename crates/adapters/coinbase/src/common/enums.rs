@@ -89,12 +89,14 @@ pub enum CoinbaseOrderType {
     Limit,
     #[serde(alias = "Stop")]
     Stop,
-    #[serde(alias = "StopLimit")]
+    #[serde(alias = "StopLimit", alias = "Stop Limit")]
     StopLimit,
     #[serde(alias = "Bracket")]
     Bracket,
     Twap,
+    #[serde(alias = "Roll Open")]
     RollOpen,
+    #[serde(alias = "Roll Close")]
     RollClose,
     Liquidation,
     Scaled,
@@ -119,6 +121,18 @@ pub enum CoinbaseOrderStatus {
     Queued,
     CancelQueued,
     EditQueued,
+}
+
+impl CoinbaseOrderStatus {
+    /// Returns true when the status represents a terminal lifecycle state
+    /// (no further updates expected from the venue).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Cancelled | Self::Expired | Self::Failed
+        )
+    }
 }
 
 /// Coinbase time in force.
@@ -430,6 +444,21 @@ mod tests {
     }
 
     #[rstest]
+    #[case(CoinbaseOrderStatus::Filled, true)]
+    #[case(CoinbaseOrderStatus::Cancelled, true)]
+    #[case(CoinbaseOrderStatus::Expired, true)]
+    #[case(CoinbaseOrderStatus::Failed, true)]
+    #[case(CoinbaseOrderStatus::Open, false)]
+    #[case(CoinbaseOrderStatus::Pending, false)]
+    #[case(CoinbaseOrderStatus::Queued, false)]
+    #[case(CoinbaseOrderStatus::CancelQueued, false)]
+    #[case(CoinbaseOrderStatus::EditQueued, false)]
+    #[case(CoinbaseOrderStatus::Unknown, false)]
+    fn test_order_status_is_terminal(#[case] status: CoinbaseOrderStatus, #[case] expected: bool) {
+        assert_eq!(status.is_terminal(), expected);
+    }
+
+    #[rstest]
     fn test_ws_channel_requires_auth() {
         assert!(CoinbaseWsChannel::User.requires_auth());
         assert!(CoinbaseWsChannel::FuturesBalanceSummary.requires_auth());
@@ -469,6 +498,9 @@ mod tests {
         assert_eq!(order_type, CoinbaseOrderType::Limit);
 
         let order_type: CoinbaseOrderType = serde_json::from_str("\"StopLimit\"").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::StopLimit);
+
+        let order_type: CoinbaseOrderType = serde_json::from_str("\"Stop Limit\"").unwrap();
         assert_eq!(order_type, CoinbaseOrderType::StopLimit);
 
         let order_type = CoinbaseOrderType::from_str("STOP_LIMIT").unwrap();

@@ -18,7 +18,10 @@
 use std::collections::HashMap;
 
 use ahash::AHashMap;
-use nautilus_common::{actor::data_actor::ImportableActorConfig, python::actor::PyDataActor};
+use nautilus_common::{
+    actor::data_actor::ImportableActorConfig,
+    python::{actor::PyDataActor, cache::PyCache},
+};
 use nautilus_core::{
     UUID4, UnixNanos,
     python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
@@ -267,8 +270,9 @@ impl PyBacktestEngine {
             .into_iter()
             .map(|obj| pyobject_to_data(py, obj.bind(py)))
             .collect::<PyResult<_>>()?;
-        self.0.add_data(rust_data, client_id, validate, sort);
-        Ok(())
+        self.0
+            .add_data(rust_data, client_id, validate, sort)
+            .map_err(to_pyruntime_err)
     }
 
     /// Adds an instrument to the engine.
@@ -670,6 +674,12 @@ impl PyBacktestEngine {
         self.0.clear_data();
     }
 
+    /// Clears all actors from the engine.
+    #[pyo3(name = "clear_actors")]
+    fn py_clear_actors(&mut self) -> PyResult<()> {
+        self.0.clear_actors().map_err(to_pyruntime_err)
+    }
+
     /// Clears all strategies from the engine.
     #[pyo3(name = "clear_strategies")]
     fn py_clear_strategies(&mut self) -> PyResult<()> {
@@ -680,6 +690,32 @@ impl PyBacktestEngine {
     #[pyo3(name = "clear_exec_algorithms")]
     fn py_clear_exec_algorithms(&mut self) -> PyResult<()> {
         self.0.clear_exec_algorithms().map_err(to_pyruntime_err)
+    }
+
+    /// Adds multiple actors from importable configs. Stops at the first error.
+    #[pyo3(name = "add_actors_from_configs")]
+    fn py_add_actors_from_configs(
+        &mut self,
+        py: Python,
+        configs: Vec<ImportableActorConfig>,
+    ) -> PyResult<()> {
+        for config in configs {
+            self.py_add_actor_from_config(py, config)?;
+        }
+        Ok(())
+    }
+
+    /// Adds multiple strategies from importable configs. Stops at the first error.
+    #[pyo3(name = "add_strategies_from_configs")]
+    fn py_add_strategies_from_configs(
+        &mut self,
+        py: Python,
+        configs: Vec<ImportableStrategyConfig>,
+    ) -> PyResult<()> {
+        for config in configs {
+            self.py_add_strategy_from_config(py, config)?;
+        }
+        Ok(())
     }
 
     /// Sorts the engine's internal data stream by timestamp.
@@ -693,6 +729,13 @@ impl PyBacktestEngine {
     #[pyo3(name = "trader_id")]
     fn py_trader_id(&self) -> TraderId {
         self.0.trader_id()
+    }
+
+    /// Returns the machine ID for this engine.
+    #[getter]
+    #[pyo3(name = "machine_id")]
+    fn py_machine_id(&self) -> String {
+        self.0.machine_id().to_string()
     }
 
     /// Returns the unique instance ID for this engine.
@@ -709,10 +752,59 @@ impl PyBacktestEngine {
         self.0.iteration()
     }
 
+    /// Returns the last run config ID, if any.
+    #[getter]
+    #[pyo3(name = "run_config_id")]
+    fn py_run_config_id(&self) -> Option<String> {
+        self.0.run_config_id().map(str::to_string)
+    }
+
+    /// Returns the last run ID, if any.
+    #[getter]
+    #[pyo3(name = "run_id")]
+    fn py_run_id(&self) -> Option<UUID4> {
+        self.0.run_id()
+    }
+
+    /// Returns when the last run started, in nanoseconds since the UNIX epoch.
+    #[getter]
+    #[pyo3(name = "run_started")]
+    fn py_run_started(&self) -> Option<u64> {
+        self.0.run_started().map(|n| n.as_u64())
+    }
+
+    /// Returns when the last run finished, in nanoseconds since the UNIX epoch.
+    #[getter]
+    #[pyo3(name = "run_finished")]
+    fn py_run_finished(&self) -> Option<u64> {
+        self.0.run_finished().map(|n| n.as_u64())
+    }
+
+    /// Returns the last backtest range start, in nanoseconds since the UNIX epoch.
+    #[getter]
+    #[pyo3(name = "backtest_start")]
+    fn py_backtest_start(&self) -> Option<u64> {
+        self.0.backtest_start().map(|n| n.as_u64())
+    }
+
+    /// Returns the last backtest range end, in nanoseconds since the UNIX epoch.
+    #[getter]
+    #[pyo3(name = "backtest_end")]
+    fn py_backtest_end(&self) -> Option<u64> {
+        self.0.backtest_end().map(|n| n.as_u64())
+    }
+
     /// Returns the list of registered venue identifiers.
     #[pyo3(name = "list_venues")]
     fn py_list_venues(&self) -> Vec<Venue> {
         self.0.list_venues()
+    }
+
+    /// Returns the cache shared with the kernel and registered components.
+    #[getter]
+    #[pyo3(name = "cache")]
+    fn py_cache(&self) -> PyCache {
+        PyCache::from_rc(self.0.kernel().cache.clone())
     }
 
     fn __repr__(&self) -> String {

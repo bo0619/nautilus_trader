@@ -49,6 +49,7 @@ use nautilus_model::{
     instruments::CurrencyPair,
     types::{Currency, Price, Quantity},
 };
+use nautilus_network::websocket::TransportBackend;
 use rstest::rstest;
 use serde_json::json;
 use ustr::Ustr;
@@ -600,6 +601,8 @@ async fn test_public_client_connection() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -629,6 +632,8 @@ async fn test_private_client_authentication() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     // Connection may timeout waiting for auth confirmation from the mock server
@@ -646,7 +651,7 @@ async fn test_private_client_authentication() {
     // Check if auth was attempted (connection was made)
     assert!(*state.connection_count.lock().await > 0);
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -661,6 +666,8 @@ async fn test_authentication_failure() {
         Some("invalid_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     let _result = client.connect().await;
@@ -675,7 +682,7 @@ async fn test_authentication_failure() {
     // Verify the server doesn't mark it as authenticated
     assert!(!state.authenticated.load(Ordering::Relaxed));
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -688,7 +695,9 @@ async fn test_ping_pong() {
         BybitProductType::Linear,
         BybitEnvironment::Mainnet,
         Some(ws_url),
-        1, // 1 second heartbeat
+        1, // 1 second heartbeat,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -723,6 +732,8 @@ async fn test_subscription_lifecycle() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -770,6 +781,8 @@ async fn test_message_routing() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -802,6 +815,8 @@ async fn test_reconnection_flow() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -843,6 +858,8 @@ async fn test_multiple_subscriptions() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -889,10 +906,12 @@ async fn test_wait_until_active_timeout() {
         BybitEnvironment::Mainnet,
         Some("ws://127.0.0.1:9999/invalid".to_string()),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     // Connect will fail, but we won't await it
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     // wait_until_active should timeout
     let result = client.wait_until_active(0.5).await;
@@ -909,7 +928,9 @@ async fn test_heartbeat_timeout_reconnection() {
         BybitProductType::Linear,
         BybitEnvironment::Mainnet,
         Some(ws_url),
-        1, // 1 second heartbeat
+        1, // 1 second heartbeat,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -941,6 +962,8 @@ async fn test_sends_pong_for_text_ping() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         1,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -969,6 +992,8 @@ async fn test_sends_pong_for_control_ping() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -999,9 +1024,11 @@ async fn test_reauth_after_disconnect() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     // Wait for initial connection
     wait_until_async(
@@ -1016,7 +1043,7 @@ async fn test_reauth_after_disconnect() {
     // Short delay for disconnect trigger to be observed by server
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -1031,9 +1058,11 @@ async fn test_login_failure_emits_error() {
         Some("invalid_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     // Wait for connection attempt
     wait_until_async(
@@ -1045,7 +1074,7 @@ async fn test_login_failure_emits_error() {
     // Verify auth failed
     assert!(!state.authenticated.load(Ordering::Relaxed));
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -1060,6 +1089,8 @@ async fn test_unauthenticated_private_subscription_fails() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1082,6 +1113,8 @@ async fn test_subscription_after_reconnection() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1120,6 +1153,8 @@ async fn test_subscription_restoration_tracking() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1156,6 +1191,8 @@ async fn test_reconnection_retries_failed_subscriptions() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1194,6 +1231,8 @@ async fn test_trade_subscription_flow() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1229,6 +1268,8 @@ async fn test_orderbook_subscription_flow() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1264,6 +1305,8 @@ async fn test_ticker_subscription_flow() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1299,6 +1342,8 @@ async fn test_klines_subscription_flow() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1334,9 +1379,11 @@ async fn test_private_orders_subscription() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     // Wait for connection
     wait_until_async(
@@ -1346,9 +1393,9 @@ async fn test_private_orders_subscription() {
     .await;
 
     // Subscribe to orders (may succeed or fail depending on auth timing)
-    let _ = client.subscribe_orders().await;
+    let _result = client.subscribe_orders().await;
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -1363,9 +1410,11 @@ async fn test_private_executions_subscription() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     // Wait for connection
     wait_until_async(
@@ -1375,9 +1424,9 @@ async fn test_private_executions_subscription() {
     .await;
 
     // Subscribe to executions (may succeed or fail depending on auth timing)
-    let _ = client.subscribe_executions().await;
+    let _result = client.subscribe_executions().await;
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -1392,9 +1441,11 @@ async fn test_private_wallet_subscription() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     // Wait for connection
     wait_until_async(
@@ -1404,9 +1455,9 @@ async fn test_private_wallet_subscription() {
     .await;
 
     // Subscribe to wallet (may succeed or fail depending on auth timing)
-    let _ = client.subscribe_wallet().await;
+    let _result = client.subscribe_wallet().await;
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -1420,6 +1471,8 @@ async fn test_rapid_consecutive_reconnections() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1450,7 +1503,7 @@ async fn test_rapid_consecutive_reconnections() {
 
         state.disconnect_trigger.store(true, Ordering::Relaxed);
 
-        let _ = client.subscribe(vec![format!("publicTrade.ETH{i}")]).await;
+        let _result = client.subscribe(vec![format!("publicTrade.ETH{i}")]).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         state.disconnect_trigger.store(false, Ordering::Relaxed);
@@ -1478,6 +1531,8 @@ async fn test_reconnection_race_condition() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1504,7 +1559,7 @@ async fn test_reconnection_race_condition() {
     .await;
 
     state.disconnect_trigger.store(true, Ordering::Relaxed);
-    let _ = client
+    let _result = client
         .subscribe(vec!["orderbook.50.ETHUSDT".to_string()])
         .await;
 
@@ -1538,9 +1593,11 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
-    let _ = client.connect().await;
+    let _result = client.connect().await;
 
     wait_until_async(
         || async { *state.connection_count.lock().await > 0 },
@@ -1548,7 +1605,7 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
     )
     .await;
 
-    let _ = client.subscribe_orders().await;
+    let _result = client.subscribe_orders().await;
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -1557,7 +1614,7 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
         "Connection should be maintained during delayed auth"
     );
 
-    let _ = client.close().await;
+    let _result = client.close().await;
 }
 
 #[rstest]
@@ -1571,6 +1628,8 @@ async fn test_multiple_partial_subscription_failures() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1608,7 +1667,7 @@ async fn test_multiple_partial_subscription_failures() {
         "publicTrade.SOLUSDT".to_string(),
         "orderbook.50.ETHUSDT".to_string(),
     ];
-    let _ = client.subscribe(mixed_topics).await;
+    let _result = client.subscribe(mixed_topics).await;
 
     wait_until_async(
         || async { !state.subscription_events.lock().await.is_empty() },
@@ -1640,6 +1699,8 @@ async fn test_is_active_false_during_reconnection() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1650,7 +1711,7 @@ async fn test_is_active_false_during_reconnection() {
 
     state.disconnect_trigger.store(true, Ordering::Relaxed);
 
-    let _ = client
+    let _result = client
         .subscribe(vec!["publicTrade.BTCUSDT".to_string()])
         .await;
 
@@ -1679,7 +1740,9 @@ async fn test_sends_pong_for_text_ping_message() {
         BybitProductType::Linear,
         BybitEnvironment::Mainnet,
         Some(ws_url),
-        1, // 1 second heartbeat
+        1, // 1 second heartbeat,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -1904,6 +1967,7 @@ mod conditional_order_tests {
                 false, // is_leverage
                 None,  // take_profit
                 None,  // stop_loss
+                None,  // position_idx
             )
             .unwrap()
     }
@@ -1962,6 +2026,7 @@ mod conditional_order_tests {
                 tp_limit_price: None,
                 order_iv: None,
                 mmp: None,
+                position_idx: None,
             }
         } else {
             BybitWsPlaceOrderParams {
@@ -1993,6 +2058,7 @@ mod conditional_order_tests {
                 tp_limit_price: None,
                 order_iv: None,
                 mmp: None,
+                position_idx: None,
             }
         }
     }
@@ -2010,6 +2076,8 @@ async fn test_is_active_lifecycle() {
         Some("test_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     assert!(
@@ -2046,6 +2114,8 @@ async fn test_is_active_false_after_close() {
         Some("test_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2080,6 +2150,8 @@ async fn test_subscribe_after_stream_call() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2118,6 +2190,8 @@ async fn test_unsubscribed_private_channel_not_resubscribed_after_disconnect() {
         Some("test_api_secret".to_string()),
         Some(ws_url.clone()),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2226,6 +2300,8 @@ async fn test_batch_place_orders_with_cache_keys() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2266,6 +2342,7 @@ async fn test_batch_place_orders_with_cache_keys() {
         tp_limit_price: None,
         order_iv: None,
         mmp: None,
+        position_idx: None,
     }];
 
     let result = client.batch_place_orders(orders).await;
@@ -2290,6 +2367,8 @@ async fn test_batch_amend_orders() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2335,6 +2414,8 @@ async fn test_batch_cancel_orders() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2380,6 +2461,8 @@ async fn test_batch_cancel_orders_chunking_over_20() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2418,6 +2501,8 @@ async fn test_batch_cancel_orders_empty_list() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2451,6 +2536,8 @@ async fn test_build_cancel_order_params_requires_order_id() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2489,6 +2576,8 @@ async fn test_option_client_rejects_bar_subscription() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2522,6 +2611,8 @@ async fn test_option_trade_subscription_uses_base_coin_topic() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2557,6 +2648,8 @@ async fn test_option_trade_unsubscribe_preserves_shared_topic() {
         BybitEnvironment::Mainnet,
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2610,6 +2703,8 @@ async fn test_batch_place_order_with_order_iv_and_mmp() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2649,10 +2744,11 @@ async fn test_batch_place_order_with_order_iv_and_mmp() {
         tp_limit_price: None,
         order_iv: Some("0.80".to_string()),
         mmp: Some(true),
+        position_idx: None,
     }];
 
     let result = client.batch_place_orders(orders).await;
-    assert!(result.is_ok());
+    result.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2683,6 +2779,8 @@ async fn test_batch_place_order_omits_order_iv_when_none() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2722,10 +2820,11 @@ async fn test_batch_place_order_omits_order_iv_when_none() {
         tp_limit_price: None,
         order_iv: None,
         mmp: None,
+        position_idx: None,
     }];
 
     let result = client.batch_place_orders(orders).await;
-    assert!(result.is_ok());
+    result.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2751,6 +2850,8 @@ async fn test_batch_amend_order_with_order_iv() {
         Some("test_api_secret".to_string()),
         Some(ws_url),
         20,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect().await.unwrap();
@@ -2777,7 +2878,7 @@ async fn test_batch_amend_order_with_order_iv() {
     }];
 
     let result = client.batch_amend_orders(orders).await;
-    assert!(result.is_ok());
+    result.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

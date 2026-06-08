@@ -19,7 +19,10 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos, correctness::FAILED};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    correctness::{CorrectnessError, FAILED},
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -517,23 +520,34 @@ impl Order for MarketIfTouchedOrder {
     }
 }
 
-impl From<OrderInitialized> for MarketIfTouchedOrder {
-    fn from(event: OrderInitialized) -> Self {
-        Self::new(
+impl TryFrom<OrderInitialized> for MarketIfTouchedOrder {
+    type Error = OrderError;
+
+    fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
+        let trigger_price =
+            event
+                .trigger_price
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message:
+                        "`trigger_price` is required for `MarketIfTouchedOrder` initialization"
+                            .to_string(),
+                })?;
+        let trigger_type =
+            event
+                .trigger_type
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message: "`trigger_type` is required for `MarketIfTouchedOrder` initialization"
+                        .to_string(),
+                })?;
+        Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
             event.client_order_id,
             event.order_side,
             event.quantity,
-            event
-            .trigger_price // TODO: Improve this error, model order domain errors
-            .expect(
-                "Error initializing order: `trigger_price` was `None` for `MarketIfTouchedOrder`",
-            ),
-            event.trigger_type.expect(
-                "Error initializing order: `trigger_type` was `None` for `MarketIfTouchedOrder`",
-            ),
+            trigger_price,
+            trigger_type,
             event.time_in_force,
             event.expire_time,
             event.reduce_only,
@@ -585,7 +599,7 @@ mod tests {
     use super::*;
     use crate::{
         enums::{OrderSide, OrderType, TimeInForce, TriggerType},
-        events::order::{filled::OrderFilledBuilder, initialized::OrderInitializedBuilder},
+        events::order::spec::{OrderFilledSpec, OrderInitializedSpec},
         identifiers::{InstrumentId, TradeId, VenueOrderId},
         instruments::{CurrencyPair, stubs::*},
         orders::{builder::OrderTestBuilder, stubs::TestOrderStubs},
@@ -699,15 +713,14 @@ mod tests {
     #[rstest]
     fn test_market_if_touched_order_from_order_initialized() {
         // Create an OrderInitialized event with all required fields for a MarketIfTouchedOrder
-        let order_initialized = OrderInitializedBuilder::default()
-            .trigger_price(Some(Price::new(100.0, 2)))
-            .trigger_type(Some(TriggerType::Default))
+        let order_initialized = OrderInitializedSpec::builder()
+            .trigger_price(Price::new(100.0, 2))
+            .trigger_type(TriggerType::Default)
             .order_type(OrderType::MarketIfTouched)
-            .build()
-            .unwrap();
+            .build();
 
         // Convert the OrderInitialized event into a MarketIfTouchedOrder
-        let order: MarketIfTouchedOrder = order_initialized.clone().into();
+        let order: MarketIfTouchedOrder = order_initialized.clone().try_into().unwrap();
 
         // Assert essential fields match the OrderInitialized fields
         assert_eq!(order.trader_id(), order_initialized.trader_id);
@@ -742,7 +755,7 @@ mod tests {
         let fill_quantity = accepted_order.quantity(); // Use the same quantity as the order
         let fill_price = Price::new(98.50, 2); // Use a price HIGHER than trigger price
 
-        let order_filled_event = OrderFilledBuilder::default()
+        let order_filled_event = OrderFilledSpec::builder()
             .client_order_id(accepted_order.client_order_id())
             .strategy_id(accepted_order.strategy_id())
             .instrument_id(accepted_order.instrument_id())
@@ -751,8 +764,7 @@ mod tests {
             .last_px(fill_price)
             .venue_order_id(VenueOrderId::from("TEST-001"))
             .trade_id(TradeId::from("TRADE-001"))
-            .build()
-            .unwrap();
+            .build();
 
         // Apply the fill event
         accepted_order

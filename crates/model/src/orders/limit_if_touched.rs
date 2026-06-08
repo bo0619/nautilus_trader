@@ -575,26 +575,39 @@ impl Display for LimitIfTouchedOrder {
     }
 }
 
-impl From<OrderInitialized> for LimitIfTouchedOrder {
-    fn from(event: OrderInitialized) -> Self {
-        Self::new(
+impl TryFrom<OrderInitialized> for LimitIfTouchedOrder {
+    type Error = OrderError;
+
+    fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
+        let price = event
+            .price
+            .ok_or_else(|| CorrectnessError::PredicateViolation {
+                message: "`price` is required for `LimitIfTouchedOrder` initialization".to_string(),
+            })?;
+        let trigger_price =
+            event
+                .trigger_price
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message: "`trigger_price` is required for `LimitIfTouchedOrder` initialization"
+                        .to_string(),
+                })?;
+        let trigger_type =
+            event
+                .trigger_type
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message: "`trigger_type` is required for `LimitIfTouchedOrder` initialization"
+                        .to_string(),
+                })?;
+        Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
             event.client_order_id,
             event.order_side,
             event.quantity,
-            event
-                .price // TODO: Improve this error, model order domain errors
-                .expect("Error initializing order: `price` was `None` for `LimitIfTouchedOrder"),
-            event
-                .trigger_price // TODO: Improve this error, model order domain errors
-                .expect(
-                    "Error initializing order: `trigger_price` was `None` for `LimitIfTouchedOrder",
-                ),
-            event
-                .trigger_type
-                .expect("Error initializing order: `trigger_type` was `None`"),
+            price,
+            trigger_price,
+            trigger_type,
             event.time_in_force,
             event.expire_time,
             event.post_only,
@@ -624,7 +637,7 @@ mod tests {
     use super::*;
     use crate::{
         enums::{TimeInForce, TriggerType},
-        events::order::{filled::OrderFilledBuilder, initialized::OrderInitializedBuilder},
+        events::order::spec::{OrderFilledSpec, OrderInitializedSpec},
         identifiers::InstrumentId,
         instruments::{CurrencyPair, stubs::*},
         orders::{builder::OrderTestBuilder, stubs::TestOrderStubs},
@@ -766,16 +779,15 @@ mod tests {
     #[rstest]
     fn test_limit_if_touched_order_from_order_initialized() {
         // Create an OrderInitialized event with all required fields for a LimitIfTouchedOrder
-        let order_initialized = OrderInitializedBuilder::default()
-            .price(Some(Price::new(100.0, 2)))
-            .trigger_price(Some(Price::new(95.0, 2)))
-            .trigger_type(Some(TriggerType::Default))
+        let order_initialized = OrderInitializedSpec::builder()
+            .price(Price::new(100.0, 2))
+            .trigger_price(Price::new(95.0, 2))
+            .trigger_type(TriggerType::Default)
             .order_type(OrderType::LimitIfTouched)
-            .build()
-            .unwrap();
+            .build();
 
         // Convert the OrderInitialized event into a LimitIfTouchedOrder
-        let order: LimitIfTouchedOrder = order_initialized.clone().into();
+        let order: LimitIfTouchedOrder = order_initialized.clone().try_into().unwrap();
 
         // Assert essential fields match the OrderInitialized fields
         assert_eq!(order.trader_id(), order_initialized.trader_id);
@@ -813,7 +825,7 @@ mod tests {
         let fill_quantity = accepted_order.quantity(); // Use the same quantity as the order
         let fill_price = Price::new(98.50, 2); // Use a price LOWER than limit price
 
-        let order_filled_event = OrderFilledBuilder::default()
+        let order_filled_event = OrderFilledSpec::builder()
             .client_order_id(accepted_order.client_order_id())
             .strategy_id(accepted_order.strategy_id())
             .instrument_id(accepted_order.instrument_id())
@@ -822,8 +834,7 @@ mod tests {
             .last_px(fill_price)
             .venue_order_id(VenueOrderId::from("TEST-001"))
             .trade_id(TradeId::from("TRADE-001"))
-            .build()
-            .unwrap();
+            .build();
 
         // Apply the fill event
         accepted_order

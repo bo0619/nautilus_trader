@@ -23,6 +23,7 @@ use std::{
 };
 
 use ahash::AHashMap;
+use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
@@ -262,6 +263,17 @@ impl SimulatedExchange {
     /// Sets the settlement price for the given instrument.
     pub fn set_settlement_price(&mut self, instrument_id: InstrumentId, price: Price) {
         self.settlement_prices.insert(instrument_id, price);
+    }
+
+    /// Returns the configured book type for this venue.
+    #[must_use]
+    pub const fn book_type(&self) -> BookType {
+        self.book_type
+    }
+
+    /// Returns an iterator over the instrument IDs registered with this exchange.
+    pub fn instrument_ids(&self) -> impl Iterator<Item = &InstrumentId> {
+        self.instruments.keys()
     }
 
     pub fn initialize_account(&mut self) {
@@ -510,7 +522,7 @@ impl SimulatedExchange {
 
                         let margins = match account {
                             AccountAny::Margin(margin_account) => margin_account.margins.clone(),
-                            _ => AHashMap::new(),
+                            _ => IndexMap::new(),
                         };
 
                         if let Some(exec_client) = &self.exec_client {

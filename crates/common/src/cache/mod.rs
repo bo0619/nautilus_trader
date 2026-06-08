@@ -28,8 +28,10 @@ mod index;
 mod tests;
 
 use std::{
+    cell::{Ref, RefCell},
     collections::VecDeque,
     fmt::{Debug, Display},
+    rc::Rc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -52,7 +54,10 @@ use nautilus_model::{
         Bar, BarType, FundingRateUpdate, GreeksData, IndexPriceUpdate, InstrumentStatus,
         MarkPriceUpdate, QuoteTick, TradeTick, YieldCurveData, option_chain::OptionGreeks,
     },
-    enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType, TriggerType},
+    enums::{
+        AggregationSource, ContingencyType, OmsType, OrderSide, PositionSide, PriceType,
+        TriggerType,
+    },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
         OrderListId, PositionId, StrategyId, Venue, VenueOrderId,
@@ -69,6 +74,38 @@ use nautilus_model::{
 use ustr::Ustr;
 
 use crate::xrate::get_exchange_rate;
+
+/// Read-only view over the platform cache.
+///
+/// Adapter-facing code receives this type instead of the mutable cache handle so cache writes stay
+/// owned by the data and execution engines.
+#[derive(Clone, Debug)]
+pub struct CacheView {
+    inner: Rc<RefCell<Cache>>,
+}
+
+impl CacheView {
+    /// Creates a new [`CacheView`] from a cache handle.
+    #[must_use]
+    pub fn new(inner: Rc<RefCell<Cache>>) -> Self {
+        Self { inner }
+    }
+
+    /// Borrows the cache immutably.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache is already mutably borrowed.
+    pub fn borrow(&self) -> Ref<'_, Cache> {
+        self.inner.borrow()
+    }
+}
+
+impl From<Rc<RefCell<Cache>>> for CacheView {
+    fn from(inner: Rc<RefCell<Cache>>) -> Self {
+        Self::new(inner)
+    }
+}
 
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
@@ -236,6 +273,8 @@ impl Cache {
         self.accounts = cache_map.accounts;
         self.orders = cache_map.orders;
         self.positions = cache_map.positions;
+
+        self.assign_position_ids_to_contingencies();
         Ok(())
     }
 
@@ -317,6 +356,8 @@ impl Cache {
         };
 
         log::info!("Cached {} orders from database", self.general.len());
+
+        self.assign_position_ids_to_contingencies();
         Ok(())
     }
 
@@ -532,9 +573,7 @@ impl Cache {
     // Calculate the unrealized profit and loss (PnL) for `position`.
     #[must_use]
     pub fn calculate_unrealized_pnl(&self, position: &Position) -> Option<Money> {
-        let quote = if let Some(quote) = self.quote(&position.instrument_id) {
-            quote
-        } else {
+        let Some(quote) = self.quote(&position.instrument_id) else {
             log::warn!(
                 "Cannot calculate unrealized PnL for {}, no quotes for {}",
                 position.id,
@@ -1234,6 +1273,99 @@ impl Cache {
         self.position_snapshots.remove(&position_id);
     }
 
+    /// Purges the instrument with the `instrument_id` from the cache (if found).
+    ///
+    /// All cache-owned data keyed by the instrument is removed: the instrument record,
+    /// any synthetic with the same id, order book and own-order-book state, quote/trade
+    /// histories, mark/index/funding price histories, instrument status, bars for any
+    /// `BarType` referencing the instrument, and the `instrument_orders` /
+    /// `instrument_positions` index entries.
+    ///
+    /// For safety, an instrument is prevented from being purged while any associated
+    /// order is non-terminal (anything not in `orders_closed`, including
+    /// initialized, submitted, accepted, emulated, released, or inflight states) or
+    /// any associated position is non-closed.
+    ///
+    /// Active subscriptions and other live data-engine state are not touched here;
+    /// those belong to the data and execution engines.
+    ///
+    /// # Warning
+    ///
+    /// Intended for actors and strategies that have their own lifecycle logic for
+    /// deciding when an instrument is no longer needed. Purging an instrument that any
+    /// other actor, strategy, or engine still relies on may cause incorrect behavior
+    /// (missing instrument lookups, lost market-data history). The caller is
+    /// responsible for ensuring the instrument is no longer in use before purging.
+    pub fn purge_instrument(&mut self, instrument_id: InstrumentId) {
+        #[cfg(feature = "defi")]
+        let defi_found = self.defi.pools.contains_key(&instrument_id)
+            || self.defi.pool_profilers.contains_key(&instrument_id);
+        #[cfg(not(feature = "defi"))]
+        let defi_found = false;
+
+        let found = self.instruments.contains_key(&instrument_id)
+            || self.synthetics.contains_key(&instrument_id)
+            || defi_found;
+
+        if !found {
+            log::warn!("Instrument {instrument_id} not found when purging");
+            return;
+        }
+
+        if let Some(orders) = self.index.instrument_orders.get(&instrument_id) {
+            let has_non_terminal = orders
+                .iter()
+                .any(|client_order_id| !self.index.orders_closed.contains(client_order_id));
+
+            if has_non_terminal {
+                log::warn!(
+                    "Instrument {instrument_id} has non-terminal orders when purging, skipping purge"
+                );
+                return;
+            }
+        }
+
+        if let Some(positions) = self.index.instrument_positions.get(&instrument_id) {
+            let has_non_closed = positions
+                .iter()
+                .any(|position_id| !self.index.positions_closed.contains(position_id));
+
+            if has_non_closed {
+                log::warn!(
+                    "Instrument {instrument_id} has non-closed positions when purging, skipping purge"
+                );
+                return;
+            }
+        }
+
+        self.instruments.remove(&instrument_id);
+        self.synthetics.remove(&instrument_id);
+        self.books.remove(&instrument_id);
+        self.own_books.remove(&instrument_id);
+        self.quotes.remove(&instrument_id);
+        self.trades.remove(&instrument_id);
+        self.mark_prices.remove(&instrument_id);
+        self.index_prices.remove(&instrument_id);
+        self.funding_rates.remove(&instrument_id);
+        self.instrument_statuses.remove(&instrument_id);
+        self.greeks.remove(&instrument_id);
+        self.option_greeks.remove(&instrument_id);
+
+        self.bars
+            .retain(|bar_type, _| bar_type.instrument_id() != instrument_id);
+
+        #[cfg(feature = "defi")]
+        {
+            self.defi.pools.remove(&instrument_id);
+            self.defi.pool_profilers.remove(&instrument_id);
+        }
+
+        self.index.instrument_orders.remove(&instrument_id);
+        self.index.instrument_positions.remove(&instrument_id);
+
+        log::info!("Purged instrument {instrument_id}");
+    }
+
     /// Purges all account state events which are outside the lookback window.
     ///
     /// Only events which are outside the lookback window will be purged.
@@ -1270,14 +1402,13 @@ impl Cache {
 
     /// Resets the cache.
     ///
-    /// All stateful fields are reset to their initial value.
+    /// All stateful fields are reset to their initial value. Instruments,
+    /// currencies and synthetics are retained when `drop_instruments_on_reset`
+    /// is `false` so that repeated backtest runs can reuse the same dataset.
     pub fn reset(&mut self) {
         log::debug!("Resetting cache");
 
         self.general.clear();
-        self.currencies.clear();
-        self.instruments.clear();
-        self.synthetics.clear();
         self.books.clear();
         self.own_books.clear();
         self.quotes.clear();
@@ -1295,6 +1426,12 @@ impl Cache {
         self.position_snapshots.clear();
         self.greeks.clear();
         self.yield_curves.clear();
+
+        if self.config.drop_instruments_on_reset {
+            self.currencies.clear();
+            self.instruments.clear();
+            self.synthetics.clear();
+        }
 
         #[cfg(feature = "defi")]
         {
@@ -2033,6 +2170,82 @@ impl Cache {
         Ok(())
     }
 
+    // Propagates parent OTO `position_id` to contingent children that are missing one.
+    //
+    // Recovers from a partial-write window during fill handling: the fill-time path in the
+    // execution engine assigns `position_id` to each contingent child in a non-atomic loop
+    // (`set_position_id` then `add_position_id`), so a crash mid-loop can leave the database
+    // with the parent updated and some children un-updated. This pass re-applies any missing
+    // assignments after load. Mirrors the Cython behaviour at
+    // `nautilus_trader/cache/cache.pyx::_assign_position_id_to_contingencies`.
+    fn assign_position_ids_to_contingencies(&mut self) {
+        let mut assignments: Vec<(PositionId, ClientOrderId)> = Vec::new();
+
+        for parent in self.orders.values() {
+            if parent.contingency_type() != Some(ContingencyType::Oto) {
+                continue;
+            }
+            let Some(parent_position_id) = parent.position_id() else {
+                continue;
+            };
+            let Some(linked_order_ids) = parent.linked_order_ids() else {
+                continue;
+            };
+
+            for client_order_id in linked_order_ids {
+                match self.orders.get(client_order_id) {
+                    None => {
+                        log::error!("Contingency order {client_order_id} not found");
+                    }
+                    Some(contingent) => {
+                        if contingent.position_id().is_none() {
+                            assignments.push((parent_position_id, *client_order_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (position_id, client_order_id) in assignments {
+            let Some((venue, strategy_id)) =
+                self.orders.get_mut(&client_order_id).map(|contingent| {
+                    contingent.set_position_id(Some(position_id));
+                    (contingent.instrument_id().venue, contingent.strategy_id())
+                })
+            else {
+                continue;
+            };
+
+            // In-memory index updates only. The persistent index entry (if any) was written by
+            // the original fill-time `add_position_id` call; replaying the database write here
+            // would invoke `CacheDatabaseAdapter::index_order_position`, which is currently
+            // `todo!()` on both the Redis and SQL adapters. Until those land, the load-time
+            // recovery is in-memory-only: sufficient for the current process to operate, but
+            // not durable across another restart.
+            self.index
+                .order_position
+                .insert(client_order_id, position_id);
+            self.index
+                .position_strategy
+                .insert(position_id, strategy_id);
+            self.index
+                .position_orders
+                .entry(position_id)
+                .or_default()
+                .insert(client_order_id);
+            self.index
+                .strategy_positions
+                .entry(strategy_id)
+                .or_default()
+                .insert(position_id);
+            self.index
+                .venue_positions
+                .entry(venue)
+                .or_default()
+                .insert(position_id);
+        }
+    }
+
     /// Adds the `position` to the cache.
     ///
     /// # Errors
@@ -2397,9 +2610,7 @@ impl Cache {
     ///
     /// Returns an error if snapshotting the order state fails.
     pub fn snapshot_order_state(&self, order: &OrderAny) -> anyhow::Result<()> {
-        let database = if let Some(database) = &self.database {
-            database
-        } else {
+        let Some(database) = &self.database else {
             log::warn!(
                 "Cannot snapshot order state for {} (no database configured)",
                 order.client_order_id()
@@ -2594,6 +2805,9 @@ impl Cache {
             }
         }
 
+        // Sort so callers receive a deterministic Vec across runs; the
+        // underlying client_order_ids set is AHash-backed.
+        orders.sort_by_key(|o| o.client_order_id());
         orders
     }
 
@@ -2621,6 +2835,9 @@ impl Cache {
             }
         }
 
+        // Sort so callers receive a deterministic Vec across runs; the
+        // underlying position_ids set is AHash-backed.
+        positions.sort_by_key(|p| p.id);
         positions
     }
 
@@ -3967,11 +4184,10 @@ impl Cache {
     ///
     /// This method is used when order event application fails and we need to ensure
     /// terminal orders are properly cleaned up from own books and all relevant indexes.
-    /// Replicates the index cleanup that update_order performs for closed orders.
+    /// Replicates the index cleanup that `update_order` performs for closed orders.
     pub fn force_remove_from_own_order_book(&mut self, client_order_id: &ClientOrderId) {
-        let order = match self.orders.get(client_order_id) {
-            Some(order) => order,
-            None => return,
+        let Some(order) = self.orders.get(client_order_id) else {
+            return;
         };
 
         self.index.orders_open.remove(client_order_id);
@@ -3997,8 +4213,8 @@ impl Cache {
     /// Audit all own order books against open and inflight order indexes.
     ///
     /// Ensures closed orders are removed from own order books. This includes both
-    /// orders tracked in `orders_open` (ACCEPTED, TRIGGERED, PENDING_*, PARTIALLY_FILLED)
-    /// and `orders_inflight` (INITIALIZED, SUBMITTED) to prevent false positives
+    /// orders tracked in `orders_open` (`ACCEPTED`, `TRIGGERED`, `PENDING_*`, `PARTIALLY_FILLED`)
+    /// and `orders_inflight` (`INITIALIZED`, `SUBMITTED`) to prevent false positives
     /// during venue latency windows.
     pub fn audit_own_order_books(&mut self) {
         log::debug!("Starting own books audit");

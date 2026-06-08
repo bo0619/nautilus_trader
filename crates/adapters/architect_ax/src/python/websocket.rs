@@ -42,6 +42,7 @@ use nautilus_model::{
     python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
+use nautilus_network::websocket::TransportBackend;
 use pyo3::{IntoPyObjectExt, prelude::*};
 use ustr::Ustr;
 
@@ -93,20 +94,31 @@ impl Debug for PyAxMdWebSocketClient {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyAxMdWebSocketClient {
     #[new]
-    #[pyo3(signature = (url, auth_token, heartbeat=30))]
-    fn py_new(url: String, auth_token: String, heartbeat: u64) -> Self {
+    #[pyo3(signature = (url, auth_token, heartbeat=30, proxy_url=None))]
+    fn py_new(url: String, auth_token: String, heartbeat: u64, proxy_url: Option<String>) -> Self {
         Self {
-            inner: AxMdWebSocketClient::new(url, auth_token, heartbeat),
+            inner: AxMdWebSocketClient::new(
+                url,
+                auth_token,
+                heartbeat,
+                TransportBackend::default(),
+                proxy_url,
+            ),
             instruments_cache: Arc::new(AtomicMap::new()),
         }
     }
 
     #[staticmethod]
     #[pyo3(name = "without_auth")]
-    #[pyo3(signature = (url, heartbeat=30))]
-    fn py_without_auth(url: String, heartbeat: u64) -> Self {
+    #[pyo3(signature = (url, heartbeat=30, proxy_url=None))]
+    fn py_without_auth(url: String, heartbeat: u64, proxy_url: Option<String>) -> Self {
         Self {
-            inner: AxMdWebSocketClient::without_auth(url, heartbeat),
+            inner: AxMdWebSocketClient::without_auth(
+                url,
+                heartbeat,
+                TransportBackend::default(),
+                proxy_url,
+            ),
             instruments_cache: Arc::new(AtomicMap::new()),
         }
     }
@@ -464,10 +476,23 @@ impl Debug for PyAxOrdersWebSocketClient {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyAxOrdersWebSocketClient {
     #[new]
-    #[pyo3(signature = (url, account_id, trader_id, heartbeat=30))]
-    fn py_new(url: String, account_id: AccountId, trader_id: TraderId, heartbeat: u64) -> Self {
+    #[pyo3(signature = (url, account_id, trader_id, heartbeat=30, proxy_url=None))]
+    fn py_new(
+        url: String,
+        account_id: AccountId,
+        trader_id: TraderId,
+        heartbeat: u64,
+        proxy_url: Option<String>,
+    ) -> Self {
         Self {
-            inner: AxOrdersWebSocketClient::new(url, account_id, trader_id, heartbeat),
+            inner: AxOrdersWebSocketClient::new(
+                url,
+                account_id,
+                trader_id,
+                heartbeat,
+                TransportBackend::default(),
+                proxy_url,
+            ),
         }
     }
 

@@ -211,6 +211,22 @@ pub fn check_fixed_precision(precision: u8) -> CorrectnessResult<()> {
     Ok(())
 }
 
+/// Returns `true` when two precisions encode their `raw` values at the same scale.
+///
+/// The effective scale for a given precision is `max(precision, FIXED_PRECISION)`:
+/// - Standard precisions (`<= FIXED_PRECISION`) all store raw at `FIXED_SCALAR` scale.
+/// - Defi precisions (`> FIXED_PRECISION`, e.g. 17 or 18) each store raw at their own
+///   native `10^precision` scale via constructors like `Price::from_wei` /
+///   `Quantity::from_u256`.
+///
+/// Two precisions match iff their effective scales are identical. Mixing different
+/// scales in raw arithmetic produces wrong results.
+#[inline]
+#[must_use]
+pub fn raw_scales_match(a: u8, b: u8) -> bool {
+    a.max(FIXED_PRECISION) == b.max(FIXED_PRECISION)
+}
+
 // -----------------------------------------------------------------------------
 // Raw value validation
 // -----------------------------------------------------------------------------
@@ -595,7 +611,7 @@ pub fn mantissa_exponent_to_fixed_i128(
     mantissa: i128,
     exponent: i8,
     precision: u8,
-) -> anyhow::Result<i128> {
+) -> CorrectnessResult<i128> {
     check_fixed_precision(precision)?;
 
     let precision_i16 = i16::from(precision);
@@ -611,17 +627,22 @@ pub fn mantissa_exponent_to_fixed_i128(
 
     let scale_after_rounding = frac_digits.min(precision_i16);
     let scale_exp = target_scale - scale_after_rounding;
-    anyhow::ensure!(
-        scale_exp <= 38,
-        "Exponent {exponent} produces scale factor 10^{scale_exp} which exceeds i128 range"
-    );
+    if scale_exp > 38 {
+        return Err(CorrectnessError::PredicateViolation {
+            message: format!(
+                "Exponent {exponent} produces scale factor 10^{scale_exp} which exceeds i128 range"
+            ),
+        });
+    }
 
     if scale_exp >= 0 {
         mantissa.checked_mul(10i128.pow(scale_exp as u32))
     } else {
         Some(mantissa / 10i128.pow((-scale_exp) as u32))
     }
-    .ok_or_else(|| anyhow::anyhow!("Overflow when scaling mantissa to fixed precision"))
+    .ok_or_else(|| CorrectnessError::PredicateViolation {
+        message: "Overflow when scaling mantissa to fixed precision".to_string(),
+    })
 }
 
 /// Converts an `f64` value to a raw fixed-point `i64` representation with a specified precision.

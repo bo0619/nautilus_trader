@@ -30,11 +30,9 @@ pub mod websocket;
 
 use std::str::FromStr;
 
+use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_system::{
-    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
-    get_global_pyo3_registry,
-};
+use nautilus_system::get_global_pyo3_registry;
 use pyo3::{prelude::*, types::PyDict};
 
 use crate::{
@@ -58,8 +56,8 @@ pub(super) fn extract_optional_trigger_type(
 ) -> PyResult<Option<OKXTriggerType>> {
     extract_optional_string(dict, key)?
         .map(|value| {
-            OKXTriggerType::from_str(&value).map_err(|_| {
-                to_pyvalue_err(format!("Invalid OKX trigger type {value:?} for {key}"))
+            OKXTriggerType::from_str(&value).map_err(|e| {
+                to_pyvalue_err(format!("Invalid OKX trigger type {value:?} for {key}: {e}"))
             })
         })
         .transpose()

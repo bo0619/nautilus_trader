@@ -218,6 +218,7 @@ impl FileWriter {
         instance_id: String,
         file_config: FileWriterConfig,
         fileout_level: LevelFilter,
+        clear_log_file: bool,
     ) -> Option<Self> {
         // Set up log file
         let json_format = match file_config.file_format.as_ref().map(|s| s.to_lowercase()) {
@@ -239,6 +240,13 @@ impl FileWriter {
                     return None;
                 }
             };
+
+        if clear_log_file
+            && file_path.exists()
+            && let Err(e) = File::create(&file_path)
+        {
+            eprintln!("{NAUTILUS_PREFIX} Error clearing log file: {e}");
+        }
 
         match File::options()
             .create(true)
@@ -280,28 +288,24 @@ impl FileWriter {
     ) -> Result<PathBuf, io::Error> {
         let utc_now = Utc::now();
 
-        let basename = match file_config.file_name.as_ref() {
-            Some(file_name) => {
-                if file_config.file_rotate.is_some() {
-                    let utc_datetime = utc_now.format("%Y-%m-%d_%H%M%S:%3f");
-                    format!("{file_name}_{utc_datetime}")
-                } else {
-                    file_name.clone()
-                }
+        let basename = if let Some(file_name) = file_config.file_name.as_ref() {
+            if file_config.file_rotate.is_some() {
+                let utc_datetime = utc_now.format("%Y-%m-%d_%H%M%S:%3f");
+                format!("{file_name}_{utc_datetime}")
+            } else {
+                file_name.clone()
             }
-            None => {
-                // Default base name
-                let utc_component = if file_config.file_rotate.is_some() {
-                    utc_now.format("%Y-%m-%d_%H%M%S:%3f")
-                } else {
-                    utc_now.format("%Y-%m-%d")
-                };
+        } else {
+            let utc_component = if file_config.file_rotate.is_some() {
+                utc_now.format("%Y-%m-%d_%H%M%S:%3f")
+            } else {
+                utc_now.format("%Y-%m-%d")
+            };
 
-                format!("{trader_id}_{utc_component}_{instance_id}")
-            }
+            format!("{trader_id}_{utc_component}_{instance_id}")
         };
 
-        let suffix = if is_json_format { "json" } else { "log" };
+        let suffix = if is_json_format { "jsonl" } else { "log" };
         let mut file_path = PathBuf::new();
 
         if let Some(directory) = file_config.directory.as_ref() {
@@ -360,7 +364,7 @@ impl FileWriter {
                 }
 
                 self.buf = BufWriter::new(new_file);
-                self.path = new_path.clone();
+                self.path.clone_from(&new_path);
                 eprintln!(
                     "{NAUTILUS_PREFIX} Rotated log file, now logging to: {}",
                     new_path.display()
@@ -472,6 +476,7 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
         )
         .unwrap();
 
@@ -526,6 +531,7 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
         );
 
         assert!(writer.is_none());
@@ -549,6 +555,7 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
         );
 
         assert!(writer.is_none());
@@ -570,6 +577,7 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
         )
         .unwrap();
 
@@ -593,11 +601,74 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
         )
         .unwrap();
 
         assert!(writer.json_format);
-        assert!(writer.path.extension().unwrap() == "json");
+        assert!(writer.path.extension().unwrap() == "jsonl");
+    }
+
+    #[rstest]
+    fn test_file_writer_clear_log_file_truncates_existing_file() {
+        let temp_dir = tempdir().unwrap();
+
+        let config = FileWriterConfig {
+            directory: Some(temp_dir.path().to_str().unwrap().to_string()),
+            file_name: Some("test".to_string()),
+            file_format: None,
+            file_rotate: None,
+        };
+
+        let existing_path = temp_dir.path().join("test.log");
+        std::fs::write(&existing_path, "stale contents").unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing_path).unwrap().len(),
+            "stale contents".len() as u64
+        );
+
+        let writer = FileWriter::new(
+            "TRADER-001".to_string(),
+            "instance-123".to_string(),
+            config,
+            LevelFilter::Info,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(writer.path, existing_path);
+        assert_eq!(std::fs::metadata(&existing_path).unwrap().len(), 0);
+    }
+
+    #[rstest]
+    fn test_file_writer_clear_log_file_false_preserves_existing_file() {
+        let temp_dir = tempdir().unwrap();
+
+        let config = FileWriterConfig {
+            directory: Some(temp_dir.path().to_str().unwrap().to_string()),
+            file_name: Some("test".to_string()),
+            file_format: None,
+            file_rotate: None,
+        };
+
+        let existing_path = temp_dir.path().join("test.log");
+        let existing_contents = "preserved contents";
+        std::fs::write(&existing_path, existing_contents).unwrap();
+
+        let writer = FileWriter::new(
+            "TRADER-001".to_string(),
+            "instance-123".to_string(),
+            config,
+            LevelFilter::Info,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(writer.path, existing_path);
+        assert_eq!(
+            std::fs::read_to_string(&existing_path).unwrap(),
+            existing_contents
+        );
     }
 
     #[rstest]

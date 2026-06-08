@@ -2308,9 +2308,12 @@ class Money:
     def __abs__(self) -> Money: ...
     def __int__(self) -> int: ...
     def is_zero(self) -> bool: ...
+    def is_positive(self) -> bool: ...
     def as_decimal(self) -> Decimal: ...
     def as_double(self) -> float: ...
     def to_formatted_str(self) -> str: ...
+    def checked_add(self, other: Money) -> Money | None: ...
+    def checked_sub(self, other: Money) -> Money | None: ...
 
 class Price:
     def __init__(self, value: float, precision: int) -> None: ...
@@ -2339,6 +2342,8 @@ class Price:
     def as_double(self) -> float: ...
     def as_decimal(self) -> Decimal: ...
     def to_formatted_str(self) -> str: ...
+    def checked_add(self, other: Price) -> Price | None: ...
+    def checked_sub(self, other: Price) -> Price | None: ...
 
 class Quantity:
     def __init__(self, value: float, precision: int) -> None: ...
@@ -2367,6 +2372,9 @@ class Quantity:
     def as_decimal(self) -> Decimal: ...
     def as_double(self) -> float: ...
     def to_formatted_str(self) -> str: ...
+    def saturating_sub(self, other: Quantity) -> Quantity: ...
+    def checked_add(self, other: Quantity) -> Quantity | None: ...
+    def checked_sub(self, other: Quantity) -> Quantity | None: ...
 
 class AccountBalance:
     def __init__(self, total: Money, locked: Money, free: Money): ...
@@ -5289,6 +5297,7 @@ class WebSocketConfig:
         reconnect_jitter_ms: int | None = 100,
         reconnect_max_attempts: int | None = None,
         idle_timeout_ms: int | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
 
 class WebSocketClient:
@@ -6558,9 +6567,14 @@ class AxMdWebSocketClient:
         url: str,
         auth_token: str,
         heartbeat: int = 30,
+        proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
-    def without_auth(url: str, heartbeat: int = 30) -> AxMdWebSocketClient: ...
+    def without_auth(
+        url: str,
+        heartbeat: int = 30,
+        proxy_url: str | None = None,
+    ) -> AxMdWebSocketClient: ...
     @property
     def url(self) -> str: ...
     def is_active(self) -> bool: ...
@@ -6593,6 +6607,7 @@ class AxOrdersWebSocketClient:
         account_id: AccountId,
         trader_id: TraderId,
         heartbeat: int = 30,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -6824,8 +6839,16 @@ class BybitMarginStatusResult:
     def ts_init(self) -> int: ...
 
 class BybitPositionMode(Enum):
-    MergedSingle = 0
-    BothSides = 3
+    MERGED_SINGLE = 0
+    BOTH_SIDES = 3
+
+class BybitPositionIdx(Enum):
+    ONE_WAY = 0
+    BUY_HEDGE = 1
+    SELL_HEDGE = 2
+
+    @classmethod
+    def from_str(cls, data: Any) -> BybitPositionIdx: ...
 
 class BybitServerTime:
     @property
@@ -7192,6 +7215,7 @@ class BybitHttpClient:
         reduce_only: bool = False,
         is_quote_quantity: bool = False,
         is_leverage: bool = False,
+        position_idx: BybitPositionIdx | None = None,
     ) -> OrderStatusReport: ...
     async def cancel_order(
         self,
@@ -7225,6 +7249,7 @@ class BybitWebSocketClient:
         environment: BybitEnvironment,
         url: str | None = None,
         heartbeat: int = 20,
+        proxy_url: str | None = None,
     ) -> BybitWebSocketClient: ...
     @staticmethod
     def new_private(
@@ -7233,6 +7258,7 @@ class BybitWebSocketClient:
         api_secret: str | None = None,
         url: str | None = None,
         heartbeat: int = 20,
+        proxy_url: str | None = None,
     ) -> BybitWebSocketClient: ...
     @staticmethod
     def new_trade(
@@ -7241,6 +7267,7 @@ class BybitWebSocketClient:
         api_secret: str | None = None,
         url: str | None = None,
         heartbeat: int = 20,
+        proxy_url: str | None = None,
     ) -> BybitWebSocketClient: ...
     @property
     def api_key_masked(self) -> str | None: ...
@@ -7290,6 +7317,7 @@ class BybitWebSocketClient:
         post_only: bool | None = None,
         reduce_only: bool | None = None,
         is_leverage: bool = False,
+        position_idx: BybitPositionIdx | None = None,
     ) -> None: ...
     async def modify_order(
         self,
@@ -7347,6 +7375,7 @@ class BybitWebSocketClient:
         is_leverage: bool = False,
         take_profit: Price | None = None,
         stop_loss: Price | None = None,
+        position_idx: BybitPositionIdx | None = None,
     ) -> BybitWsPlaceOrderParams: ...
     def build_amend_order_params(
         self,
@@ -7394,6 +7423,7 @@ class BybitWsPlaceOrderParams:
     tp_limit_price: str | None
     order_iv: str | None
     mmp: bool | None
+    position_idx: BybitPositionIdx | None
 
 class BybitWsAmendOrderParams:
     category: BybitProductType
@@ -7421,6 +7451,12 @@ def get_bybit_ws_url_public(
 ) -> str: ...
 def get_bybit_ws_url_private(environment: BybitEnvironment) -> str: ...
 def get_bybit_ws_url_trade(environment: BybitEnvironment) -> str: ...
+def bybit_resolve_position_idx(
+    position_mode: BybitPositionMode | None,
+    order_side: OrderSide,
+    is_reduce_only: bool,
+    manual_override: BybitPositionIdx | None = None,
+) -> BybitPositionIdx | None: ...
 def bybit_extract_raw_symbol(symbol: str) -> str: ...
 def bybit_bar_spec_to_interval(aggregation: int, step: int) -> str: ...
 def bybit_product_type_from_symbol(symbol: str) -> BybitProductType: ...
@@ -7869,13 +7905,18 @@ class DeribitWebSocketClient:
         api_secret: str | None = None,
         heartbeat_interval: int = 30,
         environment: DeribitEnvironment = ...,
+        proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
-    def new_public(environment: DeribitEnvironment) -> DeribitWebSocketClient: ...
+    def new_public(
+        environment: DeribitEnvironment,
+        proxy_url: str | None = None,
+    ) -> DeribitWebSocketClient: ...
     @staticmethod
     def with_credentials(
         environment: DeribitEnvironment,
         account_id: AccountId | None = None,
+        proxy_url: str | None = None,
     ) -> DeribitWebSocketClient: ...
     @property
     def url(self) -> str: ...
@@ -8215,6 +8256,7 @@ class TardisHttpClient:
         base_url: str | None = None,
         timeout_secs: int = 60,
         normalize_symbols: bool = True,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def api_key(self) -> str | None: ...
@@ -8473,6 +8515,7 @@ class OKXWebSocketClient:
         account_id: AccountId | None = None,
         heartbeat: int | None = None,
         auth_timeout_secs: int | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
     def with_credentials(
@@ -8483,6 +8526,7 @@ class OKXWebSocketClient:
         account_id: AccountId | None = None,
         heartbeat: int | None = None,
         auth_timeout_secs: int | None = None,
+        proxy_url: str | None = None,
     ) -> OKXWebSocketClient: ...
     @staticmethod
     def from_env() -> OKXWebSocketClient: ...
@@ -8829,6 +8873,7 @@ class BitmexWebSocketClient:
         account_id: AccountId | None = None,
         heartbeat: int = 5,
         environment: BitmexEnvironment = ...,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -8910,6 +8955,7 @@ class SubmitBroadcaster:
         health_check_interval_secs: int = 30,
         health_check_timeout_secs: int = 5,
         expected_reject_patterns: list[str] | None = None,
+        proxy_urls: list[str | None] | None = None,
     ) -> None: ...
     def cache_instrument(self, instrument: Instrument) -> None: ...
     def get_metrics(self) -> dict[str, int]: ...
@@ -8958,6 +9004,7 @@ class CancelBroadcaster:
         health_check_timeout_secs: int = 5,
         expected_reject_patterns: list[str] | None = None,
         idempotent_success_patterns: list[str] | None = None,
+        proxy_urls: list[str | None] | None = None,
     ) -> None: ...
     def cache_instrument(self, instrument: Instrument) -> None: ...
     def get_metrics(self) -> dict[str, int]: ...
@@ -9152,6 +9199,7 @@ class HyperliquidWebSocketClient:
         environment: HyperliquidEnvironment = ...,
         product_type: HyperliquidProductType = ...,
         account_id: str | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -9246,6 +9294,11 @@ class KrakenSpotHttpClient:
         self,
         pairs: list[str] | None = None,
     ) -> dict[InstrumentId, MarketStatusAction]: ...
+    async def request_book_snapshot(
+        self,
+        instrument_id: InstrumentId,
+        depth: int | None = None,
+    ) -> OrderBook: ...
     async def request_trades(
         self,
         instrument_id: InstrumentId,
@@ -9370,6 +9423,11 @@ class KrakenFuturesHttpClient:
     async def request_instrument_statuses(
         self,
     ) -> dict[InstrumentId, MarketStatusAction]: ...
+    async def request_book_snapshot(
+        self,
+        instrument_id: InstrumentId,
+        depth: int | None = None,
+    ) -> OrderBook: ...
     async def request_trades(
         self,
         instrument_id: InstrumentId,
@@ -9488,6 +9546,7 @@ class KrakenSpotWebSocketClient:
         heartbeat_secs: int | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -9540,6 +9599,7 @@ class KrakenFuturesWebSocketClient:
         heartbeat_secs: int = 60,
         api_key: str | None = None,
         api_secret: str | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...
@@ -9727,163 +9787,6 @@ class DockerizedIBGateway:
     async def safe_start(self, wait: int | None = None) -> None: ...
     async def stop(self) -> None: ...
     async def container_status(self) -> ContainerStatus: ...
-
-class InteractiveBrokersDataClient:
-    @property
-    def client_id(self) -> ClientId: ...
-    @property
-    def is_connected(self) -> bool: ...
-    @property
-    def is_disconnected(self) -> bool: ...
-    def get_instrument_provider(self) -> InteractiveBrokersInstrumentProvider: ...
-    async def batch_load(self, instrument_ids: list[InstrumentId]) -> int: ...
-    async def fetch_option_chain_by_range(
-        self,
-        underlying_symbol: str,
-        exchange: str | None = None,
-        currency: str | None = None,
-        expiry_min: str | None = None,
-        expiry_max: str | None = None,
-    ) -> int: ...
-    async def fetch_futures_chain(
-        self,
-        symbol: str,
-        exchange: str | None = None,
-        currency: str | None = None,
-    ) -> int: ...
-    def subscribe_quotes(
-        self,
-        instrument_id: InstrumentId,
-        params: dict[str, str] | None = None,
-    ) -> None: ...
-    def subscribe_trades(self, instrument_id: InstrumentId) -> None: ...
-    def subscribe_bars(self, bar_type: BarType) -> None: ...
-    def subscribe_book_deltas(
-        self,
-        instrument_id: InstrumentId,
-        depth: int | None = None,
-        params: dict[str, str] | None = None,
-    ) -> None: ...
-    def unsubscribe_quotes(self, instrument_id: InstrumentId) -> None: ...
-    def unsubscribe_trades(self, instrument_id: InstrumentId) -> None: ...
-    def unsubscribe_bars(self, bar_type: BarType) -> None: ...
-    def unsubscribe_book_deltas(self, instrument_id: InstrumentId) -> None: ...
-    def request_quotes(
-        self,
-        instrument_id: InstrumentId,
-        limit: int | None = None,
-        start: int | None = None,
-        end: int | None = None,
-    ) -> None: ...
-    def request_trades(
-        self,
-        instrument_id: InstrumentId,
-        limit: int | None = None,
-        start: int | None = None,
-        end: int | None = None,
-    ) -> None: ...
-    def request_bars(
-        self,
-        bar_type: BarType,
-        limit: int | None = None,
-        start: int | None = None,
-        end: int | None = None,
-    ) -> None: ...
-    def request_instrument(
-        self,
-        instrument_id: InstrumentId,
-        params: dict[str, str] | None = None,
-    ) -> None: ...
-    def request_instruments(
-        self,
-        venue: Venue | None = None,
-        params: dict[str, str] | None = None,
-    ) -> None: ...
-    def load_async(
-        self,
-        instrument_id: InstrumentId,
-        force_instrument_update: bool,
-    ) -> Awaitable[None]: ...
-    def load_with_return_async(
-        self,
-        instrument_id: InstrumentId,
-        force_instrument_update: bool,
-    ) -> Awaitable[InstrumentId | None]: ...
-    def load_ids_async(
-        self,
-        instrument_ids: list[InstrumentId],
-        force_instrument_update: bool,
-    ) -> Awaitable[None]: ...
-    def load_ids_with_return_async(
-        self,
-        instrument_ids: list[InstrumentId],
-        force_instrument_update: bool,
-    ) -> Awaitable[list[InstrumentId]]: ...
-    def load_all_async(
-        self,
-        instrument_ids: list[InstrumentId] | None = None,
-        contracts: list[dict[str, Any]] | None = None,
-        force_instrument_update: bool = False,
-    ) -> Awaitable[list[InstrumentId]]: ...
-    def fetch_spread_instrument(
-        self,
-        spread_instrument_id: InstrumentId,
-        force_instrument_update: bool,
-    ) -> Awaitable[bool]: ...
-    def get_instrument_id_by_contract_id(self, contract_id: int) -> InstrumentId | None: ...
-    def instrument_id_to_ib_contract_details(
-        self,
-        instrument_id: InstrumentId,
-    ) -> dict[str, Any] | None: ...
-    def determine_venue(self, contract: dict[str, Any]) -> str: ...
-    def get_instrument(self, contract: dict[str, Any]) -> Instrument | None: ...
-
-class InteractiveBrokersExecutionClient:
-    @property
-    def client_id(self) -> ClientId: ...
-    @property
-    def is_connected(self) -> bool: ...
-    @property
-    def is_disconnected(self) -> bool: ...
-    def submit_order(
-        self, order: Any, instrument_id: InstrumentId, strategy_id: StrategyId
-    ) -> None: ...
-    def submit_order_list(self, orders: Any, strategy_id: StrategyId) -> None: ...
-    def modify_order(
-        self,
-        client_order_id: ClientOrderId,
-        venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-        quantity: Quantity | None = None,
-        price: Price | None = None,
-        trigger_price: Price | None = None,
-    ) -> None: ...
-    def cancel_order(
-        self,
-        client_order_id: ClientOrderId,
-        venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-    ) -> None: ...
-    def cancel_all_orders(self, instrument_id: InstrumentId) -> None: ...
-    def batch_cancel_orders(self, client_order_ids: list[ClientOrderId]) -> None: ...
-    async def generate_order_status_report(
-        self,
-        client_order_id: ClientOrderId,
-    ) -> OrderStatusReport | None: ...
-    async def generate_order_status_reports(
-        self,
-        instrument_id: InstrumentId | None = None,
-    ) -> list[OrderStatusReport]: ...
-    async def generate_fill_reports(
-        self,
-        instrument_id: InstrumentId | None = None,
-        start: int | None = None,
-        end: int | None = None,
-    ) -> list[FillReport]: ...
-    async def generate_position_status_reports(
-        self,
-        instrument_id: InstrumentId | None = None,
-    ) -> list[PositionStatusReport]: ...
 
 class HistoricalInteractiveBrokersClient:
     async def request_bars(

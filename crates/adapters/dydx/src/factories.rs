@@ -15,13 +15,14 @@
 
 //! Factory functions for creating dYdX clients and components.
 
-use std::{any::Any, cell::RefCell, rc::Rc};
+use std::{any::Any, cell::RefCell, rc::Rc, sync::Arc};
 
 use log;
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
+    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
 };
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
@@ -29,12 +30,12 @@ use nautilus_model::{
     identifiers::ClientId,
 };
 use nautilus_network::retry::RetryConfig;
-use nautilus_system::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 
 use crate::{
     common::{
-        consts::DYDX_VENUE,
+        consts::{DYDX, DYDX_VENUE},
         credential::{DydxCredential, resolve_wallet_address},
+        instrument_cache::InstrumentCache,
         urls,
     },
     config::{DydxAdapterConfig, DydxDataClientConfig, DydxExecClientConfig},
@@ -87,7 +88,7 @@ impl DataClientFactory for DydxDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let dydx_config = config
@@ -121,19 +122,25 @@ impl DataClientFactory for DydxDataClientFactory {
         let http_client = DydxHttpClient::new(
             Some(http_url),
             dydx_config.http_timeout_secs,
-            dydx_config.http_proxy_url.clone(),
+            dydx_config.proxy_url.clone(),
             dydx_config.network,
             retry_config,
         )?;
 
-        let ws_client = DydxWebSocketClient::new_public(ws_url, Some(20));
+        let ws_client = DydxWebSocketClient::new_public_with_cache(
+            ws_url,
+            Arc::new(InstrumentCache::new()),
+            Some(20),
+            dydx_config.transport_backend,
+            dydx_config.proxy_url.clone(),
+        );
 
         let client = DydxDataClient::new(client_id, dydx_config, http_client, ws_client)?;
         Ok(Box::new(client))
     }
 
     fn name(&self) -> &'static str {
-        "DYDX"
+        DYDX
     }
 
     fn config_type(&self) -> &'static str {
@@ -172,7 +179,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let dydx_config = config
             .as_any()
@@ -221,6 +228,8 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
             retry_delay_initial_ms: dydx_config.retry_delay_initial_ms.unwrap_or(1000),
             retry_delay_max_ms: dydx_config.retry_delay_max_ms.unwrap_or(10000),
             grpc_rate_limit_per_second: dydx_config.grpc_rate_limit_per_second,
+            proxy_url: dydx_config.proxy_url.clone(),
+            transport_backend: dydx_config.transport_backend,
         };
 
         log::info!(
@@ -265,7 +274,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "DYDX"
+        DYDX
     }
 
     fn config_type(&self) -> &'static str {
@@ -277,9 +286,12 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_common::{
+        cache::Cache,
+        clock::TestClock,
+        factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
+    };
     use nautilus_model::identifiers::{AccountId, TraderId};
-    use nautilus_system::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
     use rstest::rstest;
 
     use super::*;
@@ -291,27 +303,27 @@ mod tests {
     #[rstest]
     fn test_dydx_data_client_factory_creation() {
         let factory = DydxDataClientFactory::new();
-        assert_eq!(factory.name(), "DYDX");
+        assert_eq!(factory.name(), DYDX);
         assert_eq!(factory.config_type(), "DydxDataClientConfig");
     }
 
     #[rstest]
     fn test_dydx_data_client_factory_default() {
         let factory = DydxDataClientFactory;
-        assert_eq!(factory.name(), "DYDX");
+        assert_eq!(factory.name(), DYDX);
     }
 
     #[rstest]
     fn test_dydx_execution_client_factory_creation() {
         let factory = DydxExecutionClientFactory::new();
-        assert_eq!(factory.name(), "DYDX");
+        assert_eq!(factory.name(), DYDX);
         assert_eq!(factory.config_type(), "DydxExecClientConfig");
     }
 
     #[rstest]
     fn test_dydx_execution_client_factory_default() {
         let factory = DydxExecutionClientFactory;
-        assert_eq!(factory.name(), "DYDX");
+        assert_eq!(factory.name(), DYDX);
     }
 
     #[rstest]
@@ -342,6 +354,8 @@ mod tests {
             retry_delay_initial_ms: None,
             retry_delay_max_ms: None,
             grpc_rate_limit_per_second: Some(4),
+            proxy_url: None,
+            transport_backend: Default::default(),
         };
 
         let boxed_config: Box<dyn ClientConfig> = Box::new(config);
@@ -370,12 +384,14 @@ mod tests {
             retry_delay_initial_ms: None,
             retry_delay_max_ms: None,
             grpc_rate_limit_per_second: Some(4),
+            proxy_url: None,
+            transport_backend: Default::default(),
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));
         let clock = Rc::new(RefCell::new(TestClock::new()));
 
-        let result = factory.create("DYDX-TEST", &wrong_config, cache, clock);
+        let result = factory.create("DYDX-TEST", &wrong_config, cache.into(), clock);
         assert!(result.is_err());
         assert!(
             result
@@ -393,7 +409,7 @@ mod tests {
 
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let result = factory.create("DYDX-TEST", &wrong_config, cache);
+        let result = factory.create("DYDX-TEST", &wrong_config, cache.into());
         assert!(result.is_err());
         assert!(
             result

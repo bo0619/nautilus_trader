@@ -18,10 +18,10 @@ workspace = true
 
 [lib]
 name = "nautilus_network"
-crate-type = ["rlib", "staticlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
-default = []
+default = ["transport-sockudo"]
 extension-module = [
   "nautilus-core/extension-module",
   "python",
@@ -35,6 +35,12 @@ python = [
 ]
 simulation = ["dep:madsim", "nautilus-core/simulation"]
 turmoil = ["dep:turmoil"]
+# Backend selection for the WebSocket transport abstraction.
+# `tokio-tungstenite` is always compiled; `transport-sockudo` (enabled by
+# default) adds the `sockudo-ws` backend, selectable at runtime via
+# `WebSocketConfig.backend`. Disable via `default-features = false` to drop
+# the sockudo dependency.
+transport-sockudo = ["dep:sockudo-ws"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -46,6 +52,7 @@ nautilus-cryptography = { workspace = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
+base64 = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
@@ -54,7 +61,7 @@ futures-util = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
@@ -73,6 +80,7 @@ madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
+sockudo-ws = { workspace = true, optional = true }
 turmoil = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -16,6 +16,7 @@
 use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
 use ahash::AHashMap;
+use indexmap::IndexMap;
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_DAY};
 use nautilus_model::{
     accounts::Account,
@@ -57,8 +58,8 @@ pub type Statistic = Arc<dyn PortfolioStatistic<Item = f64> + Send + Sync>;
 )]
 pub struct PortfolioAnalyzer {
     pub statistics: AHashMap<String, Statistic>,
-    pub account_balances_starting: AHashMap<Currency, Money>,
-    pub account_balances: AHashMap<Currency, Money>,
+    pub account_balances_starting: IndexMap<Currency, Money>,
+    pub account_balances: IndexMap<Currency, Money>,
     pub positions: Vec<Position>,
     pub realized_pnls: AHashMap<Currency, Vec<(PositionId, f64)>>,
     pub position_returns: Returns,
@@ -103,8 +104,8 @@ impl PortfolioAnalyzer {
     pub fn new() -> Self {
         Self {
             statistics: AHashMap::new(),
-            account_balances_starting: AHashMap::new(),
-            account_balances: AHashMap::new(),
+            account_balances_starting: IndexMap::new(),
+            account_balances: IndexMap::new(),
             positions: Vec::new(),
             realized_pnls: AHashMap::new(),
             position_returns: BTreeMap::new(),
@@ -633,6 +634,7 @@ mod tests {
     use std::sync::Arc;
 
     use ahash::{AHashMap, AHashSet};
+    use indexmap::IndexMap;
     use nautilus_core::{UUID4, approx_eq};
     use nautilus_model::{
         enums::{AccountType, InstrumentClass, LiquiditySide, OrderSide, PositionSide},
@@ -725,7 +727,7 @@ mod tests {
             trade_ids: AHashSet::new(),
             buy_qty: Quantity::default(),
             sell_qty: Quantity::default(),
-            commissions: AHashMap::new(),
+            commissions: IndexMap::new(),
         }
     }
 
@@ -736,11 +738,11 @@ mod tests {
     }
 
     impl Account for MockAccount {
-        fn starting_balances(&self) -> AHashMap<Currency, Money> {
-            self.starting_balances.clone()
+        fn starting_balances(&self) -> IndexMap<Currency, Money> {
+            self.starting_balances.clone().into_iter().collect()
         }
-        fn balances_total(&self) -> AHashMap<Currency, Money> {
-            self.current_balances.clone()
+        fn balances_total(&self) -> IndexMap<Currency, Money> {
+            self.current_balances.clone().into_iter().collect()
         }
         fn id(&self) -> AccountId {
             todo!()
@@ -766,13 +768,13 @@ mod tests {
         fn balance_free(&self, _: Option<Currency>) -> Option<Money> {
             todo!()
         }
-        fn balances_free(&self) -> AHashMap<Currency, Money> {
+        fn balances_free(&self) -> IndexMap<Currency, Money> {
             todo!()
         }
         fn balance_locked(&self, _: Option<Currency>) -> Option<Money> {
             todo!()
         }
-        fn balances_locked(&self) -> AHashMap<Currency, Money> {
+        fn balances_locked(&self) -> IndexMap<Currency, Money> {
             todo!()
         }
         fn last_event(&self) -> Option<AccountState> {
@@ -787,7 +789,7 @@ mod tests {
         fn currencies(&self) -> Vec<Currency> {
             self.current_balances.keys().copied().collect()
         }
-        fn balances(&self) -> AHashMap<Currency, AccountBalance> {
+        fn balances(&self) -> IndexMap<Currency, AccountBalance> {
             todo!()
         }
         fn apply(&mut self, _: AccountState) -> anyhow::Result<()> {
@@ -1107,6 +1109,30 @@ mod tests {
         assert!(analyzer.position_returns.is_empty());
         assert!(analyzer.portfolio_returns.is_empty());
         assert!(analyzer.returns.is_empty());
+    }
+
+    #[rstest]
+    fn test_currencies_preserve_account_balance_order() {
+        // Pin IndexMap iteration on PortfolioAnalyzer::account_balances:
+        // currencies() drives the per-currency stat computation in
+        // BacktestEngine::run, so the returned Vec must reflect the
+        // upstream account balance order across runs.
+        let mut analyzer = PortfolioAnalyzer::new();
+        let inserts = [
+            (Currency::BTC(), Money::new(1.0, Currency::BTC())),
+            (Currency::USD(), Money::new(2.0, Currency::USD())),
+            (Currency::ETH(), Money::new(3.0, Currency::ETH())),
+        ];
+
+        for (currency, money) in inserts {
+            analyzer.account_balances.insert(currency, money);
+        }
+
+        let returned: Vec<Currency> = analyzer.currencies().into_iter().copied().collect();
+        assert_eq!(
+            returned,
+            vec![Currency::BTC(), Currency::USD(), Currency::ETH()],
+        );
     }
 
     #[rstest]

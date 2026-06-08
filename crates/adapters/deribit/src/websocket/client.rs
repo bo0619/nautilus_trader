@@ -46,8 +46,8 @@ use nautilus_network::{
     http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        AuthTracker, PingHandler, SubscriptionState, TransportBackend, WebSocketClient,
+        WebSocketConfig, channel_message_handler,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -108,6 +108,8 @@ pub struct DeribitWebSocketClient {
     account_id: Option<AccountId>,
     bars_timestamp_on_close: bool,
     subscribe_errors: Arc<Mutex<Vec<String>>>,
+    transport_backend: TransportBackend,
+    proxy_url: Option<String>,
 }
 
 impl Debug for DeribitWebSocketClient {
@@ -140,6 +142,8 @@ impl DeribitWebSocketClient {
         api_secret: Option<String>,
         heartbeat_interval: u64,
         environment: DeribitEnvironment,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         Self::new_inner(
             url,
@@ -148,10 +152,13 @@ impl DeribitWebSocketClient {
             heartbeat_interval,
             environment,
             true,
+            transport_backend,
+            proxy_url,
         )
     }
 
     /// Internal constructor with control over environment variable fallback.
+    #[expect(clippy::too_many_arguments)]
     fn new_inner(
         url: Option<String>,
         api_key: Option<String>,
@@ -159,6 +166,8 @@ impl DeribitWebSocketClient {
         heartbeat_interval: u64,
         environment: DeribitEnvironment,
         env_fallback: bool,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         let url = url.unwrap_or_else(|| match environment {
             DeribitEnvironment::Testnet => DERIBIT_TESTNET_WS_URL.to_string(),
@@ -204,6 +213,8 @@ impl DeribitWebSocketClient {
             account_id: None,
             bars_timestamp_on_close: true,
             subscribe_errors: Arc::new(Mutex::new(Vec::new())),
+            transport_backend,
+            proxy_url,
         })
     }
 
@@ -214,7 +225,10 @@ impl DeribitWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if initialization fails.
-    pub fn new_public(environment: DeribitEnvironment) -> anyhow::Result<Self> {
+    pub fn new_public(
+        environment: DeribitEnvironment,
+        proxy_url: Option<String>,
+    ) -> anyhow::Result<Self> {
         Self::new_inner(
             None,
             None,
@@ -222,6 +236,8 @@ impl DeribitWebSocketClient {
             DERIBIT_WS_HEARTBEAT_SECS,
             environment,
             false,
+            TransportBackend::default(),
+            proxy_url,
         )
     }
 
@@ -238,7 +254,16 @@ impl DeribitWebSocketClient {
         heartbeat_interval: u64,
         environment: DeribitEnvironment,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(url, None, None, heartbeat_interval, environment, false)
+        Self::new_inner(
+            url,
+            None,
+            None,
+            heartbeat_interval,
+            environment,
+            false,
+            TransportBackend::default(),
+            None,
+        )
     }
 
     /// Creates an authenticated client with credentials.
@@ -250,7 +275,10 @@ impl DeribitWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if credentials are not found in environment variables.
-    pub fn with_credentials(environment: DeribitEnvironment) -> anyhow::Result<Self> {
+    pub fn with_credentials(
+        environment: DeribitEnvironment,
+        proxy_url: Option<String>,
+    ) -> anyhow::Result<Self> {
         let (key_env, secret_env) = credential_env_vars(environment);
 
         let api_key = get_or_env_var_opt(None, key_env)
@@ -264,6 +292,8 @@ impl DeribitWebSocketClient {
             Some(api_secret),
             DERIBIT_WS_HEARTBEAT_SECS,
             environment,
+            TransportBackend::default(),
+            proxy_url,
         )
     }
 
@@ -501,6 +531,8 @@ impl DeribitWebSocketClient {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         };
 
         // Configure rate limits

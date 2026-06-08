@@ -36,6 +36,7 @@ impl DeribitDataClientConfig {
         api_secret = None,
         base_url_http = None,
         base_url_ws = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
@@ -51,6 +52,7 @@ impl DeribitDataClientConfig {
         api_secret: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -65,6 +67,7 @@ impl DeribitDataClientConfig {
             product_types: product_types.unwrap_or(defaults.product_types),
             base_url_http,
             base_url_ws,
+            proxy_url,
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
@@ -75,6 +78,7 @@ impl DeribitDataClientConfig {
                 .unwrap_or(defaults.heartbeat_interval_secs),
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
+            transport_backend: defaults.transport_backend,
         }
     }
 
@@ -97,6 +101,7 @@ impl DeribitExecClientConfig {
         api_secret = None,
         base_url_http = None,
         base_url_ws = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
@@ -112,6 +117,7 @@ impl DeribitExecClientConfig {
         api_secret: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -126,12 +132,14 @@ impl DeribitExecClientConfig {
             product_types: product_types.unwrap_or(defaults.product_types),
             base_url_http,
             base_url_ws,
+            proxy_url,
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
                 .unwrap_or(defaults.retry_delay_initial_ms),
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
+            transport_backend: defaults.transport_backend,
         }
     }
 

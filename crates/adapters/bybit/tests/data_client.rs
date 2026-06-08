@@ -384,8 +384,7 @@ fn create_test_config(addr: SocketAddr) -> BybitDataClientConfig {
         base_url_http: Some(format!("http://{addr}")),
         base_url_ws_public: Some(format!("ws://{addr}/v5/public/linear")),
         base_url_ws_private: None,
-        http_proxy_url: None,
-        ws_proxy_url: None,
+        proxy_url: None,
         http_timeout_secs: 10,
         max_retries: 1,
         retry_delay_initial_ms: 100,
@@ -394,6 +393,7 @@ fn create_test_config(addr: SocketAddr) -> BybitDataClientConfig {
         recv_window_ms: 5000,
         update_instruments_interval_mins: None,
         instrument_status_poll_secs: None,
+        transport_backend: Default::default(),
     }
 }
 

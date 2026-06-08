@@ -47,6 +47,7 @@ use nautilus_model::{
     },
     types::Price,
 };
+use nautilus_network::websocket::TransportBackend;
 use pyo3::{conversion::IntoPyObjectExt, prelude::*};
 use ustr::Ustr;
 
@@ -103,7 +104,7 @@ impl Debug for PyBitmexWebSocketClient {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyBitmexWebSocketClient {
     #[new]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, account_id=None, heartbeat=5, environment=BitmexEnvironment::Mainnet))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, account_id=None, heartbeat=5, environment=BitmexEnvironment::Mainnet, proxy_url=None))]
     fn py_new(
         url: Option<String>,
         api_key: Option<String>,
@@ -111,6 +112,7 @@ impl PyBitmexWebSocketClient {
         account_id: Option<AccountId>,
         heartbeat: u64,
         environment: BitmexEnvironment,
+        proxy_url: Option<String>,
     ) -> PyResult<Self> {
         let inner = BitmexWebSocketClient::new_with_env(
             url,
@@ -119,6 +121,8 @@ impl PyBitmexWebSocketClient {
             account_id,
             heartbeat,
             environment,
+            TransportBackend::default(),
+            proxy_url,
         )
         .map_err(to_pyvalue_err)?;
         Ok(Self {

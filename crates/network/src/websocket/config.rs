@@ -29,6 +29,28 @@ use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
 
+/// WebSocket transport backend selection.
+///
+/// Selection is runtime so multiple backends can compile side-by-side without
+/// a `compile_error!` collision under `--all-features`.
+///
+/// `Sockudo` is the default backend and is enabled by the `transport-sockudo`
+/// Cargo feature (on by default); it uses a local HTTP/1.1 handshake helper to
+/// pass custom upgrade headers through. When the feature is disabled the
+/// default falls back to `Tungstenite`, which is always compiled and supports
+/// custom HTTP upgrade headers on the WebSocket handshake (see
+/// [`WebSocketConfig::headers`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportBackend {
+    /// `tokio-tungstenite` backed transport (default when `transport-sockudo` is disabled).
+    #[cfg_attr(not(feature = "transport-sockudo"), default)]
+    Tungstenite,
+    /// `sockudo-ws` backed transport (default; gated on `transport-sockudo` feature).
+    #[cfg_attr(feature = "transport-sockudo", default)]
+    Sockudo,
+}
+
 /// Configuration for WebSocket client connections.
 ///
 /// This struct contains only static configuration settings. Runtime callbacks
@@ -112,6 +134,24 @@ pub struct WebSocketConfig {
     /// **Note**: Only applies to handler mode. Ignored in stream mode.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
+    /// The transport backend to use for the WebSocket connection.
+    ///
+    /// Defaults to [`TransportBackend::Sockudo`] when the `transport-sockudo`
+    /// Cargo feature is enabled (the default), otherwise [`TransportBackend::Tungstenite`].
+    /// When the feature is disabled, `connect_with_server` returns an error if
+    /// `Sockudo` is selected. Both backends pass `headers` into the HTTP
+    /// upgrade request. The Sockudo backend does not yet support proxy tunnels;
+    /// when [`Self::proxy_url`] is set, `connect_with_server` logs a warning
+    /// and routes through Tungstenite regardless of this field.
+    #[serde(default)]
+    #[builder(default)]
+    pub backend: TransportBackend,
+    /// Optional forward proxy URL for the WebSocket connection.
+    ///
+    /// Routes the connection through an HTTP `CONNECT` tunnel. Accepts
+    /// `http://` and `https://` schemes; SOCKS schemes are not yet supported.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[cfg(test)]

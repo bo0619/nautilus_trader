@@ -56,7 +56,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     websocket::{
         AUTHENTICATION_TIMEOUT_SECS, AuthTracker, PingHandler, SubscriptionState, TEXT_PING,
-        WebSocketClient, WebSocketConfig, channel_message_handler,
+        TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
 use serde_json::Value;
@@ -199,12 +199,27 @@ pub struct OKXWebSocketClient {
     /// the refcount check with the venue send and leave the channel
     /// unsubscribed while the local count says it is live.
     index_pair_transition: Arc<tokio::sync::Mutex<()>>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    transport_backend: TransportBackend,
+    /// Optional proxy URL for the WebSocket transport.
+    proxy_url: Option<String>,
     cancellation_token: CancellationToken,
 }
 
 impl Default for OKXWebSocketClient {
     fn default() -> Self {
-        Self::new(None, None, None, None, None, None, None).unwrap()
+        Self::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .unwrap()
     }
 }
 
@@ -224,6 +239,7 @@ impl OKXWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if the request fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         url: Option<String>,
         api_key: Option<String>,
@@ -232,6 +248,8 @@ impl OKXWebSocketClient {
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
         auth_timeout_secs: Option<u64>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         let url = url.unwrap_or(OKX_WS_PUBLIC_URL.to_string());
         let account_id = account_id.unwrap_or(AccountId::from("OKX-master"));
@@ -286,6 +304,8 @@ impl OKXWebSocketClient {
             option_greeks_subs: Arc::new(AtomicMap::new()),
             index_pair_subscribers: Arc::new(DashMap::new()),
             index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
+            transport_backend,
+            proxy_url,
             cancellation_token: CancellationToken::new(),
         })
     }
@@ -296,6 +316,7 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if credential values cannot be loaded or if the
     /// client fails to initialize.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_credentials(
         url: Option<String>,
         api_key: Option<String>,
@@ -304,6 +325,8 @@ impl OKXWebSocketClient {
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
         auth_timeout_secs: Option<u64>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         let url = url.unwrap_or(OKX_WS_PUBLIC_URL.to_string());
         let api_key = get_or_env_var(api_key, "OKX_API_KEY")?;
@@ -318,6 +341,8 @@ impl OKXWebSocketClient {
             account_id,
             heartbeat,
             auth_timeout_secs,
+            transport_backend,
+            proxy_url,
         )
     }
 
@@ -340,6 +365,8 @@ impl OKXWebSocketClient {
             Some(api_passphrase),
             None,
             None,
+            None,
+            TransportBackend::default(),
             None,
         )
     }
@@ -469,9 +496,11 @@ impl OKXWebSocketClient {
             // Handler responds to pings internally via select! loop
         });
 
+        let headers = vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())];
+
         let config = WebSocketConfig {
             url: self.url.clone(),
-            headers: vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())],
+            headers,
             heartbeat: self.heartbeat,
             heartbeat_msg: Some(TEXT_PING.to_string()),
             reconnect_timeout_ms: Some(5_000),
@@ -481,6 +510,8 @@ impl OKXWebSocketClient {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         };
 
         let keyed_quotas = vec![
@@ -2996,7 +3027,7 @@ mod tests {
             .as_secs()
             .to_string();
 
-        assert!(timestamp.parse::<u64>().is_ok());
+        timestamp.parse::<u64>().unwrap();
         assert_eq!(timestamp.len(), 10);
         assert!(timestamp.chars().all(|c| c.is_ascii_digit()));
     }
@@ -3074,6 +3105,8 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .unwrap();
         assert!(client.credential.is_some());
@@ -3090,8 +3123,10 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         );
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[rstest]
@@ -3118,8 +3153,18 @@ mod tests {
         assert!(client.is_closed());
         assert!(!client.is_active());
 
-        let client_with_heartbeat =
-            OKXWebSocketClient::new(None, None, None, None, None, Some(30), None).unwrap();
+        let client_with_heartbeat = OKXWebSocketClient::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(30),
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .unwrap();
 
         assert!(client_with_heartbeat.heartbeat.is_some());
         assert_eq!(client_with_heartbeat.heartbeat.unwrap(), 30);
@@ -3194,6 +3239,8 @@ mod tests {
             None,
             Some(30), // 30 second heartbeat
             None,
+            TransportBackend::default(),
+            None,
         )
         .unwrap();
 
@@ -3201,8 +3248,18 @@ mod tests {
         assert_eq!(client_with_heartbeat.heartbeat.unwrap(), 30);
 
         let account_id = AccountId::from("test-account-123");
-        let client_with_account =
-            OKXWebSocketClient::new(None, None, None, None, Some(account_id), None, None).unwrap();
+        let client_with_account = OKXWebSocketClient::new(
+            None,
+            None,
+            None,
+            None,
+            Some(account_id),
+            None,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(client_with_account.account_id, account_id);
     }
@@ -3300,6 +3357,8 @@ mod tests {
             Some("test_passphrase".to_string()),
             Some(AccountId::from("test-account")),
             None,
+            None,
+            TransportBackend::default(),
             None,
         )
         .unwrap();
@@ -3424,6 +3483,8 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .expect("Failed to create client");
 
@@ -3454,6 +3515,8 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .expect("Failed to create client");
 
@@ -3479,6 +3542,8 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .expect("Failed to create client");
 
@@ -3503,6 +3568,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            TransportBackend::default(),
             None,
         )
         .expect("Failed to create client");
@@ -3632,6 +3699,8 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .expect("Failed to create client");
 
@@ -3689,6 +3758,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            TransportBackend::default(),
             None,
         )
         .expect("Failed to create client");
@@ -3756,6 +3827,8 @@ mod tests {
             None,
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .expect("Failed to create client");
 
@@ -3808,6 +3881,8 @@ mod tests {
             Some(AccountId::new("OKX-TEST")),
             None,
             None,
+            TransportBackend::default(),
+            None,
         )
         .expect("Failed to create client");
 
@@ -3848,6 +3923,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            TransportBackend::default(),
             None,
         )
         .expect("Failed to create client");

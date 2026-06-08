@@ -16,6 +16,7 @@
 //! Configuration structures for the AX Exchange adapter.
 
 use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_network::websocket::TransportBackend;
 
 use crate::common::{credential::credential_env_vars, enums::AxEnvironment};
 
@@ -46,10 +47,8 @@ pub struct AxDataClientConfig {
     pub base_url_ws_public: Option<String>,
     /// Optional override for the private WebSocket URL.
     pub base_url_ws_private: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -74,6 +73,9 @@ pub struct AxDataClientConfig {
     /// Funding rate poll interval in minutes.
     #[builder(default = 15)]
     pub funding_rate_poll_interval_mins: u64,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for AxDataClientConfig {
@@ -156,10 +158,8 @@ pub struct AxExecClientConfig {
     pub base_url_orders: Option<String>,
     /// Optional override for the private WebSocket URL.
     pub base_url_ws_private: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -181,6 +181,9 @@ pub struct AxExecClientConfig {
     /// Cancel all open orders when the orders WebSocket disconnects.
     #[builder(default)]
     pub cancel_on_disconnect: bool,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for AxExecClientConfig {

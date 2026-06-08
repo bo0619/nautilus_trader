@@ -19,7 +19,10 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos, correctness::FAILED};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    correctness::{CorrectnessError, FAILED},
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -594,27 +597,71 @@ impl Display for TrailingStopLimitOrder {
     }
 }
 
-impl From<OrderInitialized> for TrailingStopLimitOrder {
-    fn from(event: OrderInitialized) -> Self {
-        Self::new(
+impl TryFrom<OrderInitialized> for TrailingStopLimitOrder {
+    type Error = OrderError;
+
+    fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
+        let price = event
+            .price
+            .ok_or_else(|| CorrectnessError::PredicateViolation {
+                message: "`price` is required for `TrailingStopLimitOrder` initialization"
+                    .to_string(),
+            })?;
+        let trigger_price =
+            event
+                .trigger_price
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message:
+                        "`trigger_price` is required for `TrailingStopLimitOrder` initialization"
+                            .to_string(),
+                })?;
+        let trigger_type =
+            event
+                .trigger_type
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message:
+                        "`trigger_type` is required for `TrailingStopLimitOrder` initialization"
+                            .to_string(),
+                })?;
+        let limit_offset =
+            event
+                .limit_offset
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message:
+                        "`limit_offset` is required for `TrailingStopLimitOrder` initialization"
+                            .to_string(),
+                })?;
+        let trailing_offset =
+            event
+                .trailing_offset
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message:
+                        "`trailing_offset` is required for `TrailingStopLimitOrder` initialization"
+                            .to_string(),
+                })?;
+        let trailing_offset_type =
+            event
+                .trailing_offset_type
+                .ok_or_else(|| {
+                    CorrectnessError::PredicateViolation {
+                message:
+                    "`trailing_offset_type` is required for `TrailingStopLimitOrder` initialization"
+                        .to_string(),
+            }
+                })?;
+        Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
             event.client_order_id,
             event.order_side,
             event.quantity,
-            event
-                .price
-                .expect("Error initializing order: price is None"),
-            event
-                .trigger_price
-                .expect("Error initializing order: trigger_price is None"),
-            event
-                .trigger_type
-                .expect("Error initializing order: trigger_type is None"),
-            event.limit_offset.unwrap(),
-            event.trailing_offset.unwrap(),
-            event.trailing_offset_type.unwrap(),
+            price,
+            trigger_price,
+            trigger_type,
+            limit_offset,
+            trailing_offset,
+            trailing_offset_type,
             event.time_in_force,
             event.expire_time,
             event.post_only,
@@ -645,7 +692,7 @@ mod tests {
     use super::*;
     use crate::{
         enums::{TimeInForce, TrailingOffsetType, TriggerType},
-        events::order::initialized::OrderInitializedBuilder,
+        events::order::spec::OrderInitializedSpec,
         identifiers::InstrumentId,
         instruments::{CurrencyPair, stubs::*},
         orders::{OrderTestBuilder, stubs::TestOrderStubs},
@@ -798,18 +845,17 @@ mod tests {
 
     #[rstest]
     fn test_trailing_stop_limit_order_from_order_initialized() {
-        let order_initialized = OrderInitializedBuilder::default()
+        let order_initialized = OrderInitializedSpec::builder()
             .order_type(OrderType::TrailingStopLimit)
-            .price(Some(Price::new(100.0, 2)))
-            .trigger_price(Some(Price::new(95.0, 2)))
-            .trigger_type(Some(TriggerType::Default))
-            .limit_offset(Some(dec!(2.0)))
-            .trailing_offset(Some(dec!(1.0)))
-            .trailing_offset_type(Some(TrailingOffsetType::Price))
-            .build()
-            .unwrap();
+            .price(Price::new(100.0, 2))
+            .trigger_price(Price::new(95.0, 2))
+            .trigger_type(TriggerType::Default)
+            .limit_offset(dec!(2.0))
+            .trailing_offset(dec!(1.0))
+            .trailing_offset_type(TrailingOffsetType::Price)
+            .build();
 
-        let order: TrailingStopLimitOrder = order_initialized.clone().into();
+        let order: TrailingStopLimitOrder = order_initialized.clone().try_into().unwrap();
 
         assert_eq!(order.trader_id(), order_initialized.trader_id);
         assert_eq!(order.strategy_id(), order_initialized.strategy_id);

@@ -41,7 +41,8 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
         - 1: Email/Magic Wallet Proxy
         - 2: Browser Wallet Proxy
     funder : str, optional
-        The wallet address (public key) on the **Polygon** network used for funding USDC.
+        The wallet address (public key) on the **Polygon** network used for funding
+        Polymarket collateral.
         If ``None`` then will source the `POLYMARKET_FUNDER` environment variable.
     api_key : str, optional
         The Polymarket API key.
@@ -56,6 +57,8 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
         The HTTP client custom endpoint override.
     base_url_ws : str, optional
         The WebSocket client custom endpoint override.
+    proxy_url : str, optional
+        The proxy URL for HTTP and WebSocket transports.
     ws_connection_initial_delay_secs: PositiveFloat, default 5
         The delay (seconds) prior to the first websocket connection to allow initial subscriptions to arrive.
     ws_connection_delay_secs : PositiveFloat, default 0.1
@@ -90,6 +93,7 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
     passphrase: str | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
+    proxy_url: str | None = None
     ws_connection_initial_delay_secs: PositiveFloat = 5
     ws_connection_delay_secs: PositiveFloat = 0.1
     ws_max_subscriptions_per_connection: PositiveInt = 200
@@ -119,7 +123,8 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
         - 1: Email/Magic Wallet Proxy
         - 2: Browser Wallet Proxy
     funder : str, optional
-        The wallet address (public key) on the **Polygon** network used for funding USDC.
+        The wallet address (public key) on the **Polygon** network used for funding
+        Polymarket collateral.
         If ``None`` then will source the `POLYMARKET_FUNDER` environment variable.
     api_key : str, optional
         The Polymarket API key.
@@ -136,6 +141,8 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
         The WebSocket client custom endpoint override.
     base_url_data_api : str, optional
         The Data API custom endpoint override (default https://data-api.polymarket.com).
+    proxy_url : str, optional
+        The proxy URL for HTTP and WebSocket transports.
     ws_max_subscriptions_per_connection : PositiveInt, default 200
         The maximum number of subscriptions per WebSocket connection (Polymarket limit is 500).
     max_retries : PositiveInt, optional
@@ -167,6 +174,7 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
     base_url_http: str | None = None
     base_url_ws: str | None = None
     base_url_data_api: str | None = None
+    proxy_url: str | None = None
     ws_max_subscriptions_per_connection: PositiveInt = 200
     max_retries: PositiveInt | None = None
     retry_delay_initial_ms: PositiveInt | None = None

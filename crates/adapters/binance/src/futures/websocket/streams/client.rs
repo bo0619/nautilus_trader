@@ -39,7 +39,8 @@ use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
     mode::ConnectionMode,
     websocket::{
-        PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig, channel_message_handler,
+        PingHandler, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
+        channel_message_handler,
     },
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -97,6 +98,7 @@ pub struct BinanceFuturesWebSocketClient {
         Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BinanceFuturesWsStreamsMessage>>>>,
     request_id_counter: Arc<AtomicU64>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    transport_backend: TransportBackend,
 }
 
 impl Debug for BinanceFuturesWebSocketClient {
@@ -125,6 +127,7 @@ impl BinanceFuturesWebSocketClient {
         api_secret: Option<String>,
         url_override: Option<String>,
         heartbeat: Option<u64>,
+        transport_backend: TransportBackend,
     ) -> anyhow::Result<Self> {
         match product_type {
             BinanceProductType::UsdM | BinanceProductType::CoinM => {}
@@ -154,6 +157,7 @@ impl BinanceFuturesWebSocketClient {
             out_rx: Arc::new(Mutex::new(None)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             instruments_cache: Arc::new(AtomicMap::new()),
+            transport_backend,
         })
     }
 
@@ -463,6 +467,8 @@ impl BinanceFuturesWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: None,
         };
 
         let keyed_quotas = vec![(

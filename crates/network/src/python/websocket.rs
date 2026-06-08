@@ -26,14 +26,14 @@ use nautilus_core::{
     python::{clone_py_object, to_pyruntime_err, to_pyvalue_err},
 };
 use pyo3::{Py, create_exception, exceptions::PyException, prelude::*, types::PyBytes};
-use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::{
     RECONNECTED,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
+    transport::{Message, TransportError},
     websocket::{
-        WebSocketClient, WebSocketConfig,
+        TransportBackend, WebSocketClient, WebSocketConfig,
         types::{MessageHandler, PingHandler, WriterCommand},
     },
 };
@@ -41,7 +41,7 @@ use crate::{
 create_exception!(network, WebSocketClientError, PyException);
 
 #[expect(clippy::needless_pass_by_value)]
-fn to_websocket_pyerr(e: tokio_tungstenite::tungstenite::Error) -> PyErr {
+fn to_websocket_pyerr(e: TransportError) -> PyErr {
     PyErr::new::<WebSocketClientError, _>(e.to_string())
 }
 
@@ -85,6 +85,7 @@ impl WebSocketConfig {
         reconnect_jitter_ms=100,
         reconnect_max_attempts=None,
         idle_timeout_ms=None,
+        proxy_url=None,
     ))]
     fn py_new(
         url: String,
@@ -98,6 +99,7 @@ impl WebSocketConfig {
         reconnect_jitter_ms: Option<u64>,
         reconnect_max_attempts: Option<u32>,
         idle_timeout_ms: Option<u64>,
+        proxy_url: Option<String>,
     ) -> Self {
         Self {
             url,
@@ -111,6 +113,8 @@ impl WebSocketConfig {
             reconnect_jitter_ms,
             reconnect_max_attempts,
             idle_timeout_ms,
+            backend: TransportBackend::default(),
+            proxy_url,
         }
     }
 }
@@ -147,14 +151,13 @@ impl WebSocketClient {
         let handler_clone = clone_py_object(&handler);
 
         let message_handler: MessageHandler = Arc::new(move |msg: Message| {
-            if matches!(msg, Message::Text(ref text) if text.as_str() == RECONNECTED) {
+            if matches!(msg, Message::Text(ref text) if text.as_ref() == RECONNECTED.as_bytes()) {
                 return;
             }
 
             Python::attach(|py| {
                 let py_bytes = match &msg {
-                    Message::Binary(data) => PyBytes::new(py, data),
-                    Message::Text(text) => PyBytes::new(py, text.as_bytes()),
+                    Message::Binary(data) | Message::Text(data) => PyBytes::new(py, data.as_ref()),
                     _ => return,
                 };
 
@@ -191,14 +194,14 @@ impl WebSocketClient {
         });
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::connect(
+            Box::pin(Self::connect(
                 config,
                 Some(message_handler),
                 ping_handler_fn,
                 post_reconnection_fn,
                 keyed_quotas,
                 default_quota,
-            )
+            ))
             .await
             .map_err(to_websocket_pyerr)
         })
@@ -350,7 +353,6 @@ impl WebSocketClient {
         keys: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let data_str = String::from_utf8(data).map_err(to_pyvalue_err)?;
-        let data = Utf8Bytes::from(data_str);
         let rate_limiter = slf.rate_limiter.clone();
         let writer_tx = slf.writer_tx.clone();
         let mode = slf.connection_mode.clone();
@@ -376,9 +378,9 @@ impl WebSocketClient {
                 }
             }
 
-            log::trace!("Sending text: {data}");
+            log::trace!("Sending text: {data_str}");
 
-            let msg = Message::Text(data);
+            let msg = Message::Text(data_str.into());
             writer_tx
                 .send(WriterCommand::Send(msg))
                 .map_err(to_pyruntime_err)
@@ -444,13 +446,15 @@ mod tests {
     use tokio_tungstenite::{
         accept_hdr_async,
         tungstenite::{
-            Message,
             handshake::server::{self, Callback},
             http::HeaderValue,
         },
     };
 
-    use crate::websocket::{MessageHandler, WebSocketClient, WebSocketConfig};
+    use crate::{
+        transport::Message,
+        websocket::{MessageHandler, WebSocketClient, WebSocketConfig},
+    };
 
     struct TestServer {
         task: JoinHandle<()>,
@@ -610,6 +614,7 @@ counter = Counter()
             None,
             None,
             None,
+            None,
         );
 
         let handler_clone = Python::attach(|py| handler.clone_ref(py));
@@ -617,8 +622,7 @@ counter = Counter()
         let message_handler: MessageHandler = std::sync::Arc::new(move |msg: Message| {
             Python::attach(|py| {
                 let data = match msg {
-                    Message::Binary(data) => data.to_vec(),
-                    Message::Text(text) => text.as_bytes().to_vec(),
+                    Message::Binary(data) | Message::Text(data) => data.to_vec(),
                     _ => return,
                 };
                 let py_bytes = PyBytes::new(py, &data);
@@ -700,6 +704,7 @@ counter = Counter()
             None,
             None,
             None,
+            None,
         );
 
         let handler_clone = Python::attach(|py| handler.clone_ref(py));
@@ -707,8 +712,7 @@ counter = Counter()
         let message_handler: MessageHandler = std::sync::Arc::new(move |msg: Message| {
             Python::attach(|py| {
                 let data = match msg {
-                    Message::Binary(data) => data.to_vec(),
-                    Message::Text(text) => text.as_bytes().to_vec(),
+                    Message::Binary(data) | Message::Text(data) => data.to_vec(),
                     _ => return,
                 };
                 let py_bytes = PyBytes::new(py, &data);

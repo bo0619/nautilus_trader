@@ -18,7 +18,7 @@ workspace = true
 
 [lib]
 name = "nautilus_portfolio"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -40,11 +40,11 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 bon = { workspace = true }
+indexmap = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

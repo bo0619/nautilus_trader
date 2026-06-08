@@ -138,8 +138,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         self._log.info(f"config.environment={environment}", LogColor.BLUE)
         self._log.info(f"config.http_timeout_secs={config.http_timeout_secs}", LogColor.BLUE)
         self._log.info(f"config.normalize_prices={config.normalize_prices}", LogColor.BLUE)
-        self._log.info(f"{config.http_proxy_url=}", LogColor.BLUE)
-        self._log.info(f"{config.ws_proxy_url=}", LogColor.BLUE)
+        self._log.info(f"{config.proxy_url=}", LogColor.BLUE)
 
         account_id = AccountId(f"{name or HYPERLIQUID_VENUE.value}-master")
         self._set_account_id(account_id)
@@ -149,6 +148,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             url=config.base_url_ws,
             environment=environment,
             account_id=str(account_id),
+            proxy_url=config.proxy_url,
         )
 
         # Caches to handle race conditions and duplicate messages
@@ -156,11 +156,16 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         self._accepted_orders: nautilus_pyo3.FifoCache = nautilus_pyo3.FifoCache()
         self._terminal_orders: nautilus_pyo3.FifoCache = nautilus_pyo3.FifoCache()
         self._pending_filled: set[str] = set()
-        # Cloid to old venue_order_id.value for in-flight Hyperliquid modifies,
-        # populated after a successful modify HTTP call so the WS handler can
-        # suppress the old leg of a cancel-replace when CANCELED(old_voi) arrives
-        # before the replacement ACCEPTED(new_voi). See GH-3827.
+        # client_order_id.value to old venue_order_id.value for in-flight
+        # Hyperliquid modifies, populated before the modify HTTP call and
+        # cleared on either the replacement ACCEPTED(new_voi) or any modify
+        # failure. The WS handler uses it to suppress the old leg of a
+        # cancel-replace when CANCELED(old_voi) arrives before the replacement
+        # ACCEPTED(new_voi). See GH-3827.
         self._pending_modify_keys: dict[str, str] = {}
+        # FillReports buffered during an in-flight cancel-replace, drained
+        # from the cancel-replace ACCEPTED branch. See GH-3972.
+        self._buffered_fills: dict[str, list[nautilus_pyo3.FillReport]] = {}
 
         self._fee_refresh_task: asyncio.Task | None = None
 
@@ -256,6 +261,8 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             self._log.info(f"Cached cloid mappings for {count} existing order(s)", LogColor.BLUE)
 
     def _cleanup_cloid_mapping(self, client_order_id: ClientOrderId) -> None:
+        # Drop the cancel-replace fill buffer to avoid stranded entries (GH-3972).
+        self._buffered_fills.pop(client_order_id.value, None)
         try:
             pyo3_client_order_id = nautilus_pyo3.ClientOrderId(client_order_id.value)
             cloid = nautilus_pyo3.hyperliquid_cloid_from_client_order_id(pyo3_client_order_id)
@@ -814,6 +821,11 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             if trigger_price is not None:
                 pyo3_trigger_price = nautilus_pyo3.Price.from_str(str(trigger_price))
 
+            # Mark in-flight BEFORE the await so the WS cancel handler
+            # sees it regardless of timing. Cleaned up in except if HTTP fails.
+            self._pending_modify_keys[command.client_order_id.value] = venue_order_id.value
+            self._log.info(f"Order modification requested for {command.client_order_id}")
+
             await self._client.modify_order(
                 instrument_id=pyo3_instrument_id,
                 venue_order_id=pyo3_venue_order_id,
@@ -827,11 +839,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 time_in_force=pyo3_time_in_force,
                 client_order_id=pyo3_client_order_id,
             )
-            # Mark the old venue_order_id as in-flight only after a successful
-            # HTTP round-trip, so a failing modify never leaves stale race state.
-            self._pending_modify_keys[command.client_order_id.value] = venue_order_id.value
-            self._log.info(f"Order modification requested for {command.client_order_id}")
+
         except Exception as e:
+            self._pending_modify_keys.pop(command.client_order_id.value, None)
             self.generate_order_modify_rejected(
                 strategy_id=command.strategy_id,
                 instrument_id=command.instrument_id,
@@ -1021,6 +1031,36 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             self._log.debug(f"Ignoring duplicate OrderCanceled for {event.client_order_id!r}")
             return
 
+        # Stale cancel suppression: if the cached venue_order_id has already advanced
+        # past the event's venue_order_id, the CANCELED refers to the old leg of a
+        # Hyperliquid cancel-replace modify already routed through OrderUpdated.
+        cached_voi = self._cache.venue_order_id(event.client_order_id)
+        if (
+            cached_voi is not None
+            and event.venue_order_id is not None
+            and event.venue_order_id != cached_voi
+        ):
+            self._log.debug(
+                f"Skipping stale OrderCanceled for {event.venue_order_id!r} "
+                f"(cached {cached_voi!r}) on {event.client_order_id!r}",
+            )
+            return
+
+        # Cancel-before-accept race: the pending marker is set before the modify HTTP
+        # call and removed on failure, so an in-flight modify suppresses its old leg
+        # CANCELED while a failed modify never falls here.
+        pending_old_voi = self._pending_modify_keys.get(key)
+        if (
+            pending_old_voi is not None
+            and event.venue_order_id is not None
+            and event.venue_order_id.value == pending_old_voi
+        ):
+            self._log.debug(
+                f"Suppressing cancel-before-accept for {event.client_order_id!r} "
+                f"venue_order_id={event.venue_order_id!r}",
+            )
+            return
+
         self._terminal_orders.add(key)
         self._cleanup_cloid_mapping(event.client_order_id)
         self._send_order_event(event)
@@ -1150,6 +1190,12 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     ts_event=report.ts_last,
                     venue_order_id_modified=True,
                 )
+
+                # Drain buffered fills against the now-advanced state (GH-3972).
+                buffered = self._buffered_fills.pop(key, None)
+                if buffered:
+                    for pyo3_buffered in buffered:
+                        self._handle_fill_report_pyo3(pyo3_buffered)
                 return
 
             if key in self._accepted_orders or key in self._terminal_orders:
@@ -1196,8 +1242,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             # Cancel-before-accept race: for an in-flight modify, Hyperliquid
             # may deliver CANCELED(old_voi) before the replacement ACCEPTED.
             # Suppress the old leg so the later ACCEPTED can route through the
-            # OrderUpdated path. The pending marker is only set after a
-            # confirmed HTTP success, so a failed modify never falls here.
+            # OrderUpdated path. The pending marker is set before the modify
+            # HTTP call and removed on failure, so a failed modify never falls
+            # here.
             pending_old_voi = self._pending_modify_keys.get(key)
             if (
                 pending_old_voi is not None
@@ -1325,9 +1372,26 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             )
             return
 
-        self._processed_trade_ids.add(trade_id_str)
-
         key = order.client_order_id.value
+
+        # Buffer fills for an in-flight cancel-replace; the marker requirement
+        # avoids stranding stale old-leg fills after promotion. See GH-3972.
+        cached_voi = self._cache.venue_order_id(order.client_order_id)
+        if (
+            key in self._pending_modify_keys
+            and cached_voi is not None
+            and report.venue_order_id is not None
+            and report.venue_order_id != cached_voi
+        ):
+            self._log.debug(
+                f"Buffering cancel-replace fill for {order.client_order_id!r}: "
+                f"report_voi={report.venue_order_id!r}, cached_voi={cached_voi!r}, "
+                f"trade_id={report.trade_id!r}",
+            )
+            self._buffered_fills.setdefault(key, []).append(pyo3_report)
+            return
+
+        self._processed_trade_ids.add(trade_id_str)
 
         # If order not yet accepted, generate OrderAccepted first to avoid state transition error
         if key not in self._accepted_orders:

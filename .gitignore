@@ -46,6 +46,7 @@ logs/
 .benchmarks*
 .coverage*
 htmlcov/
+perf.data
 
 # Rust related
 *target/
@@ -92,6 +93,7 @@ PERF.JSON
 output.json
 
 # AI assistants and tools
+.codex
 .cursorignore
 .mcp.json
 .mcp.local.json

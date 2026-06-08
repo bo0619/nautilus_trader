@@ -132,12 +132,12 @@ pub struct DataEngine {
     catalogs: AHashMap<Ustr, ParquetDataCatalog>,
     routing_map: IndexMap<Venue, ClientId>,
     book_intervals: AHashMap<NonZeroUsize, BookSnapshotInfos>,
-    book_snapshot_counts: AHashMap<BookSnapshotKey, usize>,
+    book_snapshot_counts: IndexMap<BookSnapshotKey, usize>,
     book_deltas_subs: AHashSet<InstrumentId>,
     book_depth10_subs: AHashSet<InstrumentId>,
     book_updaters: AHashMap<InstrumentId, Rc<BookUpdater>>,
     book_snapshotters: AHashMap<NonZeroUsize, Rc<BookSnapshotter>>,
-    bar_aggregators: AHashMap<BarType, Rc<RefCell<Box<dyn BarAggregator>>>>,
+    bar_aggregators: IndexMap<BarType, Rc<RefCell<Box<dyn BarAggregator>>>>,
     bar_aggregator_handlers: AHashMap<BarType, Vec<BarAggregatorSubscription>>,
     option_chain_managers: AHashMap<OptionSeriesId, Rc<RefCell<OptionChainManager>>>,
     option_chain_instrument_index: AHashMap<InstrumentId, OptionSeriesId>,
@@ -189,12 +189,12 @@ impl DataEngine {
             catalogs: AHashMap::new(),
             routing_map: IndexMap::new(),
             book_intervals: AHashMap::new(),
-            book_snapshot_counts: AHashMap::new(),
+            book_snapshot_counts: IndexMap::new(),
             book_deltas_subs: AHashSet::new(),
             book_depth10_subs: AHashSet::new(),
             book_updaters: AHashMap::new(),
             book_snapshotters: AHashMap::new(),
-            bar_aggregators: AHashMap::new(),
+            bar_aggregators: IndexMap::new(),
             bar_aggregator_handlers: AHashMap::new(),
             option_chain_managers: AHashMap::new(),
             option_chain_instrument_index: AHashMap::new(),
@@ -315,6 +315,18 @@ impl DataEngine {
     #[must_use]
     pub const fn response_count(&self) -> u64 {
         self.response_count
+    }
+
+    /// Returns whether an `OptionChainManager` exists for the given series.
+    #[must_use]
+    pub fn has_option_chain_manager(&self, series_id: &OptionSeriesId) -> bool {
+        self.option_chain_managers.contains_key(series_id)
+    }
+
+    /// Returns the count of pending option-chain bootstrap requests.
+    #[must_use]
+    pub fn pending_option_chain_request_count(&self) -> usize {
+        self.pending_option_chain_requests.len()
     }
 
     /// Returns a read-only reference to the engines clock.
@@ -488,7 +500,7 @@ impl DataEngine {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
-            .map(|client| client.connect())
+            .map(DataClientAdapter::connect)
             .collect();
 
         let results = join_all(futures).await;
@@ -507,7 +519,7 @@ impl DataEngine {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
-            .map(|client| client.disconnect())
+            .map(DataClientAdapter::disconnect)
             .collect();
 
         let results = join_all(futures).await;
@@ -516,7 +528,7 @@ impl DataEngine {
         if errors.is_empty() {
             Ok(())
         } else {
-            let error_msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+            let error_msgs: Vec<_> = errors.iter().map(ToString::to_string).collect();
             anyhow::bail!(
                 "Failed to disconnect data clients: {}",
                 error_msgs.join("; ")
@@ -790,7 +802,7 @@ impl DataEngine {
             && self.external_clients.contains(client_id)
         {
             if self.config.debug {
-                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}",);
+                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
             }
             return Ok(());
         }
@@ -1404,7 +1416,7 @@ impl DataEngine {
             && self.external_clients.contains(client_id)
         {
             if self.config.debug {
-                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}",);
+                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
             }
             return Ok(());
         }
@@ -1788,7 +1800,7 @@ impl DataEngine {
         {
             snapshot_infos.clone()
         } else {
-            let snapshot_infos = Rc::new(RefCell::new(AHashMap::new()));
+            let snapshot_infos = Rc::new(RefCell::new(IndexMap::new()));
             self.book_intervals
                 .insert(cmd.interval_ms, snapshot_infos.clone());
             self.schedule_book_snapshotter(cmd.interval_ms, snapshot_infos.clone());
@@ -1828,11 +1840,11 @@ impl DataEngine {
             return BookSnapshotUnsubscribeResult::Decremented;
         }
 
-        self.book_snapshot_counts.remove(&key);
+        self.book_snapshot_counts.shift_remove(&key);
 
         let remove_interval = if let Some(snapshot_infos) = self.book_intervals.get(&interval_ms) {
             let mut snapshot_infos = snapshot_infos.borrow_mut();
-            snapshot_infos.remove(&instrument_id);
+            snapshot_infos.shift_remove(&instrument_id);
             snapshot_infos.is_empty()
         } else {
             false
@@ -1988,7 +2000,7 @@ impl DataEngine {
         drop(cache);
 
         if let Some(price) = best_price {
-            log::info!("Forward price for {series_id}: {price} (instant bootstrap)",);
+            log::info!("Forward price for {series_id}: {price} (instant bootstrap)");
         } else {
             log::info!(
                 "No matching forward price found for {series_id}, will bootstrap from live data",
@@ -2059,9 +2071,8 @@ impl DataEngine {
         let size_precision = instrument.size_precision();
 
         if bar_type.spec().is_time_aggregated() {
-            // Get time_bars_origin_offset from config
             let time_bars_origin_offset = config
-                .time_bars_origins
+                .time_bars_origin_offset
                 .get(&bar_type.spec().aggregation)
                 .map(|duration| chrono::TimeDelta::from_std(*duration).unwrap_or_default());
 
@@ -2223,7 +2234,7 @@ impl DataEngine {
         Ok(())
     }
 
-    /// Sets up a bar aggregator, matching Cython _setup_bar_aggregator logic.
+    /// Sets up a bar aggregator, matching Cython `_setup_bar_aggregator` logic.
     ///
     /// This method handles historical mode, message bus subscriptions, and time bar aggregator setup.
     fn setup_bar_aggregator(&self, bar_type: BarType, historical: bool) -> anyhow::Result<()> {
@@ -2284,7 +2295,7 @@ impl DataEngine {
     fn stop_bar_aggregator(&mut self, bar_type: BarType) -> anyhow::Result<()> {
         let aggregator = self
             .bar_aggregators
-            .remove(&bar_type.standard())
+            .shift_remove(&bar_type.standard())
             .ok_or_else(|| {
                 anyhow::anyhow!("Cannot stop bar aggregator: no aggregator to stop for {bar_type}")
             })?;

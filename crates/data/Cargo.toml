@@ -18,7 +18,7 @@ workspace = true
 
 [lib]
 name = "nautilus_data"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -63,6 +63,7 @@ chrono = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }
+rust_decimal = { workspace = true }
 serde = { workspace = true }
 ustr = { workspace = true }
 
@@ -71,6 +72,12 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+
+# Run with `cargo bench -p nautilus-data --bench engine`
+[[bench]]
+name = "engine"
+harness = false

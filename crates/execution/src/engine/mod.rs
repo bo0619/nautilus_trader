@@ -24,16 +24,17 @@ pub mod config;
 pub mod stubs;
 
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     collections::{HashMap, HashSet},
     fmt::Debug,
     rc::Rc,
     time::SystemTime,
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use config::ExecutionEngineConfig;
 use futures::future::join_all;
+use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
@@ -72,7 +73,7 @@ use nautilus_model::{
         ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny},
-    orderbook::own::{OwnOrderBook, should_handle_own_book_order},
+    orderbook::own::{OwnBookOrder, OwnOrderBook, should_handle_own_book_order},
     orders::{Order, OrderAny, OrderError},
     position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -102,7 +103,7 @@ const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
 pub struct ExecutionEngine {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
-    clients: AHashMap<ClientId, ExecutionClientAdapter>,
+    clients: IndexMap<ClientId, ExecutionClientAdapter>,
     default_client: Option<ExecutionClientAdapter>,
     routing_map: HashMap<Venue, ClientId>,
     oms_overrides: HashMap<StrategyId, OmsType>,
@@ -110,6 +111,9 @@ pub struct ExecutionEngine {
     external_clients: HashSet<ClientId>,
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
+    command_count: Cell<u64>,
+    event_count: u64,
+    report_count: u64,
 }
 
 impl Debug for ExecutionEngine {
@@ -131,7 +135,7 @@ impl ExecutionEngine {
         Self {
             clock: clock.clone(),
             cache,
-            clients: AHashMap::new(),
+            clients: IndexMap::new(),
             default_client: None,
             routing_map: HashMap::new(),
             oms_overrides: HashMap::new(),
@@ -144,6 +148,9 @@ impl ExecutionEngine {
                 .collect(),
             pos_id_generator: PositionIdGenerator::new(trader_id, clock),
             config: config.unwrap_or_default(),
+            command_count: Cell::new(0),
+            event_count: 0,
+            report_count: 0,
         }
     }
 
@@ -194,6 +201,24 @@ impl ExecutionEngine {
                 }
             }),
         );
+    }
+
+    /// Returns the total count of trading commands received by the engine.
+    #[must_use]
+    pub fn command_count(&self) -> u64 {
+        self.command_count.get()
+    }
+
+    /// Returns the total count of order events received by the engine.
+    #[must_use]
+    pub const fn event_count(&self) -> u64 {
+        self.event_count
+    }
+
+    /// Returns the total count of execution reports received by the engine.
+    #[must_use]
+    pub const fn report_count(&self) -> u64 {
+        self.report_count
     }
 
     /// Subscribes to instrument updates for a venue via the message bus.
@@ -456,8 +481,8 @@ impl ExecutionEngine {
     /// This method first attempts to resolve each order's originating client from the cache,
     /// then falls back to venue routing for any orders without a cached client.
     pub fn get_clients_for_orders(&self, orders: &[OrderAny]) -> Vec<&dyn ExecutionClient> {
-        let mut client_ids: AHashSet<ClientId> = AHashSet::new();
-        let mut venues: AHashSet<Venue> = AHashSet::new();
+        let mut client_ids: IndexSet<ClientId> = IndexSet::new();
+        let mut venues: IndexSet<Venue> = IndexSet::new();
 
         // Collect client IDs from cache and venues for fallback
         for order in orders {
@@ -570,7 +595,7 @@ impl ExecutionEngine {
     ///
     /// Returns an error if no client is registered with the given ID.
     pub fn deregister_client(&mut self, client_id: ClientId) -> anyhow::Result<()> {
-        if self.clients.remove(&client_id).is_some() {
+        if self.clients.shift_remove(&client_id).is_some() {
             // Remove from routing map if present
             self.routing_map
                 .retain(|_, mapped_id| mapped_id != &client_id);
@@ -588,7 +613,7 @@ impl ExecutionEngine {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
-            .map(|client| client.connect())
+            .map(ExecutionClientAdapter::connect)
             .collect();
 
         let results = join_all(futures).await;
@@ -607,7 +632,7 @@ impl ExecutionEngine {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
-            .map(|client| client.disconnect())
+            .map(ExecutionClientAdapter::disconnect)
             .collect();
 
         let results = join_all(futures).await;
@@ -616,7 +641,7 @@ impl ExecutionEngine {
         if errors.is_empty() {
             Ok(())
         } else {
-            let error_msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+            let error_msgs: Vec<_> = errors.iter().map(ToString::to_string).collect();
             anyhow::bail!(
                 "Failed to disconnect execution clients: {}",
                 error_msgs.join("; ")
@@ -830,19 +855,31 @@ impl ExecutionEngine {
             let mut cache = self.cache.borrow_mut();
             cache.clear_index();
             cache.cache_general()?;
-            self.cache.borrow_mut().cache_all().await?;
+        }
+
+        self.cache.borrow_mut().cache_all().await?;
+
+        // Snapshot before iterating: `get_or_init_own_order_book` re-enters `self.cache.borrow_mut()`.
+        let own_book_entries: Vec<(InstrumentId, OwnBookOrder)> = {
+            let mut cache = self.cache.borrow_mut();
             cache.build_index();
             let _ = cache.check_integrity();
 
             if self.config.manage_own_order_books {
-                for order in cache.orders(None, None, None, None, None) {
-                    if order.is_closed() || !should_handle_own_book_order(order) {
-                        continue;
-                    }
-                    let mut own_book = self.get_or_init_own_order_book(&order.instrument_id());
-                    own_book.add(order.to_own_book_order());
-                }
+                cache
+                    .orders(None, None, None, None, None)
+                    .into_iter()
+                    .filter(|o| !o.is_closed() && should_handle_own_book_order(o))
+                    .map(|o| (o.instrument_id(), o.to_own_book_order()))
+                    .collect()
+            } else {
+                Vec::new()
             }
+        };
+
+        for (instrument_id, own_order) in own_book_entries {
+            let mut own_book = self.get_or_init_own_order_book(&instrument_id);
+            own_book.add(own_order);
         }
 
         self.set_position_id_counts();
@@ -865,6 +902,10 @@ impl ExecutionEngine {
 
     /// Reconciles an execution report.
     pub fn reconcile_execution_report(&mut self, report: &ExecutionReport) {
+        if !matches!(report, ExecutionReport::MassStatus(_)) {
+            self.report_count += 1;
+        }
+
         match report {
             ExecutionReport::Order(order_report) => {
                 self.reconcile_order_status_report(order_report);
@@ -1145,7 +1186,7 @@ impl ExecutionEngine {
 
     /// Reconciles a fill report received at runtime.
     ///
-    /// Finds the associated order, validates the fill, and generates an OrderFilled event
+    /// Finds the associated order, validates the fill, and generates an `OrderFilled` event
     /// if the fill is not a duplicate and won't cause an overfill. When the order is not
     /// in cache, an external order is bootstrapped from the fill so that venue-initiated
     /// closures (e.g. Hyperliquid liquidations) that arrive without a companion order
@@ -1359,13 +1400,13 @@ impl ExecutionEngine {
     /// Reconciles a position status report received at runtime.
     ///
     /// Compares the venue-reported position with cached positions and logs any discrepancies.
-    /// Handles both hedging (with venue_position_id) and netting (without) modes.
+    /// Handles both hedging (with `venue_position_id`) and netting (without) modes.
     pub fn reconcile_position_report(&mut self, report: &PositionStatusReport) {
         let cache = self.cache.borrow();
 
         let size_precision = cache
             .instrument(&report.instrument_id)
-            .map(|i| i.size_precision());
+            .map(InstrumentAny::size_precision);
 
         if report.venue_position_id.is_some() {
             self.reconcile_position_report_hedging(report, &cache);
@@ -1442,6 +1483,8 @@ impl ExecutionEngine {
     /// in the mass status. Orders created as external during this pass already receive
     /// inferred fills, so their companion fill reports are skipped to avoid double-fills.
     pub fn reconcile_execution_mass_status(&mut self, mass_status: &ExecutionMassStatus) {
+        self.report_count += 1;
+
         log::info!(
             "Reconciling mass status for client={}, account={}, venue={}",
             mass_status.client_id,
@@ -1498,12 +1541,12 @@ impl ExecutionEngine {
             mass_status
                 .fill_reports()
                 .values()
-                .map(|v| v.len())
+                .map(Vec::len)
                 .sum::<usize>(),
             mass_status
                 .position_reports()
                 .values()
-                .map(|v| v.len())
+                .map(Vec::len)
                 .sum::<usize>()
         );
     }
@@ -1537,6 +1580,9 @@ impl ExecutionEngine {
     /// Resets the execution engine to its initial state.
     pub fn reset(&mut self) {
         self.pos_id_generator.reset();
+        self.command_count.set(0);
+        self.event_count = 0;
+        self.report_count = 0;
 
         log::info!("Reset");
     }
@@ -1547,6 +1593,8 @@ impl ExecutionEngine {
     }
 
     fn execute_command(&self, command: TradingCommand) {
+        self.command_count.set(self.command_count.get() + 1);
+
         if self.config.debug {
             log::debug!("{RECV}{CMD} {command:?}");
         }
@@ -1799,6 +1847,8 @@ impl ExecutionEngine {
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
+        self.event_count += 1;
+
         if self.config.debug {
             log::debug!("{RECV}{EVT} {event:?}");
         }
@@ -1860,10 +1910,14 @@ impl ExecutionEngine {
 
                 if self.apply_fill_to_order(&mut order, fill).is_ok() {
                     self.handle_order_fill(&order, fill, oms_type);
+                    let event = OrderEventAny::Filled(fill);
+                    self.publish_order_event(&event);
                 }
             }
             _ => {
-                let _ = self.apply_event_to_order(&mut order, event);
+                if self.apply_event_to_order(&mut order, event).is_ok() {
+                    self.publish_order_event(event);
+                }
             }
         }
     }
@@ -2092,14 +2146,21 @@ impl ExecutionEngine {
             log::debug!("{SEND}{EVT} {event}");
         }
 
-        let topic = switchboard::get_event_orders_topic(event.strategy_id());
-        msgbus::publish_order_event(topic, event);
-
         if self.config.snapshot_orders {
             self.create_order_state_snapshot(order);
         }
 
         Ok(())
+    }
+
+    fn publish_order_event(&self, event: &OrderEventAny) {
+        let topic = switchboard::get_event_orders_topic(event.strategy_id());
+        msgbus::publish_order_event(topic, event);
+
+        if let OrderEventAny::Canceled(_) = event {
+            let cancels_topic = switchboard::get_order_cancels_topic(event.instrument_id());
+            msgbus::publish_order_event(cancels_topic, event);
+        }
     }
 
     fn check_overfill(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
@@ -2173,27 +2234,43 @@ impl ExecutionEngine {
                 let position_id = pos.id;
 
                 for client_order_id in order.linked_order_ids().unwrap_or_default() {
-                    let mut cache = self.cache.borrow_mut();
-                    let contingent_order = cache.mut_order(client_order_id);
-                    if let Some(contingent_order) = contingent_order
-                        && contingent_order.position_id().is_none()
-                    {
-                        contingent_order.set_position_id(Some(position_id));
-
-                        if let Err(e) = self.cache.borrow_mut().add_position_id(
-                            &position_id,
-                            &contingent_order.instrument_id().venue,
-                            &contingent_order.client_order_id(),
-                            &contingent_order.strategy_id(),
-                        ) {
-                            log::error!("Failed to add position ID: {e}");
+                    // Apply mutation and index update in separate borrows: `mut_order`
+                    // holds `&mut Cache`, so a nested `self.cache.borrow_mut()` would panic.
+                    let link = {
+                        let mut cache = self.cache.borrow_mut();
+                        if let Some(contingent_order) = cache.mut_order(client_order_id)
+                            && contingent_order.position_id().is_none()
+                        {
+                            contingent_order.set_position_id(Some(position_id));
+                            Some((
+                                contingent_order.instrument_id().venue,
+                                contingent_order.client_order_id(),
+                                contingent_order.strategy_id(),
+                            ))
+                        } else {
+                            None
                         }
+                    };
+
+                    if let Some((venue, contingent_id, strategy_id)) = link
+                        && let Err(e) = self.cache.borrow_mut().add_position_id(
+                            &position_id,
+                            &venue,
+                            &contingent_id,
+                            &strategy_id,
+                        )
+                    {
+                        log::error!("Failed to add position ID: {e}");
                     }
                 }
             }
             // For spread instruments, contingent orders can still be triggered
             // but without position linkage (since no position is created for spreads)
         }
+
+        let event = OrderEventAny::Filled(fill);
+        let fills_topic = switchboard::get_order_fills_topic(fill.instrument_id);
+        msgbus::publish_order_event(fills_topic, &event);
     }
 
     /// Handle position creation or update for a fill.

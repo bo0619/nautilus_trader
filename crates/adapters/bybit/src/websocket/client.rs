@@ -41,8 +41,8 @@ use nautilus_network::{
     backoff::ExponentialBackoff,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        AuthTracker, PingHandler, SubscriptionState, TransportBackend, WebSocketClient,
+        WebSocketConfig, channel_message_handler,
     },
 };
 use serde_json::Value;
@@ -54,8 +54,8 @@ use crate::{
         consts::{BYBIT_NAUTILUS_BROKER_ID, BYBIT_WS_TOPIC_DELIMITER},
         credential::Credential,
         enums::{
-            BybitEnvironment, BybitOrderSide, BybitOrderType, BybitProductType, BybitTimeInForce,
-            BybitTpSlMode, BybitWsOrderRequestOp, resolve_trigger_type,
+            BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx, BybitProductType,
+            BybitTimeInForce, BybitTpSlMode, BybitWsOrderRequestOp, resolve_trigger_type,
         },
         parse::{
             bar_spec_to_bybit_interval, extract_base_coin, extract_raw_symbol, map_time_in_force,
@@ -121,7 +121,9 @@ pub struct BybitWebSocketClient {
     option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     bars_timestamp_on_close: Arc<AtomicBool>,
     pending_py_requests: Arc<DashMap<String, Vec<PendingPyRequest>>>,
+    transport_backend: TransportBackend,
     cancellation_token: CancellationToken,
+    proxy_url: Option<String>,
 }
 
 impl Debug for BybitWebSocketClient {
@@ -161,7 +163,9 @@ impl Clone for BybitWebSocketClient {
             option_greeks_subs: Arc::clone(&self.option_greeks_subs),
             bars_timestamp_on_close: Arc::clone(&self.bars_timestamp_on_close),
             pending_py_requests: Arc::clone(&self.pending_py_requests),
+            transport_backend: self.transport_backend,
             cancellation_token: self.cancellation_token.clone(),
+            proxy_url: self.proxy_url.clone(),
         }
     }
 }
@@ -175,6 +179,8 @@ impl BybitWebSocketClient {
             BybitEnvironment::Mainnet,
             url,
             heartbeat,
+            TransportBackend::default(),
+            None,
         )
     }
 
@@ -185,6 +191,8 @@ impl BybitWebSocketClient {
         environment: BybitEnvironment,
         url: Option<String>,
         heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
@@ -213,7 +221,9 @@ impl BybitWebSocketClient {
             pending_py_requests: Arc::new(DashMap::new()),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
+            transport_backend,
             cancellation_token: CancellationToken::new(),
+            proxy_url,
         }
     }
 
@@ -231,6 +241,8 @@ impl BybitWebSocketClient {
         api_secret: Option<String>,
         url: Option<String>,
         heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let credential = Credential::resolve(api_key, api_secret, environment);
 
@@ -261,7 +273,9 @@ impl BybitWebSocketClient {
             pending_py_requests: Arc::new(DashMap::new()),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
+            transport_backend,
             cancellation_token: CancellationToken::new(),
+            proxy_url,
         }
     }
 
@@ -279,6 +293,8 @@ impl BybitWebSocketClient {
         api_secret: Option<String>,
         url: Option<String>,
         heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let credential = Credential::resolve(api_key, api_secret, environment);
 
@@ -309,7 +325,9 @@ impl BybitWebSocketClient {
             pending_py_requests: Arc::new(DashMap::new()),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
+            transport_backend,
             cancellation_token: CancellationToken::new(),
+            proxy_url,
         }
     }
 
@@ -351,6 +369,8 @@ impl BybitWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         };
 
         // Retry initial connection with exponential backoff to handle transient DNS/network issues
@@ -1378,6 +1398,7 @@ impl BybitWebSocketClient {
                 tp_limit_price: order.tp_limit_price,
                 order_iv: order.order_iv,
                 mmp: order.mmp,
+                position_idx: order.position_idx,
             })
             .collect();
 
@@ -1530,6 +1551,7 @@ impl BybitWebSocketClient {
         post_only: Option<bool>,
         reduce_only: Option<bool>,
         is_leverage: bool,
+        position_idx: Option<BybitPositionIdx>,
     ) -> BybitWsResult<String> {
         let params = self.build_place_order_params(
             product_type,
@@ -1548,6 +1570,7 @@ impl BybitWebSocketClient {
             is_leverage,
             None,
             None,
+            position_idx,
         )?;
 
         self.place_order(params).await
@@ -1621,6 +1644,7 @@ impl BybitWebSocketClient {
         is_leverage: bool,
         take_profit: Option<Price>,
         stop_loss: Option<Price>,
+        position_idx: Option<BybitPositionIdx>,
     ) -> BybitWsResult<BybitWsPlaceOrderParams> {
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())
             .map_err(|e| BybitWsError::ClientError(e.to_string()))?;
@@ -1691,6 +1715,7 @@ impl BybitWebSocketClient {
                 tp_limit_price: None,
                 order_iv: None,
                 mmp: None,
+                position_idx,
             }
         } else {
             BybitWsPlaceOrderParams {
@@ -1726,6 +1751,7 @@ impl BybitWebSocketClient {
                 tp_limit_price: None,
                 order_iv: None,
                 mmp: None,
+                position_idx,
             }
         };
 
@@ -2051,6 +2077,8 @@ mod tests {
             Some("test-secret".to_string()),
             None,
             20,
+            TransportBackend::default(),
+            None,
         );
 
         let params = client
@@ -2069,6 +2097,7 @@ mod tests {
                 None,
                 None,
                 is_leverage,
+                None,
                 None,
                 None,
             )
@@ -2117,6 +2146,8 @@ mod tests {
             Some("test-secret".to_string()),
             None,
             20,
+            TransportBackend::default(),
+            None,
         );
 
         let params = client
@@ -2139,6 +2170,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
             )

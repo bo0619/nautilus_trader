@@ -27,8 +27,8 @@ use nautilus_model::{
         order::stubs::{order_accepted, order_filled, order_submitted},
     },
     identifiers::{
-        AccountId, ClientOrderId, PositionId, StrategyId, Symbol, TradeId, TraderId, Venue,
-        VenueOrderId,
+        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, TraderId,
+        Venue, VenueOrderId,
         stubs::{account_id, uuid4},
     },
     instruments::{
@@ -106,7 +106,7 @@ fn portfolio(
     )
 }
 
-use ahash::AHashMap;
+use indexmap::IndexMap;
 
 // Helpers
 fn get_cash_account(accountid: Option<&str>) -> AccountState {
@@ -359,19 +359,19 @@ fn test_account_when_account_returns_the_account_facade(mut portfolio: Portfolio
 #[rstest]
 fn test_balances_locked_when_no_account_for_venue_returns_none(portfolio: Portfolio, venue: Venue) {
     let result = portfolio.balances_locked(&venue);
-    assert_eq!(result, AHashMap::new());
+    assert_eq!(result, IndexMap::new());
 }
 
 #[rstest]
 fn test_margins_init_when_no_account_for_venue_returns_none(portfolio: Portfolio, venue: Venue) {
     let result = portfolio.margins_init(&venue);
-    assert_eq!(result, AHashMap::new());
+    assert_eq!(result, IndexMap::new());
 }
 
 #[rstest]
 fn test_margins_maint_when_no_account_for_venue_returns_none(portfolio: Portfolio, venue: Venue) {
     let result = portfolio.margins_maint(&venue);
-    assert_eq!(result, AHashMap::new());
+    assert_eq!(result, IndexMap::new());
 }
 
 #[rstest]
@@ -389,7 +389,7 @@ fn test_unrealized_pnl_for_venue_when_no_account_returns_empty_dict(
     venue: Venue,
 ) {
     let result = portfolio.unrealized_pnls(&venue, None);
-    assert_eq!(result, AHashMap::new());
+    assert_eq!(result, IndexMap::new());
 }
 
 #[rstest]
@@ -407,7 +407,7 @@ fn test_realized_pnl_for_venue_when_no_account_returns_empty_dict(
     venue: Venue,
 ) {
     let result = portfolio.realized_pnls(&venue, None);
-    assert_eq!(result, AHashMap::new());
+    assert_eq!(result, IndexMap::new());
 }
 
 #[rstest]
@@ -469,6 +469,15 @@ fn test_update_tick(mut portfolio: Portfolio, instrument_audusd: InstrumentAny) 
     let tick = get_quote_tick(&instrument_audusd, 1.25, 1.251, 1.0, 1.0);
     portfolio.update_quote_tick(&tick);
     assert!(portfolio.unrealized_pnl(&instrument_audusd.id()).is_none());
+}
+
+#[rstest]
+fn test_reset_clears_initialized_flag(mut portfolio: Portfolio) {
+    portfolio.initialize_orders();
+    assert!(portfolio.is_initialized());
+
+    portfolio.reset();
+    assert!(!portfolio.is_initialized());
 }
 
 //TODO: FIX: It should return an error
@@ -1464,7 +1473,7 @@ fn test_opening_several_positions_updates_portfolio(
     // FIX: TODO: should not be empty
     assert_eq!(
         portfolio.margins_maint(&Venue::test_default()),
-        AHashMap::new()
+        IndexMap::new()
     );
     assert_eq!(
         portfolio
@@ -1637,7 +1646,7 @@ fn test_modifying_position_updates_portfolio(
     // FIX: TODO: should not be empty
     assert_eq!(
         portfolio.margins_maint(&Venue::test_default()),
-        AHashMap::new()
+        IndexMap::new()
     );
     assert_eq!(
         portfolio
@@ -1670,11 +1679,11 @@ fn test_modifying_position_updates_portfolio(
     assert!(!portfolio.is_completely_flat());
     assert_eq!(
         portfolio.unrealized_pnls(&Venue::from("BINANCE"), None),
-        AHashMap::new()
+        IndexMap::new()
     );
     assert_eq!(
         portfolio.realized_pnls(&Venue::from("BINANCE"), None),
-        AHashMap::new()
+        IndexMap::new()
     );
     assert_eq!(portfolio.net_exposures(&Venue::from("BINANCE"), None), None);
 }
@@ -1831,7 +1840,7 @@ fn test_closing_position_updates_portfolio(
 
     assert_eq!(
         portfolio.margins_maint(&Venue::test_default()),
-        AHashMap::new()
+        IndexMap::new()
     ); // No maintenance margins
 
     let net_exposure = portfolio.net_exposure(&instrument_audusd.id(), None);
@@ -2060,7 +2069,7 @@ fn test_several_positions_with_different_instruments_updates_portfolio(
     // FIX: TODO: should not be empty
     assert_eq!(
         portfolio.margins_maint(&Venue::test_default()),
-        AHashMap::new()
+        IndexMap::new()
     );
 }
 
@@ -2718,6 +2727,51 @@ fn test_equity_returns_empty_for_unknown_venue(portfolio: Portfolio) {
 }
 
 #[rstest]
+fn test_equity_preserves_account_balance_currency_order(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+) {
+    // Pin IndexMap iteration on Portfolio::equity(): the cash-account fixture
+    // loads balances in BTC, USD, USDT, ETH order, so the returned currency
+    // map must iterate in that order across runs even after a position adds
+    // to the USD mark value.
+    let state = get_cash_account(Some("SIM-001"));
+    portfolio.update_account(&state);
+
+    let last = get_quote_tick(&instrument_audusd, 100.0, 101.0, 1.0, 1.0);
+    portfolio.cache().borrow_mut().add_quote(last).unwrap();
+    portfolio.update_quote_tick(&last);
+
+    let fill = make_fill_for_account(
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        OrderSide::Buy,
+        Quantity::from("1"),
+        Price::new(100.0, 0),
+        PositionId::new("P-EQO"),
+    );
+    let position = Position::new(&instrument_audusd, fill);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+
+    let equity = portfolio.equity(&Venue::test_default(), None);
+    let keys: Vec<Currency> = equity.keys().copied().collect();
+    assert_eq!(
+        keys,
+        vec![
+            Currency::BTC(),
+            Currency::USD(),
+            Currency::USDT(),
+            Currency::ETH(),
+        ],
+    );
+}
+
+#[rstest]
 fn test_missing_price_tracked_for_unpriced_open_position(
     mut portfolio: Portfolio,
     instrument_audusd: InstrumentAny,
@@ -2783,6 +2837,59 @@ fn test_missing_price_tracked_for_unpriced_margin_position(
         vec![instrument_audusd.id()],
         "margin equity path must track unpriced open positions"
     );
+}
+
+#[rstest]
+fn test_missing_price_instruments_returned_sorted(mut portfolio: Portfolio) {
+    // Open three unpriced positions on the SIM venue across instruments whose
+    // InstrumentIds are intentionally not registered in sorted order. The
+    // public missing_price_instruments() Vec must return them sorted, and the
+    // warn-log loop in update_missing_price_state iterates the same sorted
+    // sequence.
+    let state = get_cash_account(Some("SIM-001"));
+    portfolio.update_account(&state);
+
+    // Build three instruments on the SIM venue with a non-alphabetic insertion order.
+    let venue = Venue::test_default();
+    let raw_symbols = ["NZD/USD", "EUR/USD", "CHF/USD"];
+    let instrument_ids: Vec<InstrumentId> = raw_symbols
+        .iter()
+        .map(|sym| {
+            let instrument =
+                InstrumentAny::CurrencyPair(default_fx_ccy(Symbol::from(*sym), Some(venue)));
+            let id = instrument.id();
+            portfolio
+                .cache()
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+
+            // Open a position without a quote so the instrument flows into the
+            // unpriced tracker.
+            let fill = make_fill_for_account(
+                &instrument,
+                AccountId::new("SIM-001"),
+                OrderSide::Buy,
+                Quantity::from("1"),
+                Price::new(100.0, 0),
+                PositionId::new(format!("P-{}", sym.replace('/', ""))),
+            );
+            let position = Position::new(&instrument, fill);
+            portfolio
+                .cache()
+                .borrow_mut()
+                .add_position(&position, OmsType::Hedging)
+                .unwrap();
+            portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+            id
+        })
+        .collect();
+
+    let _ = portfolio.mark_values(&venue, None);
+
+    let mut expected = instrument_ids;
+    expected.sort();
+    assert_eq!(portfolio.missing_price_instruments(&venue), expected);
 }
 
 #[rstest]

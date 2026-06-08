@@ -21,7 +21,7 @@ name = "nautilus_common"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["indicators"]
+default = []
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -40,8 +40,9 @@ python = [
   "live",
 ]
 live = ["tokio"]
-simulation = ["live", "madsim"]
+simulation = ["live", "madsim", "nautilus-core/simulation"]
 defi = ["nautilus-model/defi", "alloy-primitives"]
+high-precision = ["nautilus-model/high-precision"]
 capnp = ["nautilus-serialization/capnp"]
 tracing-bridge = ["tracing", "tracing-subscriber"]
 
@@ -66,6 +67,7 @@ chrono = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
+itoa = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
 rust_decimal = { workspace = true }
@@ -109,6 +111,21 @@ harness = false
 [[bench]]
 name = "cache_query_sets"
 path = "benches/cache/query_sets.rs"
+harness = false
+
+[[bench]]
+name = "client_order_id"
+path = "benches/client_order_id.rs"
+harness = false
+
+[[bench]]
+name = "order_list_id"
+path = "benches/order_list_id.rs"
+harness = false
+
+[[bench]]
+name = "position_id"
+path = "benches/position_id.rs"
 harness = false
 
 [[bench]]

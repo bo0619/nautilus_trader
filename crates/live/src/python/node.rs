@@ -1153,10 +1153,11 @@ mod tests {
 
     use async_trait::async_trait;
     use nautilus_common::{
-        cache::Cache,
+        cache::CacheView,
         clients::DataClient,
         clock::Clock,
         enums::Environment,
+        factories::{ClientConfig, DataClientFactory},
         live::runner::get_data_event_sender,
         messages::{
             DataEvent, DataResponse,
@@ -1170,7 +1171,6 @@ mod tests {
         identifiers::{ClientId, TraderId, Venue},
         types::{Price, Quantity},
     };
-    use nautilus_system::factories::{ClientConfig, DataClientFactory};
     use nautilus_trading::{ImportableStrategyConfig, python::strategy::PyStrategy};
     use pyo3::{
         Python,
@@ -1213,7 +1213,7 @@ mod tests {
             &self,
             name: &str,
             _config: &dyn ClientConfig,
-            _cache: Rc<RefCell<Cache>>,
+            _cache: CacheView,
             _clock: Rc<RefCell<dyn Clock>>,
         ) -> anyhow::Result<Box<dyn DataClient>> {
             Ok(Box::new(TestHistoricalBarsDataClient::new(

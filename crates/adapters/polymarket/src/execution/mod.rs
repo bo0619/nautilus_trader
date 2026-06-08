@@ -51,10 +51,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{
-        AccountType, CurrencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        TimeInForce,
-    },
+    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{OrderEventAny, OrderUpdated},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
@@ -65,6 +62,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::retry::RetryConfig;
+use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 use ustr::Ustr;
 
@@ -72,18 +70,18 @@ use self::{
     order_builder::PolymarketOrderBuilder,
     order_fill_tracker::OrderFillTrackerMap,
     parse::{
-        compute_commission, instrument_taker_fee, parse_balance_allowance,
+        compute_commission, instrument_fee_exponent, instrument_taker_fee, parse_balance_allowance,
         parse_order_status_report,
     },
     reconciliation::{
         FillContext, apply_fill_filters, build_fill_reports_from_trades, build_position_reports,
     },
-    submitter::OrderSubmitter,
+    submitter::{MarketBuyFeeContext, OrderSubmitter},
     types::{BatchLimitOrderContext, CancelOutcome, LimitOrderSubmitRequest},
 };
 use crate::{
     common::{
-        consts::{BATCH_ORDER_LIMIT, POLYMARKET_VENUE, USDC},
+        consts::{BATCH_ORDER_LIMIT, POLYMARKET_VENUE},
         credential::Secrets,
         enums::SignatureType,
     },
@@ -187,16 +185,17 @@ impl PolymarketExecutionClient {
         let ws_client = PolymarketWebSocketClient::new_user(
             config.base_url_ws.clone(),
             secrets.credential.clone(),
+            config.transport_backend,
         );
 
         let clock = get_atomic_clock_realtime();
-        let usdc = get_usdc_currency();
+        let pusd = get_pusd_currency();
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
             core.account_id,
             AccountType::Cash,
-            Some(usdc),
+            Some(pusd),
         );
 
         Ok(Self {
@@ -509,7 +508,25 @@ impl PolymarketExecutionClient {
         let amount = order.quantity();
         let is_quote_qty = order.is_quote_quantity();
 
+        // Quote-quantity BUYs are sized in pUSD; the venue computes taker
+        // fees against `amount + fees`, so we shrink the spend to fit the
+        // user's collateral balance before signing. SELL orders are sized
+        // in shares and skip this step.
+        let needs_fee_adjustment = side == OrderSide::Buy && is_quote_qty;
+        let fee_rate = if needs_fee_adjustment {
+            instrument_taker_fee(&instrument)
+        } else {
+            Decimal::ZERO
+        };
+        let fee_exponent = if needs_fee_adjustment {
+            instrument_fee_exponent(&instrument)
+        } else {
+            1.0
+        };
+
         let submitter = self.submitter.clone();
+        let http_client = self.http_client.clone();
+        let signature_type = self.config.signature_type;
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
@@ -521,8 +538,37 @@ impl PolymarketExecutionClient {
         let price_precision = instrument.price_precision();
 
         self.spawn_task("submit_market_order", async move {
+            let fee_context = if needs_fee_adjustment {
+                match fetch_collateral_balance_pusd(&http_client, signature_type).await {
+                    Ok(balance) => Some(MarketBuyFeeContext {
+                        user_pusd_balance: balance,
+                        fee_rate,
+                        fee_exponent,
+                        builder_taker_fee_rate: Decimal::ZERO,
+                    }),
+                    Err(e) => {
+                        emitter.emit_order_rejected(
+                            &order,
+                            &format!("Failed to fetch pUSD balance for fee adjustment: {e}"),
+                            clock.get_time_ns(),
+                            false,
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+
             match submitter
-                .submit_market_order(&token_id, side, amount, neg_risk, tick_decimals)
+                .submit_market_order(
+                    &token_id,
+                    side,
+                    amount,
+                    neg_risk,
+                    tick_decimals,
+                    fee_context,
+                )
                 .await
             {
                 Ok((response, expected_base_qty)) => {
@@ -539,7 +585,7 @@ impl PolymarketExecutionClient {
                     {
                         log::info!(
                             "Converted {} quote quantity {} to base quantity {} \
-                             (expected from book walk)",
+                             (from signed taker_amount)",
                             order.instrument_id(),
                             amount,
                             base_qty,
@@ -656,7 +702,7 @@ impl PolymarketExecutionClient {
             account_id: self.core.account_id,
             user_address,
             api_key: self.secrets.credential.api_key().as_str(),
-            usdc: get_usdc_currency(),
+            pusd: get_pusd_currency(),
             clock: self.clock,
         }
     }
@@ -1428,13 +1474,18 @@ impl ExecutionClient for PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (reports, _) = build_fill_reports_from_trades(
+        let (mut reports, _) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
             cmd.instrument_id,
             self.clock.get_time_ns(),
         );
+
+        // Snap dust drift on REST fills the same way the WS path does, so the
+        // engine sees a consistent quantity regardless of which path delivered
+        // a given fill first. Commission stays as venue-reported.
+        self.fill_tracker.snap_fill_reports(&mut reports);
 
         let reports = apply_fill_filters(reports, cmd.venue_order_id, cmd.start, cmd.end);
 
@@ -1473,6 +1524,7 @@ impl ExecutionClient for PolymarketExecutionClient {
             &self.http_client,
             &self.data_api_client,
             &self.shared_token_instruments,
+            &self.fill_tracker,
             &ctx,
             self.core.client_id,
             self.core.venue,
@@ -1761,7 +1813,7 @@ fn handle_order_response(
                                 account_id,
                                 &order_id,
                                 fallback_px,
-                                get_usdc_currency(),
+                                get_pusd_currency(),
                                 ts_now,
                                 ts_now,
                             ) {
@@ -1940,9 +1992,8 @@ async fn check_fok_status(
     emitter.send_order_status_report(report);
 }
 
-pub fn get_usdc_currency() -> Currency {
-    Currency::try_from_str(USDC)
-        .unwrap_or_else(|| Currency::new(USDC, 6, 0, USDC, CurrencyType::Crypto))
+pub fn get_pusd_currency() -> Currency {
+    Currency::pUSD()
 }
 
 async fn fetch_and_emit_account_state(
@@ -1964,15 +2015,40 @@ async fn fetch_and_emit_account_state(
         .await
         .context("failed to fetch balance allowance")?;
 
-    let usdc = get_usdc_currency();
-    let account_balance = parse_balance_allowance(balance_allowance.balance, usdc)
+    let pusd = get_pusd_currency();
+    let account_balance = parse_balance_allowance(balance_allowance.balance, pusd)
         .context("failed to parse balance allowance")?;
 
     let ts_event = clock.get_time_ns();
     log::info!(
-        "Account state updated: balance={} USDC",
+        "Account state updated: balance={} pUSD",
         account_balance.total
     );
     emitter.emit_account_state(vec![account_balance], vec![], true, ts_event);
     Ok(())
+}
+
+/// Fetches the user's pUSD collateral balance as a `Decimal`. Mirrors
+/// [`fetch_and_emit_account_state`] but returns the value directly so the
+/// market-BUY fee-adjustment path can size against a fresh balance.
+async fn fetch_collateral_balance_pusd(
+    http_client: &PolymarketClobHttpClient,
+    signature_type: SignatureType,
+) -> anyhow::Result<Decimal> {
+    use anyhow::Context;
+
+    let params = GetBalanceAllowanceParams {
+        asset_type: Some(crate::http::query::AssetType::Collateral),
+        signature_type: Some(signature_type),
+        ..Default::default()
+    };
+
+    let balance_allowance = http_client
+        .get_balance_allowance(params)
+        .await
+        .context("failed to fetch balance allowance")?;
+
+    // The API returns balances as integer micro-pUSD (e.g. `20000000` = 20 pUSD).
+    let usdc_scale = Decimal::from(1_000_000u32);
+    Ok(balance_allowance.balance / usdc_scale)
 }
