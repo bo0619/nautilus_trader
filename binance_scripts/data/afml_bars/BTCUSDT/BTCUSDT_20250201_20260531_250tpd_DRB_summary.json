@@ -4,22 +4,22 @@
   "kind": "DRB",
   "source": "Binance Vision futures aggregate trades",
   "input_archives": [
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-02.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-03.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-04.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-05.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-06.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-07.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-08.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-09.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-10.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-11.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-12.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-01.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-02.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-03.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-04.zip",
-    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\binance_vision\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-05.zip"
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-02.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-03.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-04.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-05.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-06.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-07.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-08.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-09.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-10.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-11.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2025-12.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-01.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-02.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-03.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-04.zip",
+    "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\futures_um\\monthly\\aggTrades\\BTCUSDT\\BTCUSDT-aggTrades-2026-05.zip"
   ],
   "start_date": "2025-02-01",
   "end_date": "2026-05-31",
@@ -684,5 +684,5 @@
     "2026-05-31": 59
   },
   "path": "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\afml_bars\\BTCUSDT\\BTCUSDT_20250201_20260531_250tpd_DRB.csv",
-  "elapsed_seconds": 2413.973
+  "elapsed_seconds": 4661.33
 }

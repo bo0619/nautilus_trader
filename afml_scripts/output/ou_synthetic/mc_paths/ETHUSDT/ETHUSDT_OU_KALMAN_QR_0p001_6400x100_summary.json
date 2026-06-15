@@ -1,0 +1,90 @@
+{
+  "symbol": "ETHUSDT",
+  "source_csv": "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\afml_bars\\ETHUSDT\\ETHUSDT_20250201_20260531_250tpd_DRB.csv",
+  "paths_npz": "E:\\VSCode\\nautilus_trader\\afml_scripts\\output\\ou_synthetic\\mc_paths\\ETHUSDT\\ETHUSDT_OU_KALMAN_QR_0p001_6400x100.npz",
+  "long_csv": null,
+  "n_paths": 6400,
+  "max_horizon_bars": 100,
+  "seed": 2246,
+  "volatility_target": {
+    "kind": "ewma_1bar_log_return_std",
+    "span": 80
+  },
+  "barrier": {
+    "vertical_barrier_bars": 80,
+    "barrier_unit": "ewma_1bar_log_return_volatility",
+    "barrier_unit_value": 0.0017655647303377112,
+    "payoff_policy": "first_touch_or_terminal_log_return",
+    "tie_policy": "stop_loss_first"
+  },
+  "fit": {
+    "trend_drift": -7.1369834675579125e-06,
+    "trend_std": 0.000389926009256195,
+    "ou_intercept": -7.244484035724301e-06,
+    "ou_phi": 0.9674840527680413,
+    "ou_mean": -0.00022279787773194458,
+    "ou_kappa": 0.033056337141134234,
+    "ou_half_life_bars": 20.968662607733854,
+    "ou_innovation_std": 0.003069361167020337,
+    "ou_sigma": 0.003120229518680911,
+    "innovation_covariance": [
+      [
+        1.5204229269446234e-07,
+        3.0277507626998015e-07
+      ],
+      [
+        3.0277507626998015e-07,
+        9.420977973612447e-06
+      ]
+    ],
+    "observed_log_return_volatility": 0.0031680560590810177,
+    "observed_ewma_1bar_log_return_volatility": 0.0017655647303377112
+  },
+  "synthetic": {
+    "terminal_log_return_mean": -0.00047253011867018845,
+    "terminal_log_return_std": 0.01780451604679665,
+    "terminal_relative_price_mean": 0.9996859758130014,
+    "terminal_relative_price_std": 0.017797084423924386
+  },
+  "calibration_mode": "full_sample",
+  "price_model": {
+    "kind": "log_price_trend_plus_ou_residual",
+    "price_column": "close",
+    "output_price_space": "relative_path"
+  },
+  "fair_value": {
+    "kind": "kalman_local_level",
+    "q_over_r": 0.001,
+    "input_space": "log_price"
+  },
+  "trend_process": {
+    "kind": "gaussian_random_walk_log_trend_increments",
+    "drift_shrinkage": 1.0,
+    "volatility_scale": 1.0,
+    "anchor_policy": "last_observed_kalman_fair_value"
+  },
+  "ou_process": {
+    "kind": "discrete_ou_ar1_log_residual",
+    "seed_policy": "stationary_distribution",
+    "residual_volatility_scale": 1.0
+  },
+  "monte_carlo": {
+    "n_paths": 6400,
+    "max_horizon_bars": 100,
+    "seed": 42,
+    "innovation_distribution": "joint_gaussian",
+    "joint_innovation_model": "trend_increment_and_ou_residual_innovation",
+    "output_format": "npz",
+    "write_long_csv": false,
+    "dtype": "float32"
+  },
+  "barrier_config": {
+    "enabled": true,
+    "vertical_barrier_bars": 80,
+    "barrier_unit": "ewma_1bar_log_return_volatility",
+    "volatility_ewma_span": 80,
+    "payoff_policy": "first_touch_or_terminal_log_return",
+    "tie_policy": "stop_loss_first"
+  },
+  "strategy_config_path": "E:\\VSCode\\nautilus_trader\\afml_strategies\\cvdslope.json"
+}

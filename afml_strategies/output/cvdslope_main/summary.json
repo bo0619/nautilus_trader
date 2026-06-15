@@ -1,0 +1,512 @@
+{
+  "mode": "train_and_backtest",
+  "symbols": [
+    "BTCUSDT"
+  ],
+  "configured_window": {
+    "data_start": "2025-01-01",
+    "data_end": "2026-05-31",
+    "train_start": "2025-01-01",
+    "train_end": "2025-12-31",
+    "test_start": "2026-02-01",
+    "test_end": "2026-05-31",
+    "test_days": 2.0,
+    "train_days": 90.0
+  },
+  "results": [
+    {
+      "symbol": "BTCUSDT",
+      "input_csv": "E:\\VSCode\\nautilus_trader\\binance_scripts\\data\\afml_bars\\BTCUSDT\\BTCUSDT_20250201_20260531_250tpd_DRB.csv",
+      "signal_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_signals_test.csv",
+      "price_column": "close",
+      "n_bars": 68510,
+      "n_features": 87,
+      "window": {
+        "train_start": "2025-02-01T00:17:44.044000+00:00",
+        "train_end": "2025-12-31T23:38:31.742000+00:00",
+        "test_start": "2026-02-01T00:06:04.273000+00:00",
+        "test_end": "2026-05-31T23:57:35.008000+00:00",
+        "embargo_bars": 800
+      },
+      "exit_definition": {
+        "long_profit_taking_mult": 1.2,
+        "long_stop_loss_mult": 1.5,
+        "short_profit_taking_mult": 1.2,
+        "short_stop_loss_mult": 1.5
+      },
+      "vertical_barrier_bars": 80,
+      "volatility_target": {
+        "kind": "ewma_1bar_log_return_std",
+        "span": 80,
+        "floor_quantile": 0.05,
+        "return_type": "log"
+      },
+      "meta_label_min_ret": 0.0014,
+      "primary": {
+        "model": "cvdslope_rule",
+        "candidate_count": 22385,
+        "side_counts": {
+          "-1": 16269,
+          "1": 6116
+        },
+        "event_definition": {
+          "trend_window_bars": 20,
+          "micro_slope_window_bars": 5,
+          "cvd_z_window_bars": 200,
+          "min_event_gap_bars": 1,
+          "long": {
+            "r2_threshold": 0.52,
+            "cvd_z_min": 1.7,
+            "micro_slope_min": 0.0
+          },
+          "short": {
+            "r2_threshold": 0.44,
+            "cvd_z_max": -1.2,
+            "micro_slope_max": 0.0
+          }
+        }
+      },
+      "meta": {
+        "n_labels": 22385,
+        "label_counts": {
+          "0": 10108,
+          "1": 12277
+        },
+        "train_events": 15502,
+        "test_events": 5442,
+        "train_precision": 0.5710214489275536,
+        "train_recall": 0.44819872851424536,
+        "test_precision": 0.5596239485403266,
+        "test_recall": 0.37737737737737737,
+        "train_metrics": {
+          "accuracy": 0.5131595923106695,
+          "macro_precision": 0.5202588851881684,
+          "macro_recall": 0.5200468528415976,
+          "macro_f1": 0.5129239083078928,
+          "weighted_precision": 0.5251249134243138,
+          "weighted_recall": 0.5131595923106695,
+          "weighted_f1": 0.511896851333915,
+          "positive_label": 1,
+          "positive_precision": 0.5710214489275536,
+          "positive_recall": 0.44819872851424536,
+          "positive_f1": 0.5022096167798958,
+          "per_class": {
+            "0": {
+              "precision": 0.4694963214487832,
+              "recall": 0.5918949771689498,
+              "f1": 0.5236381998358898,
+              "support": 7008
+            },
+            "1": {
+              "precision": 0.5710214489275536,
+              "recall": 0.44819872851424536,
+              "f1": 0.5022096167798958,
+              "support": 8494
+            }
+          }
+        },
+        "test_metrics": {
+          "accuracy": 0.4935685409775818,
+          "macro_precision": 0.5070847015428905,
+          "macro_recall": 0.5066845987091386,
+          "macro_f1": 0.49047554273418964,
+          "weighted_precision": 0.5124139305657838,
+          "weighted_recall": 0.4935685409775818,
+          "weighted_f1": 0.4864488091720377,
+          "positive_label": 1,
+          "positive_precision": 0.5596239485403266,
+          "positive_recall": 0.37737737737737737,
+          "positive_f1": 0.4507772020725389,
+          "per_class": {
+            "0": {
+              "precision": 0.45454545454545453,
+              "recall": 0.6359918200408998,
+              "f1": 0.5301738833958404,
+              "support": 2445
+            },
+            "1": {
+              "precision": 0.5596239485403266,
+              "recall": 0.37737737737737737,
+              "f1": 0.4507772020725389,
+              "support": 2997
+            }
+          }
+        },
+        "probability_threshold": 0.5,
+        "feature_selection": {
+          "enabled": true,
+          "method": "train_fold_standardize_pca_backproject_select_original_then_mda_negative_prune",
+          "pca_components": 0.95,
+          "raw_feature_count": 87,
+          "pca_component_count": 31,
+          "selected_raw_feature_count": 32,
+          "primary_context_feature_count": 0,
+          "selected_feature_count": 23,
+          "selected_features": [
+            "sadf_change",
+            "cvdslope_trend_r2",
+            "cvdslope_log_ret_1",
+            "log_return_1",
+            "oc_return",
+            "return_skew",
+            "notional_per_tick_zscore",
+            "tick_side_hhi",
+            "cvd_slope",
+            "return_kurt",
+            "order_flow_imbalance",
+            "tick_imbalance",
+            "buy_tick_ratio",
+            "cvdslope_log_ret_20",
+            "threshold_scale_chg",
+            "tick_zscore",
+            "ffd_d_0_40_ewm_diff",
+            "entropy_zscore",
+            "adf_t_128",
+            "dollar_volume_zscore",
+            "sqrt_dollar_imbalance",
+            "cvdslope_cvd_z",
+            "vpin_zscore"
+          ],
+          "pca_importance_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_meta_pca_backprojected_importance.csv",
+          "pca_train_metrics": {
+            "accuracy": 0.5095471552057799,
+            "macro_precision": 0.525672256899697,
+            "macro_recall": 0.5237153367996533,
+            "macro_f1": 0.5048302571473867,
+            "weighted_precision": 0.5309829619345288,
+            "weighted_recall": 0.5095471552057799,
+            "weighted_f1": 0.5001975337403991,
+            "positive_label": 1,
+            "positive_precision": 0.581073703366697,
+            "positive_recall": 0.3759124087591241,
+            "positive_f1": 0.4565015369218672,
+            "per_class": {
+              "0": {
+                "precision": 0.47027081043269714,
+                "recall": 0.6715182648401826,
+                "f1": 0.5531589773729063,
+                "support": 7008
+              },
+              "1": {
+                "precision": 0.581073703366697,
+                "recall": 0.3759124087591241,
+                "f1": 0.4565015369218672,
+                "support": 8494
+              }
+            }
+          },
+          "pca_test_metrics": {
+            "accuracy": 0.47133406835722164,
+            "macro_precision": 0.5053347392500983,
+            "macro_recall": 0.5032588826044859,
+            "macro_f1": 0.4318277317442767,
+            "weighted_precision": 0.5108193594525728,
+            "weighted_recall": 0.47133406835722164,
+            "weighted_f1": 0.41663086915867,
+            "positive_label": 1,
+            "positive_precision": 0.5594059405940595,
+            "positive_recall": 0.18852185518852185,
+            "positive_f1": 0.2820064886448715,
+            "per_class": {
+              "0": {
+                "precision": 0.45126353790613716,
+                "recall": 0.8179959100204499,
+                "f1": 0.5816489748436818,
+                "support": 2445
+              },
+              "1": {
+                "precision": 0.5594059405940595,
+                "recall": 0.18852185518852185,
+                "f1": 0.2820064886448715,
+                "support": 2997
+              }
+            }
+          },
+          "mda_pruning_enabled": true,
+          "mda_pruning_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_meta_mda_pruning_importance.csv",
+          "mda_pruning_candidate_feature_count": 32,
+          "mda_pruning_retained_feature_count": 23,
+          "mda_pruning_dropped_feature_count": 9,
+          "mda_pruning_dropped_features": [
+            "ffd_d_0_40_autocorr",
+            "notional_per_tick",
+            "cvdslope_log_ret_5",
+            "notional_side_hhi_chg",
+            "daily_vol_chg",
+            "cvdslope_signed_notional_z",
+            "tick_side_hhi_zscore",
+            "cvd_change",
+            "volume_zscore"
+          ],
+          "mda_pruning_validation_fraction": 0.25,
+          "mda_pruning_train_events": 11186,
+          "mda_pruning_validation_events": 3876,
+          "final_mdi_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_meta_selected_mdi_importance.csv",
+          "final_mda_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_meta_selected_mda_importance.csv",
+          "final_sfi_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_meta_selected_sfi_importance.csv",
+          "final_top_mdi_features": [
+            {
+              "method": "MDI",
+              "feature": "sadf_change",
+              "importance": 0.14362836001082052,
+              "std": 0.226834271580318
+            },
+            {
+              "method": "MDI",
+              "feature": "oc_return",
+              "importance": 0.10479336207308217,
+              "std": 0.18618018821757584
+            },
+            {
+              "method": "MDI",
+              "feature": "cvdslope_log_ret_1",
+              "importance": 0.09773358724898717,
+              "std": 0.15675458821595722
+            },
+            {
+              "method": "MDI",
+              "feature": "log_return_1",
+              "importance": 0.09051674252895989,
+              "std": 0.16367726203551738
+            },
+            {
+              "method": "MDI",
+              "feature": "tick_imbalance",
+              "importance": 0.07484860245526775,
+              "std": 0.15764029950933942
+            },
+            {
+              "method": "MDI",
+              "feature": "sqrt_dollar_imbalance",
+              "importance": 0.06562270732827266,
+              "std": 0.12940191692059685
+            },
+            {
+              "method": "MDI",
+              "feature": "buy_tick_ratio",
+              "importance": 0.04721589902131414,
+              "std": 0.1070015070861641
+            },
+            {
+              "method": "MDI",
+              "feature": "cvdslope_cvd_z",
+              "importance": 0.0443946728303726,
+              "std": 0.08577999596964697
+            },
+            {
+              "method": "MDI",
+              "feature": "cvd_slope",
+              "importance": 0.04328435444530455,
+              "std": 0.07823967683617393
+            },
+            {
+              "method": "MDI",
+              "feature": "cvdslope_log_ret_20",
+              "importance": 0.042268205639113494,
+              "std": 0.06802743214542155
+            }
+          ],
+          "final_top_mda_features": [
+            {
+              "method": "MDA",
+              "feature": "sadf_change",
+              "importance": 0.05092756702712068,
+              "std": 0.002312668312285871,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "cvdslope_cvd_z",
+              "importance": 0.02710173459286976,
+              "std": 0.0014170261025299713,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "cvd_slope",
+              "importance": 0.020603938560097124,
+              "std": 0.003477288555220121,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "order_flow_imbalance",
+              "importance": 0.01871514016092664,
+              "std": 0.0025300615635915078,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "cvdslope_log_ret_20",
+              "importance": 0.008876856327415453,
+              "std": 0.0018159807921576386,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "ffd_d_0_40_ewm_diff",
+              "importance": 0.0070757390879095565,
+              "std": 0.00160557853632218,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "return_skew",
+              "importance": 0.005661323481066738,
+              "std": 0.001503823165043864,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "dollar_volume_zscore",
+              "importance": 0.004019669777425257,
+              "std": 0.0013533835226739084,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "entropy_zscore",
+              "importance": 0.002580374050280332,
+              "std": 0.0021517520304734665,
+              "baseline_score": 0.6598809919928978
+            },
+            {
+              "method": "MDA",
+              "feature": "adf_t_128",
+              "importance": 0.002330837952536043,
+              "std": 0.002660984794580746,
+              "baseline_score": 0.6598809919928978
+            }
+          ],
+          "final_top_sfi_features": [
+            {
+              "method": "SFI",
+              "feature": "sadf_change",
+              "importance": 0.6651620941875569,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "sqrt_dollar_imbalance",
+              "importance": 0.5391186803908102,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "tick_zscore",
+              "importance": 0.5385054865014457,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "oc_return",
+              "importance": 0.536776309749427,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "cvdslope_log_ret_1",
+              "importance": 0.5360329145643162,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "log_return_1",
+              "importance": 0.5360329145643162,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "buy_tick_ratio",
+              "importance": 0.5305747544436079,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "tick_imbalance",
+              "importance": 0.5305747544436079,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "ffd_d_0_40_ewm_diff",
+              "importance": 0.5256516277602911,
+              "std": 0.0
+            },
+            {
+              "method": "SFI",
+              "feature": "dollar_volume_zscore",
+              "importance": 0.5232479246003863,
+              "std": 0.0
+            }
+          ]
+        }
+      },
+      "signals": {
+        "test_rows": 5442,
+        "signal_counts": {
+          "-1": 1527,
+          "0": 3421,
+          "1": 494
+        },
+        "active_signals": 2021
+      },
+      "model_controls": {
+        "primary_model": "cvdslope_rule",
+        "meta_model": "sequential_bootstrap_random_forest",
+        "max_features": 1,
+        "max_samples": "avg_uniqueness",
+        "min_weight_fraction_leaf": 0.05,
+        "class_weight": "balanced_subsample",
+        "sequential_bootstrap": {
+          "primary": false,
+          "meta": true
+        },
+        "sample_weight": "return_attribution_x_time_decay_or_uniqueness"
+      }
+    }
+  ],
+  "backtest": {
+    "start": "2026-02-01T00:06:04.273000+00:00",
+    "end": "2026-05-31T23:57:35.008000+00:00",
+    "starting_balance_usdt": "1000000",
+    "ending_balance_usdt": "998480.48209520 USDT",
+    "realized_pnl_usdt": "-1519.51790480 USDT",
+    "return_pct": "-0.1519517904800",
+    "n_bars": 16456,
+    "n_fills": 1928,
+    "n_positions": 964,
+    "pnl_by_symbol_usdt": {
+      "BTCUSDT": "-1519.5179048"
+    },
+    "position_statistics": {
+      "n_positions": 964,
+      "winning_positions": 329,
+      "losing_positions": 635,
+      "flat_positions": 0,
+      "win_rate": 0.3412863070539419,
+      "mean_position_pnl_usdt": "-1.5762633867219917",
+      "median_position_pnl_usdt": "-1.48216075",
+      "gross_profit_usdt": "950.4307981000001",
+      "gross_loss_usdt": "2469.9487029",
+      "profit_factor": 0.3847977883038973,
+      "max_drawdown_usdt": "-1536.3517995000007"
+    },
+    "symbols": [
+      {
+        "symbol": "BTCUSDT",
+        "bars": 16456,
+        "trade_size": "0.139",
+        "min_position_change": "0.001",
+        "signal_csv": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\BTCUSDT_signals_test.csv",
+        "instrument_id": "BTCUSDT-PERP.BINANCE"
+      }
+    ],
+    "files": {
+      "fills": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\fills.csv",
+      "positions": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\positions.csv",
+      "account": "E:\\VSCode\\nautilus_trader\\afml_strategies\\output\\cvdslope_main\\account.csv"
+    }
+  },
+  "failures": []
+}

@@ -155,8 +155,11 @@
     "random_seed": 2027
   },
   "runtime_strategy": {
-    "source": "synthetic_ml_summary",
-    "synthetic_summary_dir": "afml_scripts/output/ou_synthetic/ml_backtest",
+    "source": "static", 
+    "long_profit_taking_mult": 1.2,  
+    "long_stop_loss_mult": 1.5,      
+    "short_profit_taking_mult": 1.2, 
+    "short_stop_loss_mult": 1.5,     
     "vertical_barrier_bars": 80,
     "vertical_barrier_days": null
   },

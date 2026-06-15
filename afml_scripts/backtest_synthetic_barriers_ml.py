@@ -30,6 +30,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from afml_scripts.diagnose_ou_residuals import kalman_local_level  # noqa: E402
+from afml_scripts.generate_ou_residual_synthetic import (  # noqa: E402
+    DEFAULT_SYNTHETIC_STRATEGY_CONFIG,
+)
 from afml_scripts.generate_ou_residual_synthetic import barrier_unit  # noqa: E402
 from afml_scripts.generate_ou_residual_synthetic import configured_symbols  # noqa: E402
 from afml_scripts.generate_ou_residual_synthetic import deterministic_symbol_seed  # noqa: E402
@@ -40,6 +43,13 @@ from afml_scripts.generate_ou_residual_synthetic import read_real_bars  # noqa: 
 from afml_strategies.config_loader import load_afml_data_config  # noqa: E402
 from afml_strategies.config_loader import resolve_repo_path  # noqa: E402
 from afml_strategies.config_loader import section  # noqa: E402
+from nautilus_trader.research.afml_pipeline import AfmlDataset  # noqa: E402
+from nautilus_trader.research.afml_pipeline import _pca_dataset  # noqa: E402
+from nautilus_trader.research.afml_pipeline import make_pipeline_features  # noqa: E402
+from nautilus_trader.research.afml_pipeline import mda_feature_importance  # noqa: E402
+from nautilus_trader.research.afml_pipeline import mdi_feature_importance  # noqa: E402
+from nautilus_trader.research.afml_pipeline import pca_mdi_feature_importance  # noqa: E402
+from nautilus_trader.research.afml_pipeline import sfi_feature_importance  # noqa: E402
 
 
 FEATURE_COLUMNS = [
@@ -54,9 +64,11 @@ FEATURE_COLUMNS = [
     "realized_vol_20",
     "signed_notional_z",
 ]
+PRIMARY_STATE_COLUMNS = tuple(FEATURE_COLUMNS[1:])
+DEFAULT_CALENDAR_WINDOWS = ("1D", "3D", "7D", "14D", "30D")
 
 LOGGER = logging.getLogger("afml_synthetic_barriers_ml")
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 VOLATILITY_TARGET_KIND = "ewma_1bar_log_return_std"
 NEGATIVE_OBJECTIVE = -1.0e12
 
@@ -80,6 +92,19 @@ class SyntheticCandidateOutcome:
     mean_exit_step: np.ndarray
     unit: float
     n_paths: int
+
+
+@dataclass(frozen=True)
+class SyntheticMetaFoldResult:
+    model: Any
+    dataset: AfmlDataset
+    probabilities: pd.Series
+    feature_columns: list[str]
+    diagnostics: dict[str, Any]
+    pca_importance: pd.DataFrame | None = None
+    mdi_importance: pd.DataFrame | None = None
+    mda_importance: pd.DataFrame | None = None
+    sfi_importance: pd.DataFrame | None = None
 
 
 def json_default(value: Any) -> Any:
@@ -128,12 +153,15 @@ def run_fingerprint(
     bagging_config: dict[str, Any],
     labeling_config: dict[str, Any],
     primary_optuna_config: dict[str, Any],
+    feature_config: dict[str, Any],
 ) -> str:
     payload = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "symbol": symbol,
         "input_csv": file_signature(input_csv),
-        "feature_columns": FEATURE_COLUMNS,
+        "primary_state_columns": PRIMARY_STATE_COLUMNS,
+        "feature_source": "make_pipeline_features_plus_cvdslope_state",
+        "feature_engineering": feature_config,
         "price_model": price_model_config,
         "fair_value": fair_value_config,
         "trend_process": trend_config,
@@ -403,35 +431,115 @@ def event_state_features(
     return features, log_trend, residual
 
 
-def first_config_value(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
+def parse_calendar_windows(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in {"", "none", "null", "off", "false"}:
+            return None
+        windows = tuple(item.strip() for item in text.split(",") if item.strip())
+    elif isinstance(value, (list, tuple)):
+        windows = tuple(str(item).strip() for item in value if str(item).strip())
+    else:
+        raise TypeError("feature_engineering.calendar_windows must be a string, list, tuple, or null")
+    return windows or None
+
+
+def frame_with_datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
+    if "ts_event_ns" in frame.columns:
+        index = pd.to_datetime(frame["ts_event_ns"], unit="ns", utc=True, errors="coerce")
+    elif "ts_event" in frame.columns:
+        index = pd.to_datetime(frame["ts_event"], utc=True, errors="coerce")
+    else:
+        raise ValueError("Input bars must contain 'ts_event_ns' or 'ts_event'.")
+
+    out = frame.copy()
+    out.index = pd.DatetimeIndex(index)
+    out = out.loc[out.index.notna()].sort_index()
+    out = out.loc[~out.index.duplicated(keep="last")]
+    return out
+
+
+def ewma_volatility_target(
+    close: pd.Series,
+    *,
+    span: int,
+    floor_quantile: float | None,
+) -> pd.Series:
+    log_return = np.log(close.astype(float)).diff()
+    volatility = log_return.ewm(
+        span=int(span),
+        adjust=False,
+        min_periods=max(2, int(span) // 2),
+    ).std()
+    if floor_quantile is not None:
+        valid = volatility.dropna()
+        if not valid.empty:
+            floor = float(valid.quantile(float(floor_quantile)))
+            volatility = volatility.clip(lower=floor)
+    return volatility.rename("trgt")
+
+
+def build_synthetic_feature_frame(
+    frame: pd.DataFrame,
+    *,
+    price_column: str,
+    fair_value_config: dict[str, Any],
+    event_config: dict[str, Any],
+    barrier_config: dict[str, Any],
+    feature_config: dict[str, Any],
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.Series]:
+    close = frame[price_column].dropna().astype(float)
+    volatility = ewma_volatility_target(
+        close,
+        span=int(barrier_config.get("volatility_ewma_span", 80)),
+        floor_quantile=feature_config.get("volatility_floor_quantile"),
+    )
+    calendar_windows_value = feature_config.get("calendar_windows", DEFAULT_CALENDAR_WINDOWS)
+    pipeline_features = make_pipeline_features(
+        frame,
+        volatility=volatility,
+        microstructure_window=int(feature_config.get("microstructure_window", 50)),
+        information_window=int(feature_config.get("information_window", 64)),
+        calendar_windows=parse_calendar_windows(calendar_windows_value),
+        calendar_min_periods=int(feature_config.get("calendar_min_periods", 8)),
+        tail_quantile=float(feature_config.get("tail_quantile", 0.99)),
+        robust_z_clip=(
+            None
+            if feature_config.get("robust_z_clip", 5.0) is None
+            else float(feature_config.get("robust_z_clip", 5.0))
+        ),
+        fracdiff_d=float(feature_config.get("fracdiff_d", 0.4)),
+        fracdiff_threshold=float(feature_config.get("fracdiff_threshold", 0.01)),
+    )
+    state_features, log_trend, log_residual = event_state_features(
+        frame,
+        price_column=price_column,
+        fair_value_config=fair_value_config,
+        event_config=event_config,
+    )
+    state_features.index = frame.index
+
+    features = pd.concat([pipeline_features, state_features], axis=1)
+    features = features.loc[:, ~features.columns.duplicated(keep="last")]
+    features = features.select_dtypes(include=[np.number])
+    features = features.replace([np.inf, -np.inf], np.nan)
+    features = features.dropna(axis=1, how="all").ffill()
+    return features, log_trend, log_residual, volatility
 
 
 def direction_config(event_config: dict[str, Any], side: str) -> dict[str, Any]:
-    value = event_config.get(side, {})
+    value = event_config.get(side)
     if not isinstance(value, dict):
-        raise TypeError(f"event_definition.{side} must be a JSON object when provided")
+        raise TypeError(f"event_definition.{side} must be a JSON object")
     return value
 
 
-def short_cvd_z_threshold(event_config: dict[str, Any], short_config: dict[str, Any]) -> float:
-    value = first_config_value(
-        short_config.get("cvd_z_max"),
-        event_config.get("short_cvd_z_max"),
-    )
-    if value is not None:
-        return float(value)
-    abs_value = first_config_value(
-        short_config.get("cvd_z_min"),
-        short_config.get("cvd_z_abs_min"),
-        event_config.get("short_cvd_z_min"),
-        event_config.get("short_cvd_z_abs_min"),
-        1.5,
-    )
-    return -abs(float(abs_value))
+def required_float(config: dict[str, Any], key: str, path: str) -> float:
+    if key not in config:
+        raise ValueError(f"{path}.{key} is required")
+    return float(config[key])
 
 
 def deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -456,55 +564,29 @@ def explicit_event_definition(
     short_config = direction_config(event_config, "short")
     long_event = {
         "r2_threshold": float(
-            first_config_value(
-                long_r2_threshold,
-                long_config.get("r2_threshold"),
-                event_config.get("long_r2_threshold"),
-                event_config.get("r2_threshold"),
-                0.488,
-            ),
+            long_r2_threshold
+            if long_r2_threshold is not None
+            else required_float(long_config, "r2_threshold", "event_definition.long"),
         ),
         "cvd_z_min": float(
-            first_config_value(
-                long_cvd_z_min,
-                long_config.get("cvd_z_min"),
-                event_config.get("long_cvd_z_min"),
-                1.5,
-            ),
+            long_cvd_z_min
+            if long_cvd_z_min is not None
+            else required_float(long_config, "cvd_z_min", "event_definition.long"),
         ),
-        "micro_slope_min": float(
-            first_config_value(
-                long_config.get("micro_slope_min"),
-                event_config.get("long_micro_slope_min"),
-                0.0,
-            ),
-        ),
+        "micro_slope_min": required_float(long_config, "micro_slope_min", "event_definition.long"),
     }
     short_event = {
         "r2_threshold": float(
-            first_config_value(
-                short_r2_threshold,
-                short_config.get("r2_threshold"),
-                event_config.get("short_r2_threshold"),
-                event_config.get("r2_threshold"),
-                0.488,
-            ),
+            short_r2_threshold
+            if short_r2_threshold is not None
+            else required_float(short_config, "r2_threshold", "event_definition.short"),
         ),
         "cvd_z_max": float(
-            first_config_value(
-                short_cvd_z_max,
-                short_config.get("cvd_z_max"),
-                event_config.get("short_cvd_z_max"),
-                short_cvd_z_threshold(event_config, short_config),
-            ),
+            short_cvd_z_max
+            if short_cvd_z_max is not None
+            else required_float(short_config, "cvd_z_max", "event_definition.short"),
         ),
-        "micro_slope_max": float(
-            first_config_value(
-                short_config.get("micro_slope_max"),
-                event_config.get("short_micro_slope_max"),
-                0.0,
-            ),
-        ),
+        "micro_slope_max": required_float(short_config, "micro_slope_max", "event_definition.short"),
     }
     out = dict(event_config)
     out["long"] = deep_merge_config(long_config, long_event)
@@ -544,7 +626,7 @@ def runtime_candidate_payload(
     }
 
 
-def build_primary_events(
+def build_primary_events(  # noqa: C901
     symbol: str,
     df: pd.DataFrame,
     feature_frame: pd.DataFrame,
@@ -555,54 +637,29 @@ def build_primary_events(
 ) -> pd.DataFrame:
     long_config = direction_config(event_config, "long")
     short_config = direction_config(event_config, "short")
-    long_r2_threshold = float(
-        first_config_value(
-            long_config.get("r2_threshold"),
-            event_config.get("long_r2_threshold"),
-            event_config.get("r2_threshold"),
-            0.488,
-        ),
-    )
-    short_r2_threshold = float(
-        first_config_value(
-            short_config.get("r2_threshold"),
-            event_config.get("short_r2_threshold"),
-            event_config.get("r2_threshold"),
-            0.488,
-        ),
-    )
-    long_slope_min = float(
-        first_config_value(
-            long_config.get("micro_slope_min"),
-            event_config.get("long_micro_slope_min"),
-            0.0,
-        ),
-    )
-    short_slope_max = float(
-        first_config_value(
-            short_config.get("micro_slope_max"),
-            event_config.get("short_micro_slope_max"),
-            0.0,
-        ),
-    )
-    long_cvd_min = float(
-        first_config_value(
-            long_config.get("cvd_z_min"),
-            event_config.get("long_cvd_z_min"),
-            1.5,
-        ),
-    )
-    short_cvd_max = short_cvd_z_threshold(event_config, short_config)
+    long_r2_threshold = required_float(long_config, "r2_threshold", "event_definition.long")
+    short_r2_threshold = required_float(short_config, "r2_threshold", "event_definition.short")
+    long_slope_min = required_float(long_config, "micro_slope_min", "event_definition.long")
+    short_slope_max = required_float(short_config, "micro_slope_max", "event_definition.short")
+    long_cvd_min = required_float(long_config, "cvd_z_min", "event_definition.long")
+    short_cvd_max = required_float(short_config, "cvd_z_max", "event_definition.short")
     min_gap = int(event_config.get("min_event_gap_bars", 1))
 
     rows: list[dict[str, Any]] = []
     last_event_idx = -min_gap - 1
     max_idx = len(feature_frame) - horizon - 1
+    missing_state = [column for column in PRIMARY_STATE_COLUMNS if column not in feature_frame.columns]
+    if missing_state:
+        raise ValueError(f"Missing primary state feature columns for {symbol}: {missing_state}")
+    feature_columns = tuple(str(column) for column in feature_frame.columns)
+    bar_index = pd.DatetimeIndex(feature_frame.index)
     for idx in range(max_idx + 1):
         if idx - last_event_idx < min_gap:
             continue
         row = feature_frame.iloc[idx]
-        if not np.all(np.isfinite(row[FEATURE_COLUMNS[1:]].to_numpy(dtype=float))):
+        if not np.all(np.isfinite(row.loc[list(PRIMARY_STATE_COLUMNS)].to_numpy(dtype=float))):
+            continue
+        if not np.all(np.isfinite(row.loc[list(feature_columns)].to_numpy(dtype=float))):
             continue
         if not math.isfinite(float(log_trend[idx])) or not math.isfinite(float(log_residual[idx])):
             continue
@@ -625,11 +682,13 @@ def build_primary_events(
             "symbol": symbol,
             "event_idx": idx,
             "event_end_idx": idx + horizon,
+            "event_time": bar_index[idx].isoformat(),
+            "event_end_time": bar_index[idx + horizon].isoformat(),
             "side": side,
             "initial_log_trend": float(log_trend[idx]),
             "initial_log_residual": float(log_residual[idx]),
         }
-        for column in FEATURE_COLUMNS[1:]:
+        for column in feature_columns:
             payload[column] = float(row[column])
         rows.append(payload)
         last_event_idx = idx
@@ -1002,13 +1061,40 @@ def sequential_bootstrap(
     return selected
 
 
+def bagging_sample_length(
+    max_samples: Any,
+    n_samples: int,
+    sample_length_multiplier: float,
+    *,
+    sample_weight: np.ndarray | None = None,
+) -> int:
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive")
+    multiplier = float(sample_length_multiplier)
+    if max_samples is None:
+        base_length = n_samples
+    elif isinstance(max_samples, str):
+        value = max_samples.strip().lower()
+        if value in {"avg_uniqueness", "avgu"}:
+            if sample_weight is None or len(sample_weight) == 0:
+                raise ValueError("sample_weight is required when max_samples='avg_uniqueness'")
+            base_length = math.ceil(float(np.mean(sample_weight)) * n_samples)
+        else:
+            base_length = math.ceil(float(max_samples) * n_samples)
+    elif isinstance(max_samples, int):
+        base_length = max_samples
+    else:
+        base_length = math.ceil(float(max_samples) * n_samples)
+    return max(1, math.ceil(base_length * multiplier))
+
+
 class SequentialBaggedRandomForestClassifier:
     def __init__(
         self,
         *,
         n_estimators: int,
         max_features: int,
-        max_samples: float,
+        max_samples: Any,
         min_samples_leaf: int,
         max_depth: int | None,
         random_seed: int,
@@ -1016,26 +1102,70 @@ class SequentialBaggedRandomForestClassifier:
     ) -> None:
         self.n_estimators = int(n_estimators)
         self.max_features = int(max_features)
-        self.max_samples = float(max_samples)
+        self.max_samples = max_samples
         self.min_samples_leaf = int(min_samples_leaf)
         self.max_depth = max_depth
         self.random_seed = int(random_seed)
         self.sample_length_multiplier = float(sample_length_multiplier)
         self.estimators: list[DecisionTreeClassifier] = []
+        self.estimators_: list[DecisionTreeClassifier] = []
+        self.feature_names_: list[str] | None = None
+        self.n_features_in_: int | None = None
+        self.classes_: np.ndarray | None = None
+        self.requires_event_spans = True
 
     def fit(
         self,
-        x: np.ndarray,
-        y: np.ndarray,
-        starts: np.ndarray,
-        ends: np.ndarray,
-        sample_weight: np.ndarray,
+        x: Any,
+        y: Any,
+        starts: np.ndarray | None = None,
+        ends: np.ndarray | None = None,
+        sample_weight: Any | None = None,
         precomputed_bags: Sequence[np.ndarray] | None = None,
+        *,
+        t1: Any | None = None,
+        bar_index: Any | None = None,
     ) -> SequentialBaggedRandomForestClassifier:
+        if isinstance(x, pd.DataFrame):
+            self.feature_names_ = [str(column) for column in x.columns]
+            x_index = pd.DatetimeIndex(x.index)
+            x_values = x.to_numpy(dtype=float)
+        else:
+            x_index = None
+            x_values = np.asarray(x, dtype=float)
+            self.feature_names_ = [f"feature_{idx}" for idx in range(x_values.shape[1])]
+
+        y_values = np.asarray(y, dtype=np.int32)
         if len(np.unique(y)) < 2:
             raise ValueError("Meta-model training requires at least two classes.")
+        if sample_weight is None:
+            weight_values = np.ones(len(y_values), dtype=float)
+        else:
+            weight_values = np.asarray(sample_weight, dtype=float)
+        if starts is None or ends is None:
+            if t1 is None or bar_index is None or x_index is None:
+                starts = np.arange(len(y_values), dtype=np.int32)
+                ends = starts.copy()
+            else:
+                full_bar_index = pd.DatetimeIndex(bar_index)
+                start_values = full_bar_index.searchsorted(x_index, side="left").astype(np.int32)
+                t1_index = pd.DatetimeIndex(pd.Series(t1, index=x_index).reindex(x_index))
+                end_values = full_bar_index.searchsorted(t1_index, side="left").astype(np.int32)
+                starts = start_values
+                ends = np.maximum(start_values, end_values)
+        else:
+            starts = np.asarray(starts, dtype=np.int32)
+            ends = np.asarray(ends, dtype=np.int32)
+
+        self.n_features_in_ = int(x_values.shape[1])
+        self.classes_ = np.array(sorted(np.unique(y_values)), dtype=np.int32)
         rng = np.random.default_rng(self.random_seed)
-        sample_length = max(1, math.ceil(len(y) * self.max_samples * self.sample_length_multiplier))
+        sample_length = bagging_sample_length(
+            self.max_samples,
+            len(y_values),
+            self.sample_length_multiplier,
+            sample_weight=weight_values,
+        )
         if precomputed_bags is None:
             bags = [
                 sequential_bootstrap(starts, ends, sample_length=sample_length, rng=rng)
@@ -1048,28 +1178,36 @@ class SequentialBaggedRandomForestClassifier:
 
         self.estimators = []
         for bag in bags:
-            counts = np.bincount(bag, minlength=len(y)).astype(float)
-            weights = sample_weight * counts
+            counts = np.bincount(bag, minlength=len(y_values)).astype(float)
+            weights = weight_values * counts
             used = counts > 0
             tree = DecisionTreeClassifier(
-                max_features=max(1, min(self.max_features, x.shape[1])),
+                max_features=max(1, min(self.max_features, x_values.shape[1])),
                 min_samples_leaf=self.min_samples_leaf,
                 max_depth=self.max_depth,
                 random_state=int(rng.integers(0, 2**31 - 1)),
             )
-            tree.fit(x[used], y[used], sample_weight=weights[used])
+            tree.fit(x_values[used], y_values[used], sample_weight=weights[used])
             self.estimators.append(tree)
+        self.estimators_ = self.estimators
         return self
 
-    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if not self.estimators:
             raise RuntimeError("Model is not fitted.")
-        proba = np.zeros((len(x), 2), dtype=float)
+        x_values = x.to_numpy(dtype=float) if isinstance(x, pd.DataFrame) else np.asarray(x, dtype=float)
+        proba = np.zeros((len(x_values), 2), dtype=float)
         for tree in self.estimators:
-            tree_proba = tree.predict_proba(x)
+            tree_proba = tree.predict_proba(x_values)
             for class_pos, class_value in enumerate(tree.classes_):
                 proba[:, int(class_value)] += tree_proba[:, class_pos]
         return proba / len(self.estimators)
+
+    def predict(self, x: Any) -> Any:
+        prediction = np.argmax(self.predict_proba(x), axis=1).astype(np.int32)
+        if isinstance(x, pd.DataFrame):
+            return pd.Series(prediction, index=x.index, name="prediction")
+        return prediction
 
 
 def purged_walk_forward_splits(
@@ -1103,7 +1241,7 @@ def precompute_bootstrap_bags_by_fold(
     show_progress: bool,
 ) -> dict[int, list[np.ndarray]]:
     n_estimators = int(meta_config.get("n_estimators", 100))
-    max_samples = float(meta_config.get("max_samples", 1.0))
+    max_samples = meta_config.get("max_samples", 1.0)
     sample_length_multiplier = float(bagging_config.get("sample_length_multiplier", 1.0))
     base_seed = int(bagging_config.get("random_seed", 2027))
     bags_by_fold: dict[int, list[np.ndarray]] = {}
@@ -1120,9 +1258,11 @@ def precompute_bootstrap_bags_by_fold(
             rng = np.random.default_rng(base_seed + fold_idx)
             train_starts = starts[train_idx]
             train_ends = ends[train_idx]
-            sample_length = max(
-                1,
-                math.ceil(len(train_idx) * max_samples * sample_length_multiplier),
+            sample_length = bagging_sample_length(
+                max_samples,
+                len(train_idx),
+                sample_length_multiplier,
+                sample_weight=event_uniqueness(train_starts, train_ends),
             )
             bags = []
             for _ in range(n_estimators):
@@ -1139,6 +1279,369 @@ def precompute_bootstrap_bags_by_fold(
     finally:
         progress.close()
     return bags_by_fold
+
+
+def feature_selection_config(meta_config: dict[str, Any]) -> dict[str, Any]:
+    config = meta_config.get("feature_selection", {})
+    return config if isinstance(config, dict) else {}
+
+
+def pca_feature_selection_enabled(meta_config: dict[str, Any]) -> bool:
+    config = feature_selection_config(meta_config)
+    return bool(config.get("enabled", meta_config.get("pca_components") is not None))
+
+
+def selected_feature_count(meta_config: dict[str, Any], available: int) -> int:
+    if available < 1:
+        raise ValueError("At least one feature is required")
+    config = feature_selection_config(meta_config)
+    top_n = config.get("top_n")
+    if top_n is None:
+        return available
+    return max(1, min(int(top_n), available))
+
+
+def write_importance_csv(frame: pd.DataFrame | None, path: Path) -> str | None:
+    if frame is None or frame.empty:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+    return str(path)
+
+
+def aggregate_importance_frames(frames: list[pd.DataFrame], *, method: str) -> pd.DataFrame:
+    frames = [frame for frame in frames if frame is not None and not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    numeric_columns = [
+        column
+        for column in ("importance", "std", "baseline_score")
+        if column in combined.columns
+    ]
+    grouped = (
+        combined.groupby("feature", as_index=False)[numeric_columns]
+        .mean()
+        .sort_values("importance", ascending=False, ignore_index=True)
+    )
+    grouped.insert(0, "method", method)
+    grouped["fold_count"] = combined.groupby("feature")["fold"].nunique().reindex(grouped["feature"]).to_numpy()
+    return grouped
+
+
+def replace_synthetic_dataset_features(dataset: AfmlDataset, features: pd.DataFrame) -> AfmlDataset:
+    return AfmlDataset(
+        close=dataset.close,
+        features=features.reindex(dataset.features.index),
+        events=dataset.events,
+        labels=dataset.labels,
+        sample_weight=dataset.sample_weight,
+        volatility=dataset.volatility,
+        t_events=dataset.t_events,
+    )
+
+
+def synthetic_meta_model_from_config(
+    *,
+    meta_config: dict[str, Any],
+    bagging_config: dict[str, Any],
+    seed_offset: int = 0,
+    n_estimators_override: int | None = None,
+) -> SequentialBaggedRandomForestClassifier:
+    return SequentialBaggedRandomForestClassifier(
+        n_estimators=(
+            int(n_estimators_override)
+            if n_estimators_override is not None
+            else int(meta_config.get("n_estimators", 100))
+        ),
+        max_features=int(meta_config.get("max_features", 1)),
+        max_samples=meta_config.get("max_samples", 1.0),
+        min_samples_leaf=int(meta_config.get("min_samples_leaf", 5)),
+        max_depth=meta_config.get("max_depth"),
+        random_seed=int(bagging_config.get("random_seed", 2027)) + int(seed_offset),
+        sample_length_multiplier=float(bagging_config.get("sample_length_multiplier", 1.0)),
+    )
+
+
+def fit_synthetic_meta_model(
+    model: SequentialBaggedRandomForestClassifier,
+    dataset: AfmlDataset,
+    train_index: pd.DatetimeIndex,
+    *,
+    precomputed_bags: Sequence[np.ndarray] | None = None,
+) -> SequentialBaggedRandomForestClassifier:
+    train_events = dataset.events.loc[train_index]
+    model.fit(
+        dataset.X.loc[train_index],
+        dataset.y.loc[train_index],
+        starts=train_events["event_idx"].to_numpy(dtype=np.int32),
+        ends=train_events["event_end_idx"].to_numpy(dtype=np.int32),
+        sample_weight=dataset.sample_weight.loc[train_index].to_numpy(dtype=float),
+        precomputed_bags=precomputed_bags,
+    )
+    return model
+
+
+def build_synthetic_meta_dataset(
+    events: pd.DataFrame,
+    outcome: SyntheticCandidateOutcome,
+    feature_frame: pd.DataFrame,
+    close: pd.Series,
+    volatility: pd.Series,
+    *,
+    label_threshold: float,
+) -> tuple[AfmlDataset, pd.DataFrame]:
+    event_index = pd.DatetimeIndex(pd.to_datetime(events["event_time"], utc=True))
+    event_end_index = pd.DatetimeIndex(pd.to_datetime(events["event_end_time"], utc=True))
+    feature_columns = [column for column in feature_frame.columns if column in events.columns]
+    features = events[feature_columns].copy()
+    features.index = event_index
+    features = features.replace([np.inf, -np.inf], np.nan)
+
+    labels = pd.DataFrame(
+        {
+            "ret": outcome.expected_payoff.astype(float),
+            "bin": (outcome.expected_payoff > float(label_threshold)).astype(np.int32),
+            "side": events["side"].to_numpy(dtype=np.int32),
+        },
+        index=event_index,
+    )
+    aligned_events = pd.DataFrame(
+        {
+            "t1": event_end_index,
+            "trgt": float(outcome.unit),
+            "side": events["side"].to_numpy(dtype=np.int32),
+            "event_idx": events["event_idx"].to_numpy(dtype=np.int32),
+            "event_end_idx": events["event_end_idx"].to_numpy(dtype=np.int32),
+        },
+        index=event_index,
+    )
+    outcome_frame = pd.DataFrame(
+        {
+            "expected_payoff": outcome.expected_payoff.astype(float),
+            "payoff_std": outcome.payoff_std.astype(float),
+            "payoff_standard_error": outcome.payoff_standard_error.astype(float),
+            "pt_hit_rate": outcome.pt_hit_rate.astype(float),
+            "sl_hit_rate": outcome.sl_hit_rate.astype(float),
+            "vertical_rate": outcome.vertical_rate.astype(float),
+            "mean_exit_step": outcome.mean_exit_step.astype(float),
+        },
+        index=event_index,
+    )
+
+    valid = features.notna().all(axis=1) & labels["bin"].notna()
+    features = features.loc[valid]
+    labels = labels.loc[valid]
+    aligned_events = aligned_events.loc[valid]
+    outcome_frame = outcome_frame.loc[valid]
+    if labels.empty:
+        raise ValueError("No synthetic labels remain after full feature alignment")
+
+    starts = aligned_events["event_idx"].to_numpy(dtype=np.int32)
+    ends = aligned_events["event_end_idx"].to_numpy(dtype=np.int32)
+    sample_weight = pd.Series(event_uniqueness(starts, ends), index=labels.index, name="sample_weight")
+    dataset = AfmlDataset(
+        close=close,
+        features=features,
+        events=aligned_events,
+        labels=labels,
+        sample_weight=sample_weight,
+        volatility=volatility,
+        t_events=pd.DatetimeIndex(labels.index),
+    )
+    return dataset, outcome_frame
+
+
+def split_train_validation_indices_for_pruning(
+    dataset: AfmlDataset,
+    train_index: pd.DatetimeIndex,
+    *,
+    validation_fraction: float,
+    embargo_bars: int,
+) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("mda_pruning_validation_fraction must be in (0, 1)")
+    ordered = pd.DatetimeIndex(train_index).intersection(dataset.X.index).sort_values()
+    if len(ordered) < 4:
+        raise ValueError("MDA pruning requires at least four training events")
+
+    split_pos = int(np.floor(len(ordered) * (1.0 - validation_fraction)))
+    split_pos = max(1, min(split_pos, len(ordered) - 1))
+    validation_index = pd.DatetimeIndex(ordered[split_pos:])
+    inner_train_index = pd.DatetimeIndex(ordered[:split_pos])
+    validation_start_idx = int(dataset.events.loc[validation_index[0], "event_idx"])
+
+    if int(embargo_bars) > 0:
+        cutoff = validation_start_idx - int(embargo_bars)
+        event_ends = dataset.events.loc[inner_train_index, "event_end_idx"].astype(int)
+        inner_train_index = pd.DatetimeIndex(event_ends.index[event_ends <= cutoff])
+    else:
+        event_ends = dataset.events.loc[inner_train_index, "event_end_idx"].astype(int)
+        inner_train_index = pd.DatetimeIndex(event_ends.index[event_ends < validation_start_idx])
+
+    if inner_train_index.empty or validation_index.empty:
+        raise ValueError("MDA pruning train/validation split is empty after purge and embargo")
+    return inner_train_index, validation_index
+
+
+def fit_synthetic_fold_with_feature_selection(
+    *,
+    dataset: AfmlDataset,
+    train_index: pd.DatetimeIndex,
+    test_index: pd.DatetimeIndex,
+    meta_config: dict[str, Any],
+    bagging_config: dict[str, Any],
+    precomputed_bags: Sequence[np.ndarray] | None,
+    fold_idx: int,
+) -> SyntheticMetaFoldResult:
+    diagnostics: dict[str, Any] = {
+        "fold": fold_idx,
+        "feature_selection_enabled": False,
+        "raw_feature_count": int(dataset.X.shape[1]),
+    }
+    final_dataset = dataset
+    final_feature_columns = list(dataset.X.columns)
+    pca_importance: pd.DataFrame | None = None
+
+    if pca_feature_selection_enabled(meta_config):
+        pca_components = float(meta_config.get("pca_components", 0.95))
+        pca_dataset, pca_transformer = _pca_dataset(
+            dataset,
+            train_index,
+            pca_components=pca_components,
+            pca_random_state=int(meta_config.get("pca_random_state", 42)) + fold_idx,
+        )
+        if pca_transformer is None:
+            raise ValueError("PCA feature selection requires a fitted transformer")
+        pca_model = synthetic_meta_model_from_config(
+            meta_config=meta_config,
+            bagging_config=bagging_config,
+            seed_offset=20_000 + fold_idx,
+        )
+        pca_model = fit_synthetic_meta_model(
+            pca_model,
+            pca_dataset,
+            train_index,
+            precomputed_bags=precomputed_bags,
+        )
+        pca_importance = pca_mdi_feature_importance(
+            pca_model,
+            pca_transformer,
+            dataset.X.columns,
+        )
+        top_n = selected_feature_count(meta_config, available=dataset.X.shape[1])
+        final_feature_columns = pca_importance.head(top_n)["feature"].astype(str).tolist()
+        final_dataset = replace_synthetic_dataset_features(
+            dataset,
+            dataset.features[final_feature_columns],
+        )
+        diagnostics.update(
+            {
+                "feature_selection_enabled": True,
+                "pca_components": pca_components,
+                "pca_component_count": int(pca_dataset.X.shape[1]),
+                "selected_raw_feature_count": len(final_feature_columns),
+            },
+        )
+
+        config = feature_selection_config(meta_config)
+        if bool(config.get("mda_prune_negative", True)):
+            pruning_train_index, pruning_validation_index = split_train_validation_indices_for_pruning(
+                final_dataset,
+                train_index,
+                validation_fraction=float(config.get("mda_pruning_validation_fraction", 0.25)),
+                embargo_bars=int(meta_config.get("embargo_bars", 80)),
+            )
+            provisional_model = synthetic_meta_model_from_config(
+                meta_config=meta_config,
+                bagging_config=bagging_config,
+                seed_offset=30_000 + fold_idx,
+            )
+            provisional_model = fit_synthetic_meta_model(
+                provisional_model,
+                final_dataset,
+                pruning_train_index,
+            )
+            pruning_mda = mda_feature_importance(
+                provisional_model,
+                final_dataset.X.loc[pruning_validation_index],
+                final_dataset.y.loc[pruning_validation_index],
+                sample_weight=final_dataset.sample_weight.loc[pruning_validation_index],
+                n_repeats=int(config.get("mda_repeats", 3)),
+                random_state=int(meta_config.get("pca_random_state", 42)) + fold_idx,
+            )
+            retained = pruning_mda.loc[pruning_mda["importance"] >= 0.0, "feature"].astype(str).tolist()
+            if retained:
+                final_feature_columns = [feature for feature in final_feature_columns if feature in set(retained)]
+                final_dataset = replace_synthetic_dataset_features(
+                    dataset,
+                    dataset.features[final_feature_columns],
+                )
+            diagnostics.update(
+                {
+                    "mda_pruning_enabled": True,
+                    "mda_pruning_retained_feature_count": len(final_feature_columns),
+                    "mda_pruning_dropped_feature_count": int(len(pruning_mda) - len(final_feature_columns)),
+                },
+            )
+        else:
+            diagnostics["mda_pruning_enabled"] = False
+
+    model = synthetic_meta_model_from_config(
+        meta_config=meta_config,
+        bagging_config=bagging_config,
+        seed_offset=fold_idx,
+    )
+    model = fit_synthetic_meta_model(
+        model,
+        final_dataset,
+        train_index,
+        precomputed_bags=precomputed_bags,
+    )
+    probabilities = pd.Series(
+        model.predict_proba(final_dataset.X.loc[test_index])[:, 1],
+        index=test_index,
+        name="meta_probability",
+    )
+
+    mdi: pd.DataFrame | None = None
+    mda: pd.DataFrame | None = None
+    sfi: pd.DataFrame | None = None
+    if diagnostics["feature_selection_enabled"]:
+        config = feature_selection_config(meta_config)
+        mdi = mdi_feature_importance(model)
+        mda = mda_feature_importance(
+            model,
+            final_dataset.X.loc[test_index],
+            final_dataset.y.loc[test_index],
+            sample_weight=final_dataset.sample_weight.loc[test_index],
+            n_repeats=int(config.get("mda_repeats", 3)),
+            random_state=int(meta_config.get("pca_random_state", 42)) + fold_idx,
+        )
+        sfi = sfi_feature_importance(
+            final_dataset,
+            train_index=train_index,
+            test_index=test_index,
+            model_factory=lambda: synthetic_meta_model_from_config(
+                meta_config=meta_config,
+                bagging_config=bagging_config,
+                seed_offset=40_000 + fold_idx,
+                n_estimators_override=int(config.get("sfi_n_estimators", 10)),
+            ),
+        )
+    diagnostics["selected_feature_count"] = len(final_feature_columns)
+    diagnostics["selected_features"] = final_feature_columns
+    return SyntheticMetaFoldResult(
+        model=model,
+        dataset=final_dataset,
+        probabilities=probabilities,
+        feature_columns=final_feature_columns,
+        diagnostics=diagnostics,
+        pca_importance=pca_importance,
+        mdi_importance=mdi,
+        mda_importance=mda,
+        sfi_importance=sfi,
+    )
 
 
 def candidate_screen_row(
@@ -1183,9 +1686,65 @@ def candidate_screen_row(
     }
 
 
+def screening_only_candidate_result(
+    *,
+    screen_row: dict[str, Any],
+    events: pd.DataFrame,
+    outcome: SyntheticCandidateOutcome,
+    status: str,
+    error: str | None,
+) -> dict[str, Any]:
+    expected = outcome.expected_payoff.astype(float)
+    n_events = len(expected)
+    std_expected = float(screen_row["screen_std_expected_log_return"] or 0.0)
+    standard_error = float(screen_row["screen_standard_error"] or 0.0)
+    robust_expected = float(screen_row["screen_robust_expected_log_return"])
+    path_metrics = trade_path_metrics(
+        expected,
+        event_starts=events["event_idx"].to_numpy(dtype=np.int32),
+    )
+    return {
+        "candidate_id": screen_row["candidate_id"],
+        "long_R2": screen_row["long_R2"],
+        "short_R2": screen_row["short_R2"],
+        "long_Z": screen_row["long_Z"],
+        "short_Z": screen_row["short_Z"],
+        "long_PT": screen_row["long_PT"],
+        "long_SL": screen_row["long_SL"],
+        "short_PT": screen_row["short_PT"],
+        "short_SL": screen_row["short_SL"],
+        "n_test_events": 0,
+        "n_accepted_events": 0,
+        "accept_rate": 0.0,
+        "mean_expected_log_return": float(screen_row["screen_mean_expected_log_return"]),
+        "median_expected_log_return": screen_row["screen_median_expected_log_return"],
+        "sum_expected_log_return": float(screen_row["screen_sum_expected_log_return"]),
+        "std_expected_log_return": std_expected,
+        "cross_event_standard_error": standard_error,
+        "mean_path_payoff_std": screen_row["screen_mean_path_payoff_std"],
+        "monte_carlo_standard_error": float(np.mean(outcome.payoff_standard_error)) if n_events else 0.0,
+        "total_standard_error": standard_error,
+        "robust_expected_log_return": robust_expected,
+        "sharpe_like": screen_row["screen_sharpe_like"],
+        "robust_sharpe_like": robust_expected / std_expected if std_expected > 0.0 else None,
+        "meta_precision": None,
+        "mean_predicted_probability": None,
+        "mean_pt_hit_rate": screen_row["screen_mean_pt_hit_rate"],
+        "mean_sl_hit_rate": screen_row["screen_mean_sl_hit_rate"],
+        "mean_vertical_rate": screen_row["screen_mean_vertical_rate"],
+        "mean_exit_step": screen_row["screen_mean_exit_step"],
+        "meta_validation_status": status,
+        "meta_validation_error": error,
+        **path_metrics,
+    }
+
+
 def run_meta_model_candidate(
     events: pd.DataFrame,
     outcome: SyntheticCandidateOutcome,
+    feature_frame: pd.DataFrame,
+    close: pd.Series,
+    volatility: pd.Series,
     meta_config: dict[str, Any],
     bagging_config: dict[str, Any],
     labeling_config: dict[str, Any],
@@ -1195,12 +1754,19 @@ def run_meta_model_candidate(
     exit_definition: dict[str, float],
     min_accepted_events: int,
     symbol: str | None = None,
+    output_dir: Path | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
-    x = events[FEATURE_COLUMNS].to_numpy(dtype=float)
-    starts = events["event_idx"].to_numpy(dtype=np.int32)
-    ends = events["event_end_idx"].to_numpy(dtype=np.int32)
-    uniqueness = event_uniqueness(starts, ends)
+    dataset, outcome_frame = build_synthetic_meta_dataset(
+        events,
+        outcome,
+        feature_frame,
+        close,
+        volatility,
+        label_threshold=float(labeling_config.get("label_threshold", 0.0)),
+    )
+    starts = dataset.events["event_idx"].to_numpy(dtype=np.int32)
+    ends = dataset.events["event_end_idx"].to_numpy(dtype=np.int32)
     splits = purged_walk_forward_splits(
         starts,
         ends,
@@ -1211,9 +1777,7 @@ def run_meta_model_candidate(
         raise ValueError("Purged walk-forward produced no train/test splits")
 
     threshold = float(meta_config.get("class_probability_threshold", 0.5))
-    label_threshold = float(labeling_config.get("label_threshold", 0.0))
-    expected = outcome.expected_payoff
-    y = (expected > label_threshold).astype(np.int32)
+    y = dataset.y.to_numpy(dtype=np.int32)
     if len(np.unique(y)) < 2:
         raise ValueError("Candidate synthetic labels contain fewer than two classes")
 
@@ -1232,39 +1796,50 @@ def run_meta_model_candidate(
     accepted_labels: list[int] = []
     accepted_probabilities: list[float] = []
     accepted_event_starts: list[int] = []
+    pca_frames: list[pd.DataFrame] = []
+    mdi_frames: list[pd.DataFrame] = []
+    mda_frames: list[pd.DataFrame] = []
+    sfi_frames: list[pd.DataFrame] = []
+    fold_diagnostics: list[dict[str, Any]] = []
     n_test_total = 0
     for fold_idx, (train_idx, test_idx) in enumerate(splits):
         if len(np.unique(y[train_idx])) < 2:
             continue
-        model = SequentialBaggedRandomForestClassifier(
-            n_estimators=int(meta_config.get("n_estimators", 100)),
-            max_features=int(meta_config.get("max_features", 1)),
-            max_samples=float(meta_config.get("max_samples", 1.0)),
-            min_samples_leaf=int(meta_config.get("min_samples_leaf", 5)),
-            max_depth=meta_config.get("max_depth"),
-            random_seed=int(bagging_config.get("random_seed", 2027)) + fold_idx,
-            sample_length_multiplier=float(bagging_config.get("sample_length_multiplier", 1.0)),
-        )
-        model.fit(
-            x[train_idx],
-            y[train_idx],
-            starts[train_idx],
-            ends[train_idx],
-            sample_weight=uniqueness[train_idx],
+        train_index = pd.DatetimeIndex(dataset.X.index[train_idx])
+        test_index = pd.DatetimeIndex(dataset.X.index[test_idx])
+        fold_result = fit_synthetic_fold_with_feature_selection(
+            dataset=dataset,
+            train_index=train_index,
+            test_index=test_index,
+            meta_config=meta_config,
+            bagging_config=bagging_config,
             precomputed_bags=bags_by_fold[fold_idx],
+            fold_idx=fold_idx,
         )
-        proba = model.predict_proba(x[test_idx])[:, 1]
+        proba = fold_result.probabilities.reindex(test_index).to_numpy(dtype=float)
         accept = proba >= threshold
         n_test_total += len(test_idx)
         if np.any(accept):
-            accepted_returns.extend(expected[test_idx][accept].astype(float).tolist())
-            accepted_path_std.extend(outcome.payoff_std[test_idx][accept].astype(float).tolist())
+            test_outcome = outcome_frame.loc[test_index]
+            accepted_returns.extend(test_outcome["expected_payoff"].to_numpy(dtype=float)[accept].tolist())
+            accepted_path_std.extend(test_outcome["payoff_std"].to_numpy(dtype=float)[accept].tolist())
             accepted_path_se.extend(
-                outcome.payoff_standard_error[test_idx][accept].astype(float).tolist(),
+                test_outcome["payoff_standard_error"].to_numpy(dtype=float)[accept].tolist(),
             )
             accepted_labels.extend(y[test_idx][accept].astype(int).tolist())
             accepted_probabilities.extend(proba[accept].astype(float).tolist())
             accepted_event_starts.extend(starts[test_idx][accept].astype(int).tolist())
+        fold_diagnostics.append(fold_result.diagnostics)
+        for frame, target in (
+            (fold_result.pca_importance, pca_frames),
+            (fold_result.mdi_importance, mdi_frames),
+            (fold_result.mda_importance, mda_frames),
+            (fold_result.sfi_importance, sfi_frames),
+        ):
+            if frame is not None and not frame.empty:
+                with_fold = frame.copy()
+                with_fold["fold"] = fold_idx
+                target.append(with_fold)
 
     if len(accepted_returns) < min_accepted_events:
         raise ValueError(
@@ -1293,6 +1868,33 @@ def run_meta_model_candidate(
     mean_expected = float(np.mean(accepted_returns_array))
     robust_expected = mean_expected - 2.0 * total_standard_error
     path_metrics = trade_path_metrics(accepted_returns_array, event_starts=accepted_event_starts_array)
+    feature_selection_enabled = pca_feature_selection_enabled(meta_config)
+    pca_importance = aggregate_importance_frames(pca_frames, method="PCA_MDI_BACKPROJECTED")
+    mdi_importance = aggregate_importance_frames(mdi_frames, method="MDI")
+    mda_importance = aggregate_importance_frames(mda_frames, method="MDA")
+    sfi_importance = aggregate_importance_frames(sfi_frames, method="SFI")
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    pca_importance_csv = (
+        write_importance_csv(pca_importance, output_dir / f"{candidate_id}_pca_backprojected_importance.csv")
+        if output_dir is not None
+        else None
+    )
+    mdi_importance_csv = (
+        write_importance_csv(mdi_importance, output_dir / f"{candidate_id}_selected_mdi_importance.csv")
+        if output_dir is not None
+        else None
+    )
+    mda_importance_csv = (
+        write_importance_csv(mda_importance, output_dir / f"{candidate_id}_selected_mda_importance.csv")
+        if output_dir is not None
+        else None
+    )
+    sfi_importance_csv = (
+        write_importance_csv(sfi_importance, output_dir / f"{candidate_id}_selected_sfi_importance.csv")
+        if output_dir is not None
+        else None
+    )
     return {
         "candidate_id": candidate_id,
         "long_R2": float(event_definition["long"]["r2_threshold"]),
@@ -1323,30 +1925,36 @@ def run_meta_model_candidate(
         "mean_sl_hit_rate": float(np.mean(outcome.sl_hit_rate)),
         "mean_vertical_rate": float(np.mean(outcome.vertical_rate)),
         "mean_exit_step": float(np.mean(outcome.mean_exit_step)),
+        "meta_feature_count": int(dataset.X.shape[1]),
+        "feature_selection_enabled": feature_selection_enabled,
+        "pca_importance_csv": pca_importance_csv,
+        "final_mdi_csv": mdi_importance_csv,
+        "final_mda_csv": mda_importance_csv,
+        "final_sfi_csv": sfi_importance_csv,
+        "fold_diagnostics": fold_diagnostics,
+        "top_mdi_features": mdi_importance.head(10).to_dict(orient="records"),
+        "top_mda_features": mda_importance.head(10).to_dict(orient="records"),
+        "top_sfi_features": sfi_importance.head(10).to_dict(orient="records"),
         **path_metrics,
     }
 
 
-def search_space_config(primary_optuna_config: dict[str, Any], *names: str) -> dict[str, Any]:
+def search_space_config(primary_optuna_config: dict[str, Any], name: str) -> dict[str, Any]:
     search_space = section(primary_optuna_config, "search_space")
-    for name in names:
-        value = search_space.get(name)
-        if isinstance(value, dict):
-            return value
-    return {}
+    value = search_space.get(name)
+    return value if isinstance(value, dict) else {}
 
 
-def suggest_float_with_aliases(
+def suggest_float(
     trial: Any,
     primary_optuna_config: dict[str, Any],
     trial_name: str,
-    aliases: tuple[str, ...],
     *,
     default_low: float,
     default_high: float,
     log: bool = False,
 ) -> float:
-    config = search_space_config(primary_optuna_config, trial_name, *aliases)
+    config = search_space_config(primary_optuna_config, trial_name)
     low = float(config.get("low", default_low))
     high = float(config.get("high", default_high))
     if high <= low:
@@ -1363,67 +1971,59 @@ def runtime_candidate_from_trial(
     event_config: dict[str, Any],
     primary_optuna_config: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, float]]:
-    long_r2 = suggest_float_with_aliases(
+    long_r2 = suggest_float(
         trial,
         primary_optuna_config,
         "long_R2",
-        ("long_r2_threshold",),
         default_low=0.40,
         default_high=0.70,
     )
-    short_r2 = suggest_float_with_aliases(
+    short_r2 = suggest_float(
         trial,
         primary_optuna_config,
         "short_R2",
-        ("short_r2_threshold",),
         default_low=0.35,
         default_high=0.65,
     )
-    long_z = suggest_float_with_aliases(
+    long_z = suggest_float(
         trial,
         primary_optuna_config,
         "long_Z",
-        ("long_cvd_z_min",),
         default_low=1.0,
         default_high=2.5,
     )
-    short_z_abs = suggest_float_with_aliases(
+    short_z = suggest_float(
         trial,
         primary_optuna_config,
-        "short_Z_abs",
-        ("short_cvd_z_abs_min",),
-        default_low=0.8,
-        default_high=2.2,
+        "short_Z",
+        default_low=-2.2,
+        default_high=-0.8,
     )
-    long_pt = suggest_float_with_aliases(
+    long_pt = suggest_float(
         trial,
         primary_optuna_config,
         "long_PT",
-        ("long_profit_taking_mult",),
         default_low=0.5,
         default_high=4.0,
     )
-    long_sl = suggest_float_with_aliases(
+    long_sl = suggest_float(
         trial,
         primary_optuna_config,
         "long_SL",
-        ("long_stop_loss_mult",),
         default_low=0.5,
         default_high=4.0,
     )
-    short_pt = suggest_float_with_aliases(
+    short_pt = suggest_float(
         trial,
         primary_optuna_config,
         "short_PT",
-        ("short_profit_taking_mult",),
         default_low=0.5,
         default_high=4.0,
     )
-    short_sl = suggest_float_with_aliases(
+    short_sl = suggest_float(
         trial,
         primary_optuna_config,
         "short_SL",
-        ("short_stop_loss_mult",),
         default_low=0.5,
         default_high=4.0,
     )
@@ -1432,7 +2032,7 @@ def runtime_candidate_from_trial(
         long_r2_threshold=long_r2,
         short_r2_threshold=short_r2,
         long_cvd_z_min=long_z,
-        short_cvd_z_max=-abs(short_z_abs),
+        short_cvd_z_max=short_z,
     )
     exit_definition = {
         "long_profit_taking_mult": long_pt,
@@ -1458,11 +2058,167 @@ def sort_candidate_results(frame: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def static_exit_definition(runtime_config: dict[str, Any]) -> dict[str, float]:
+    return {
+        "long_profit_taking_mult": required_float(
+            runtime_config,
+            "long_profit_taking_mult",
+            "runtime_strategy",
+        ),
+        "long_stop_loss_mult": required_float(
+            runtime_config,
+            "long_stop_loss_mult",
+            "runtime_strategy",
+        ),
+        "short_profit_taking_mult": required_float(
+            runtime_config,
+            "short_profit_taking_mult",
+            "runtime_strategy",
+        ),
+        "short_stop_loss_mult": required_float(
+            runtime_config,
+            "short_stop_loss_mult",
+            "runtime_strategy",
+        ),
+    }
+
+
+def evaluate_static_runtime_candidate(
+    *,
+    symbol: str,
+    df: pd.DataFrame,
+    feature_frame: pd.DataFrame,
+    close: pd.Series,
+    volatility: pd.Series,
+    log_trend: np.ndarray,
+    log_residual: np.ndarray,
+    model: Any,
+    event_config: dict[str, Any],
+    barrier_config: dict[str, Any],
+    runtime_config: dict[str, Any],
+    meta_config: dict[str, Any],
+    bagging_config: dict[str, Any],
+    labeling_config: dict[str, Any],
+    primary_optuna_config: dict[str, Any],
+    base_seed: int,
+    diagnostics_dir: Path | None,
+    show_progress: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    horizon = int(barrier_config.get("vertical_barrier_bars", 80))
+    min_primary_events = int(primary_optuna_config.get("min_primary_events", 50))
+    min_accepted_events = int(primary_optuna_config.get("min_accepted_events", 10))
+    candidate_id = "static_runtime"
+    event_definition = explicit_event_definition(event_config)
+    exit_definition = static_exit_definition(runtime_config)
+    payload = runtime_candidate_payload(
+        event_definition=event_definition,
+        exit_definition=exit_definition,
+        barrier_config=barrier_config,
+        vertical_barrier_bars=horizon,
+    )
+    events = build_primary_events(
+        symbol,
+        df=df,
+        feature_frame=feature_frame,
+        log_trend=log_trend,
+        log_residual=log_residual,
+        event_config=event_definition,
+        horizon=horizon,
+    )
+    if len(events) < min_primary_events:
+        raise ValueError(f"static primary_events {len(events)} < min_primary_events {min_primary_events}")
+
+    outcome = synthetic_outcome_for_runtime_candidate(
+        events,
+        model=model,
+        barrier_config=barrier_config,
+        labeling_config=labeling_config,
+        symbol_seed=deterministic_symbol_seed(base_seed, symbol),
+        exit_definition=exit_definition,
+        symbol=symbol,
+        show_progress=show_progress,
+    )
+    screen_row = candidate_screen_row(
+        candidate_id=candidate_id,
+        event_definition=event_definition,
+        exit_definition=exit_definition,
+        outcome=outcome,
+        label_threshold=float(labeling_config.get("label_threshold", 0.0)),
+        n_events=len(events),
+    )
+    screen_result = pd.DataFrame([screen_row])
+    screen_result["screen_rank"] = 1
+    if not bool(screen_row["screen_eligible_for_meta"]):
+        reason = (
+            "static runtime candidate labels are not meta-eligible: "
+            f"positive_rate={screen_row['screen_label_positive_rate']:.6g}"
+        )
+        LOGGER.warning("%s %s", symbol, reason)
+        result = screening_only_candidate_result(
+            screen_row=screen_row,
+            events=events,
+            outcome=outcome,
+            status="skipped_single_class_labels",
+            error=reason,
+        )
+    else:
+        try:
+            result = run_meta_model_candidate(
+                events,
+                outcome=outcome,
+                feature_frame=feature_frame,
+                close=close,
+                volatility=volatility,
+                meta_config=meta_config,
+                bagging_config=bagging_config,
+                labeling_config=labeling_config,
+                candidate_id=candidate_id,
+                event_definition=event_definition,
+                exit_definition=exit_definition,
+                min_accepted_events=min_accepted_events,
+                symbol=symbol,
+                output_dir=diagnostics_dir / candidate_id if diagnostics_dir is not None else None,
+                show_progress=show_progress,
+            )
+            result["meta_validation_status"] = "success"
+            result["meta_validation_error"] = None
+        except ValueError as exc:
+            reason = str(exc)
+            LOGGER.warning("%s static runtime candidate meta validation failed: %s", symbol, reason)
+            result = screening_only_candidate_result(
+                screen_row=screen_row,
+                events=events,
+                outcome=outcome,
+                status="failed",
+                error=reason,
+            )
+    candidate_result = sort_candidate_results(pd.DataFrame([result]))
+    candidate_result["selected_for_runtime"] = True
+    top_candidates = candidate_result.copy()
+    top_candidates["runtime_strategy_candidate"] = [payload]
+    static_summary = {
+        "enabled": False,
+        "mode": "static_runtime_candidate",
+        "candidate_id": candidate_id,
+        "min_primary_events": min_primary_events,
+        "min_accepted_events": min_accepted_events,
+        "n_paths_per_event": int(labeling_config.get("n_paths_per_event", 25_000)),
+        "meta_validation_status": result["meta_validation_status"],
+        "meta_validation_error": result["meta_validation_error"],
+    }
+    return events, screen_result, candidate_result, top_candidates, {
+        "runtime_strategy_candidate": payload,
+        "primary_optuna": static_summary,
+    }
+
+
 def optimize_runtime_candidates_with_optuna(
     *,
     symbol: str,
     df: pd.DataFrame,
     feature_frame: pd.DataFrame,
+    close: pd.Series,
+    volatility: pd.Series,
     log_trend: np.ndarray,
     log_residual: np.ndarray,
     model: Any,
@@ -1473,6 +2229,7 @@ def optimize_runtime_candidates_with_optuna(
     labeling_config: dict[str, Any],
     primary_optuna_config: dict[str, Any],
     base_seed: int,
+    diagnostics_dir: Path | None,
     show_progress: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     try:
@@ -1570,6 +2327,9 @@ def optimize_runtime_candidates_with_optuna(
             result = run_meta_model_candidate(
                 events,
                 outcome=outcome,
+                feature_frame=feature_frame,
+                close=close,
+                volatility=volatility,
                 meta_config=meta_config,
                 bagging_config=bagging_config,
                 labeling_config=optuna_labeling_config,
@@ -1578,6 +2338,7 @@ def optimize_runtime_candidates_with_optuna(
                 exit_definition=exit_definition,
                 min_accepted_events=min_accepted_events,
                 symbol=symbol,
+                output_dir=diagnostics_dir / candidate_id if diagnostics_dir is not None else None,
                 show_progress=show_progress,
             )
         except ValueError as exc:
@@ -1656,9 +2417,11 @@ def backtest_symbol(
     ou_config = section(synthetic_config, "ou_process")
     barrier_config = section(strategy_config, "barrier_optimization")
     event_config = section(strategy_config, "event_definition")
+    runtime_config = section(strategy_config, "runtime_strategy")
     primary_optuna_config = section(strategy_config, "primary_optuna")
     meta_config = section(strategy_config, "meta_model")
     bagging_config = section(strategy_config, "sequential_bagging")
+    feature_config = section(strategy_config, "feature_engineering")
     labeling_config = dict(section(strategy_config, "synthetic_labeling"))
     if cli_n_paths_per_event is not None:
         labeling_config["n_paths_per_event"] = cli_n_paths_per_event
@@ -1678,6 +2441,7 @@ def backtest_symbol(
         bagging_config=bagging_config,
         labeling_config=labeling_config,
         primary_optuna_config=primary_optuna_config,
+        feature_config=feature_config,
     )
     if not force:
         cached = load_cached_summary(summary_path, fingerprint)
@@ -1686,7 +2450,7 @@ def backtest_symbol(
             return cached
 
     price_column = str(price_model_config.get("price_column", "close"))
-    df = read_real_bars(input_csv, price_column=price_column)
+    df = frame_with_datetime_index(read_real_bars(input_csv, price_column=price_column))
     LOGGER.info("%s loaded bars: rows=%s price_column=%s", symbol, f"{len(df):,}", price_column)
     model = fit_joint_trend_ou_model(
         df,
@@ -1697,47 +2461,76 @@ def backtest_symbol(
         barrier_config=barrier_config,
     )
     LOGGER.info(
-        "%s fitted model: ou_phi=%.6g half_life_bars=%.3f horizon_vol=%.6g",
+        "%s fitted model: ou_phi=%.6g half_life_bars=%.3f ewma_1bar_vol=%.6g",
         symbol,
         model.ou_phi,
         model.ou_half_life_bars,
-        model.observed_horizon_volatility,
+        model.observed_ewma_1bar_log_return_volatility,
     )
-    features, log_trend, log_residual = event_state_features(
+    features, log_trend, log_residual, volatility = build_synthetic_feature_frame(
         df,
         price_column=price_column,
         fair_value_config=fair_value_config,
         event_config=event_config,
+        barrier_config=barrier_config,
+        feature_config=feature_config,
     )
+    close = df[price_column].dropna().astype(float)
+    symbol_output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir = symbol_output_dir / "feature_diagnostics"
     horizon = int(barrier_config.get("vertical_barrier_bars", 80))
-    if not bool(primary_optuna_config.get("enabled", False)):
-        raise ValueError(
-            "Synthetic workflow requires primary_optuna.enabled=true; "
-            "configure the 8D runtime candidate search.",
-        )
 
-    LOGGER.info("%s primary Optuna search enabled: n_trials=%s", symbol, primary_optuna_config.get("n_trials", 32))
-    events, screen_result, candidate_result, top_candidates_frame, optuna_artifacts = (
-        optimize_runtime_candidates_with_optuna(
-            symbol=symbol,
-            df=df,
-            feature_frame=features,
-            log_trend=log_trend,
-            log_residual=log_residual,
-            model=model,
-            event_config=event_config,
-            barrier_config=barrier_config,
-            meta_config=meta_config,
-            bagging_config=bagging_config,
-            labeling_config=labeling_config,
-            primary_optuna_config=primary_optuna_config,
-            base_seed=int(labeling_config.get("random_seed", 1729)),
-            show_progress=show_progress,
+    if bool(primary_optuna_config.get("enabled", False)):
+        LOGGER.info("%s primary Optuna search enabled: n_trials=%s", symbol, primary_optuna_config.get("n_trials", 32))
+        events, screen_result, candidate_result, top_candidates_frame, optuna_artifacts = (
+            optimize_runtime_candidates_with_optuna(
+                symbol=symbol,
+                df=df,
+                feature_frame=features,
+                close=close,
+                volatility=volatility,
+                log_trend=log_trend,
+                log_residual=log_residual,
+                model=model,
+                event_config=event_config,
+                barrier_config=barrier_config,
+                meta_config=meta_config,
+                bagging_config=bagging_config,
+                labeling_config=labeling_config,
+                primary_optuna_config=primary_optuna_config,
+                base_seed=int(labeling_config.get("random_seed", 1729)),
+                diagnostics_dir=diagnostics_dir,
+                show_progress=show_progress,
+            )
         )
-    )
+        selection_rule = "Optuna primary/exit candidates with purged walk-forward meta validation"
+    else:
+        LOGGER.info("%s primary Optuna disabled: evaluating static runtime candidate", symbol)
+        events, screen_result, candidate_result, top_candidates_frame, optuna_artifacts = (
+            evaluate_static_runtime_candidate(
+                symbol=symbol,
+                df=df,
+                feature_frame=features,
+                close=close,
+                volatility=volatility,
+                log_trend=log_trend,
+                log_residual=log_residual,
+                model=model,
+                event_config=event_config,
+                barrier_config=barrier_config,
+                runtime_config=runtime_config,
+                meta_config=meta_config,
+                bagging_config=bagging_config,
+                labeling_config=labeling_config,
+                primary_optuna_config=primary_optuna_config,
+                base_seed=int(labeling_config.get("random_seed", 1729)),
+                diagnostics_dir=diagnostics_dir,
+                show_progress=show_progress,
+            )
+        )
+        selection_rule = "Static primary/exit runtime candidate with purged walk-forward meta validation"
     outcome_unit = barrier_unit(model, barrier_config)
 
-    symbol_output_dir.mkdir(parents=True, exist_ok=True)
     events_path = symbol_output_dir / f"{symbol}_primary_events.csv"
     screen_path = symbol_output_dir / f"{symbol}_synthetic_ml_screening.csv"
     candidates_path = symbol_output_dir / f"{symbol}_synthetic_ml_runtime_candidates.csv"
@@ -1766,12 +2559,14 @@ def backtest_symbol(
         "round_trip_cost": round_trip_cost_from_labeling_config(labeling_config),
         "screening": {
             "candidate_points": len(candidate_result),
-            "selection_rule": "Optuna primary/exit candidates with purged walk-forward meta validation",
+            "selection_rule": selection_rule,
             "top_synthetic_candidate": screen_result.iloc[0].to_dict(),
         },
         "primary_optuna": optuna_artifacts["primary_optuna"],
         "event_definition": event_config,
         "meta_model": meta_config,
+        "feature_engineering": feature_config,
+        "n_meta_features": int(features.shape[1]),
         "sequential_bagging": bagging_config,
         "synthetic_labeling": labeling_config,
         "strategy_config_path": strategy_config.get("_strategy_config_path"),
@@ -1781,7 +2576,6 @@ def backtest_symbol(
             "ou_half_life_bars": model.ou_half_life_bars,
             "ou_innovation_std": model.ou_innovation_std,
             "observed_ewma_1bar_log_return_volatility": model.observed_ewma_1bar_log_return_volatility,
-            "observed_horizon_volatility": model.observed_horizon_volatility,
         },
         "best": best,
         "top_candidates": top_candidates,
@@ -1811,7 +2605,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-csv", default=None, help="Only valid with one --symbols value.")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--n-paths-per-event", type=int, default=None)
-    parser.add_argument("--strategy-config", default=None)
+    parser.add_argument(
+        "--strategy-config",
+        default=None,
+        help=f"Override strategy JSON path (default: {DEFAULT_SYNTHETIC_STRATEGY_CONFIG}).",
+    )
     parser.add_argument("--force", action="store_true", help="Ignore cached symbol outputs and retrain.")
     parser.add_argument(
         "--log-level",
@@ -1827,7 +2625,7 @@ def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
     config = load_afml_data_config(args.config)
-    strategy_config = load_strategy_config(config, args.strategy_config)
+    strategy_config = load_strategy_config(config, args.strategy_config or DEFAULT_SYNTHETIC_STRATEGY_CONFIG)
     output_dir = (
         resolve_repo_path(args.output_dir)
         if args.output_dir is not None

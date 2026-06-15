@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------
-# Generate AFML dollar runs bars (DRB) directly from Binance aggTrades archives.
+# Generate AFML dollar imbalance bars (DIB) directly from Binance aggTrades archives.
 #
 # This file is intentionally a user-facing entrypoint:
 # edit afml_strategies/afml_data_config.json, then run this file from VSCode.
@@ -38,7 +38,7 @@ from afml_strategies.config_loader import resolve_repo_path
 from afml_strategies.config_loader import section
 from afml_strategies.config_loader import string_tuple
 from nautilus_trader.data.afml_bars import AfmlBarMeta
-from nautilus_trader.data.afml_bars import AfmlDollarRunsBarAggregator
+from nautilus_trader.data.afml_bars import AfmlDollarImbalanceBarAggregator
 from nautilus_trader.data.afml_bars import estimate_afml_dollar_expectations
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarAggregation
@@ -77,13 +77,13 @@ GENERATION_END = GENERATION_END_CONFIG
 
 PRODUCT = str(REAL_DATA_CONFIG.get("product", "um"))
 THRESHOLD_ROLLING_WINDOW_DAYS = int(REAL_DATA_CONFIG.get("threshold_rolling_window_days", 30))
-THRESHOLD_DAILY_NOTIONAL_DIVISOR = int(REAL_DATA_CONFIG.get("threshold_daily_notional_divisor", 200))
+THRESHOLD_DAILY_NOTIONAL_DIVISOR = int(REAL_DATA_CONFIG.get("threshold_daily_notional_divisor", 250))
 THRESHOLD_UPDATE_FREQUENCY = str(REAL_DATA_CONFIG.get("threshold_update_frequency", "monthly"))
 THRESHOLD_MIN_LOOKBACK_DAYS = int(REAL_DATA_CONFIG.get("threshold_min_lookback_days", 7))
 TARGET_BARS_PER_DAY = THRESHOLD_DAILY_NOTIONAL_DIVISOR
 EWMA_SPAN = int(REAL_DATA_CONFIG.get("ewma_span", 20))
 
-# Keep E[T] fixed to the target density. The DRB side/notional expectations
+# Keep E[T] fixed to the target density. The DIB side/notional expectations
 # still update online after each closed bar.
 UPDATE_EXPECTED_TICKS = bool(REAL_DATA_CONFIG.get("update_expected_ticks", False))
 INCREMENTAL_ENABLED = bool(INCREMENTAL_CONFIG.get("enabled", False))
@@ -289,7 +289,7 @@ def make_binance_perpetual(symbol: str, paths: list[Path]) -> CryptoPerpetual:
 def make_bar_type(instrument, target_bars_per_day: int) -> BarType:
     return BarType(
         instrument.id,
-        BarSpecification(target_bars_per_day, BarAggregation.VALUE_RUNS, PriceType.LAST),
+        BarSpecification(target_bars_per_day, BarAggregation.VALUE_IMBALANCE, PriceType.LAST),
     )
 
 
@@ -808,7 +808,7 @@ class NotionalThresholdSchedule:
         return self.thresholds[position]
 
 
-class StreamingDrbCsvWriter:
+class StreamingDibCsvWriter:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -846,7 +846,7 @@ class StreamingDrbCsvWriter:
     def handle(self, bar: Bar, meta: AfmlBarMeta) -> None:
         self.writer.writerow(
             {
-                "bar_type": "AFML_DRB",
+                "bar_type": "AFML_DIB",
                 "ts_event": ns_to_iso(bar.ts_event),
                 "ts_event_ns": bar.ts_event,
                 "open": str(bar.open),
@@ -965,7 +965,7 @@ def threshold_plan_path(symbol: str) -> Path:
     stem = (
         f"{symbol}_{THRESHOLD_HISTORY_START.replace('-', '')}_{GENERATION_START.replace('-', '')}"
         f"_{GENERATION_END.replace('-', '')}_{THRESHOLD_ROLLING_WINDOW_DAYS}d"
-        f"_{THRESHOLD_UPDATE_FREQUENCY}_{TARGET_BARS_PER_DAY}tpd_DRB_threshold_plan.json"
+        f"_{THRESHOLD_UPDATE_FREQUENCY}_{TARGET_BARS_PER_DAY}tpd_DIB_threshold_plan.json"
     )
     return CALIBRATION_OUTPUT_DIR / symbol / stem
 
@@ -973,7 +973,7 @@ def threshold_plan_path(symbol: str) -> Path:
 def expected_threshold_plan_config(symbol: str) -> dict:
     return {
         "symbol": symbol,
-        "kind": "DRB",
+        "kind": "DIB",
         "threshold_method": "rolling_daily_notional_sma",
         "threshold_history_start": THRESHOLD_HISTORY_START,
         "generation_start": GENERATION_START,
@@ -1028,7 +1028,7 @@ def latest_reusable_threshold_plan(symbol: str) -> dict | None:
 
     latest_payload: dict | None = None
     latest_end: date | None = None
-    for path in plan_dir.glob("*_DRB_threshold_plan.json"):
+    for path in plan_dir.glob("*_DIB_threshold_plan.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1104,9 +1104,9 @@ def load_or_create_threshold_plan(symbol_arg: str) -> dict:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         mismatch_reason = threshold_plan_mismatch_reason(payload, symbol)
         if mismatch_reason is None:
-            print(f"{symbol} resume: using DRB threshold plan -> {output_path}")
+            print(f"{symbol} resume: using DIB threshold plan -> {output_path}")
             return payload
-        print(f"{symbol} resume: ignoring stale DRB threshold plan ({mismatch_reason}) -> {output_path}")
+        print(f"{symbol} resume: ignoring stale DIB threshold plan ({mismatch_reason}) -> {output_path}")
 
     history_start = parse_date(THRESHOLD_HISTORY_START)
     generation_start = parse_date(GENERATION_START)
@@ -1154,15 +1154,19 @@ def output_label(symbol: str, start: date, end: date) -> str:
     return f"{symbol}_{start:%Y%m%d}_{end:%Y%m%d}_{TARGET_BARS_PER_DAY}tpd"
 
 
+def output_label_with_kind(symbol: str, start: date, end: date) -> str:
+    return f"{output_label(symbol, start, end)}_DIB"
+
+
 def cumulative_catalog_path(symbol: str, end: date) -> Path:
     start = parse_date(GENERATION_START_FALLBACK if INCREMENTAL_ENABLED else GENERATION_START_CONFIG)
-    return CATALOG_DIR / symbol / output_label(symbol, start, end)
+    return CATALOG_DIR / symbol / output_label_with_kind(symbol, start, end)
 
 
 def summary_matches_generation_config(payload: dict, symbol: str) -> bool:
     expected = {
         "symbol": symbol,
-        "kind": "DRB",
+        "kind": "DIB",
         "threshold_method": "rolling_daily_notional_sma",
         "threshold_history_start": THRESHOLD_HISTORY_START,
         "threshold_rolling_window_days": THRESHOLD_ROLLING_WINDOW_DAYS,
@@ -1184,7 +1188,7 @@ def matching_generated_summaries(symbol_arg: str) -> list[dict]:
         return []
 
     summaries: list[dict] = []
-    for summary_path in symbol_dir.glob("*_DRB_summary.json"):
+    for summary_path in symbol_dir.glob("*_DIB_summary.json"):
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1360,7 +1364,7 @@ def completed_csv_summary_matches(  # noqa: C901
         return None
     expected = {
         "symbol": symbol,
-        "kind": "DRB",
+        "kind": "DIB",
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
         "threshold_method": "rolling_daily_notional_sma",
@@ -1389,7 +1393,7 @@ def completed_csv_summary_matches(  # noqa: C901
     return summary
 
 
-def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
+def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     started = time.perf_counter()
     symbol = normalize_symbol(symbol_arg)
     start = parse_date(GENERATION_START)
@@ -1409,10 +1413,11 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     target_bars_total = TARGET_BARS_PER_DAY * days
 
     label = output_label(symbol, start, end)
-    catalog_path, append_existing_catalog = catalog_path_for_generation(symbol, label)
+    catalog_label = output_label_with_kind(symbol, start, end)
+    catalog_path, append_existing_catalog = catalog_path_for_generation(symbol, catalog_label)
     output_dir = OUTPUT_DIR / symbol
-    output_path = output_dir / f"{label}_DRB.csv"
-    summary_path = output_dir / f"{label}_DRB_summary.json"
+    output_path = output_dir / f"{label}_DIB.csv"
+    summary_path = output_dir / f"{label}_DIB_summary.json"
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
 
     if RESUME_COMPLETED_CSV:
@@ -1427,7 +1432,7 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
         )
         if existing_summary is not None:
             print(
-                f"{symbol} resume: found completed DRB CSV "
+                f"{symbol} resume: found completed DIB CSV "
                 f"bars={int(existing_summary['bars']):,} -> {output_path}",
             )
             return
@@ -1461,13 +1466,13 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     expectations = estimate_afml_dollar_expectations(expectation_ticks, expectation_target)
 
     print(
-        f"{symbol} DRB generation={start:%Y-%m-%d}..{end:%Y-%m-%d} "
+        f"{symbol} DIB generation={start:%Y-%m-%d}..{end:%Y-%m-%d} "
         f"threshold=daily_notional_sma({THRESHOLD_ROLLING_WINDOW_DAYS}d)/"
         f"{THRESHOLD_DAILY_NOTIONAL_DIVISOR} "
         f"update={THRESHOLD_UPDATE_FREQUENCY} ewma_span={ewma_span}",
     )
 
-    writer = StreamingDrbCsvWriter(output_path)
+    writer = StreamingDibCsvWriter(output_path)
     catalog_sink = (
         MonthlyCatalogSink(
             catalog_path=catalog_path,
@@ -1478,7 +1483,7 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
         else NullCatalogSink()
     )
     bar_type = make_bar_type(instrument, TARGET_BARS_PER_DAY)
-    aggregator = AfmlDollarRunsBarAggregator(
+    aggregator = AfmlDollarImbalanceBarAggregator(
         instrument=instrument,
         bar_type=bar_type,
         handler=catalog_sink.append,
@@ -1503,7 +1508,7 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
             aggregator.handle_trade_tick(tick)
             ticks_processed += 1
             if ticks_processed % 5_000_000 == 0:
-                print(f"processed ticks={ticks_processed:,} DRB={writer.count:,}")
+                print(f"processed ticks={ticks_processed:,} DIB={writer.count:,}")
     finally:
         catalog_sink.close()
         writer.close()
@@ -1517,7 +1522,7 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     summary = {
         "symbol": symbol,
         "instrument_id": str(instrument.id),
-        "kind": "DRB",
+        "kind": "DIB",
         "source": "Binance Vision futures aggregate trades",
         "input_archives": [str(path) for path in generation_paths],
         "start_date": start.isoformat(),
@@ -1555,7 +1560,7 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"wrote DRB bars={writer.count:,} avg/day={writer.count / days:.2f} -> {output_path}")
+    print(f"wrote DIB bars={writer.count:,} avg/day={writer.count / days:.2f} -> {output_path}")
     if final_catalog_path is not None:
         print(f"wrote Nautilus catalog -> {final_catalog_path}")
     print(f"wrote summary -> {summary_path}")
@@ -1564,7 +1569,7 @@ def generate_drb_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
 def main() -> None:
     target_end = resolve_generation_end(GENERATION_END_CONFIG, incremental=INCREMENTAL_ENABLED)
     print(
-        "AFML DRB from Binance aggTrades "
+        "AFML DIB from Binance aggTrades "
         f"threshold_history={THRESHOLD_HISTORY_START}..{target_end:%Y-%m-%d} "
         f"threshold=daily_notional_sma({THRESHOLD_ROLLING_WINDOW_DAYS}d)/"
         f"{THRESHOLD_DAILY_NOTIONAL_DIVISOR} "
@@ -1584,7 +1589,7 @@ def main() -> None:
         print(f"\n[{index}/{len(SYMBOLS)}] {normalized}")
         print(f"{normalized} generation range {GENERATION_START}..{GENERATION_END}")
         threshold_payload = load_or_create_threshold_plan(symbol)
-        generate_drb_for_symbol(symbol, threshold_payload)
+        generate_dib_for_symbol(symbol, threshold_payload)
 
 
 if __name__ == "__main__":

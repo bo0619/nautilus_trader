@@ -1,6 +1,6 @@
 {
   "symbol": "BTCUSDT",
-  "kind": "DRB",
+  "kind": "DIB",
   "threshold_method": "rolling_daily_notional_sma",
   "threshold_history_start": "2025-01-01",
   "generation_start": "2025-02-01",
@@ -680,5 +680,5 @@
       "threshold": 42965216.87566408
     }
   ],
-  "elapsed_seconds": 1923.998
+  "elapsed_seconds": 47.058
 }

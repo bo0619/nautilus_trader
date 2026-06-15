@@ -24,7 +24,6 @@ from afml_scripts.backtest_synthetic_barriers_ml import (  # noqa: E402
 )
 from afml_scripts.generate_ou_residual_synthetic import configured_symbols  # noqa: E402
 from afml_scripts.generate_ou_residual_synthetic import input_csv_for_symbol  # noqa: E402
-from afml_scripts.generate_ou_residual_synthetic import load_strategy_config  # noqa: E402
 from afml_scripts.generate_ou_residual_synthetic import normalize_symbol  # noqa: E402
 from afml_scripts.generate_ou_residual_synthetic import read_real_bars  # noqa: E402
 from afml_strategies.config_loader import load_afml_data_config  # noqa: E402
@@ -74,7 +73,15 @@ from nautilus_trader.research.afml_pipeline import write_signal_csv  # noqa: E40
 
 
 DEFAULT_OUTPUT_DIR = Path("afml_strategies/output/cvdslope_main")
+DEFAULT_REAL_STRATEGY_CONFIG = Path("afml_strategies/cvdslope_nooptuna.json")
+DEFAULT_CALENDAR_WINDOWS = ("1D", "3D", "7D", "14D", "30D")
 BINANCE = Venue("BINANCE")
+EXIT_MULTIPLIER_KEYS = (
+    "long_profit_taking_mult",
+    "long_stop_loss_mult",
+    "short_profit_taking_mult",
+    "short_stop_loss_mult",
+)
 
 
 @dataclass(frozen=True)
@@ -188,77 +195,27 @@ class CvdSlopeRuleSideModel:
     requires_event_spans = False
 
     def __init__(self, event_config: dict[str, Any]) -> None:
-        long_config = event_config.get("long", {})
-        short_config = event_config.get("short", {})
+        long_config = event_config.get("long")
+        short_config = event_config.get("short")
         if not isinstance(long_config, dict):
-            raise TypeError("event_definition.long must be a JSON object when provided")
+            raise TypeError("event_definition.long must be a JSON object")
         if not isinstance(short_config, dict):
-            raise TypeError("event_definition.short must be a JSON object when provided")
+            raise TypeError("event_definition.short must be a JSON object")
 
-        self.long_trend_r2_min = float(
-            self._first_config_value(
-                long_config.get("r2_threshold"),
-                event_config.get("long_r2_threshold"),
-                event_config.get("r2_threshold"),
-                0.488,
-            ),
-        )
-        self.short_trend_r2_min = float(
-            self._first_config_value(
-                short_config.get("r2_threshold"),
-                event_config.get("short_r2_threshold"),
-                event_config.get("r2_threshold"),
-                0.488,
-            ),
-        )
-        self.long_slope_min = float(
-            self._first_config_value(
-                long_config.get("micro_slope_min"),
-                event_config.get("long_micro_slope_min"),
-                0.0,
-            ),
-        )
-        self.short_slope_max = float(
-            self._first_config_value(
-                short_config.get("micro_slope_max"),
-                event_config.get("short_micro_slope_max"),
-                0.0,
-            ),
-        )
-        self.long_cvd_z_min = float(
-            self._first_config_value(
-                long_config.get("cvd_z_min"),
-                event_config.get("long_cvd_z_min"),
-                1.5,
-            ),
-        )
-        self.short_cvd_z_max = self._short_cvd_z_threshold(event_config, short_config)
+        self.long_trend_r2_min = self._required_float(long_config, "r2_threshold", "event_definition.long")
+        self.short_trend_r2_min = self._required_float(short_config, "r2_threshold", "event_definition.short")
+        self.long_slope_min = self._required_float(long_config, "micro_slope_min", "event_definition.long")
+        self.short_slope_max = self._required_float(short_config, "micro_slope_max", "event_definition.short")
+        self.long_cvd_z_min = self._required_float(long_config, "cvd_z_min", "event_definition.long")
+        self.short_cvd_z_max = self._required_float(short_config, "cvd_z_max", "event_definition.short")
         self.classes_ = np.array([-1, 0, 1], dtype=int)
         self.feature_names_: list[str] | None = None
 
     @staticmethod
-    def _first_config_value(*values: Any) -> Any:
-        for value in values:
-            if value is not None:
-                return value
-        return None
-
-    @classmethod
-    def _short_cvd_z_threshold(cls, event_config: dict[str, Any], short_config: dict[str, Any]) -> float:
-        value = cls._first_config_value(
-            short_config.get("cvd_z_max"),
-            event_config.get("short_cvd_z_max"),
-        )
-        if value is not None:
-            return float(value)
-        abs_value = cls._first_config_value(
-            short_config.get("cvd_z_min"),
-            short_config.get("cvd_z_abs_min"),
-            event_config.get("short_cvd_z_min"),
-            event_config.get("short_cvd_z_abs_min"),
-            1.5,
-        )
-        return -abs(float(abs_value))
+    def _required_float(config: dict[str, Any], key: str, path: str) -> float:
+        if key not in config:
+            raise ValueError(f"{path}.{key} is required")
+        return float(config[key])
 
     def fit(
         self,
@@ -316,7 +273,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--config", default=None, help="Path to AFML data config JSON.")
-    parser.add_argument("--strategy-config", default=None, help="Path to cvdslope strategy JSON.")
+    parser.add_argument(
+        "--strategy-config",
+        default=None,
+        help=f"Override strategy JSON path (default: {DEFAULT_REAL_STRATEGY_CONFIG}).",
+    )
     parser.add_argument("--symbols", nargs="+", default=None)
     parser.add_argument("--input-csv", default=None, help="Only valid with one --symbols value.")
     parser.add_argument("--output-dir", default=None)
@@ -334,14 +295,8 @@ def parse_args() -> argparse.Namespace:
         help="Training lookback before the embargo. Use 0 for all available history.",
     )
     parser.add_argument("--price-column", default=None)
-    parser.add_argument("--pt-mult", type=float, default=None)
-    parser.add_argument("--sl-mult", type=float, default=None)
     parser.add_argument("--vertical-barrier-bars", type=int, default=None)
-    parser.add_argument("--volatility-span", type=int, default=None)
-    parser.add_argument("--volatility-lookback-days", type=int, default=None)
     parser.add_argument("--volatility-ewma-span", type=int, default=None)
-    parser.add_argument("--volatility-horizon-bars", type=int, default=None)
-    parser.add_argument("--volatility-window-bars", type=int, default=None)
     parser.add_argument("--volatility-floor-quantile", type=float, default=None)
     parser.add_argument("--cusum-window", type=int, default=None)
     parser.add_argument("--cusum-threshold-mult", type=float, default=None)
@@ -350,7 +305,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oldest-weight", type=float, default=None)
     parser.add_argument("--rare-label-min-pct", type=float, default=None)
     parser.add_argument("--meta-label-min-ret", type=float, default=None)
-    parser.add_argument("--primary-probability-threshold", type=float, default=None)
     parser.add_argument("--meta-probability-threshold", type=float, default=None)
     parser.add_argument("--n-estimators", type=int, default=None)
     parser.add_argument("--max-features", default=None)
@@ -368,6 +322,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-fracdiff-threshold", type=float, default=None)
     parser.add_argument("--microstructure-window", type=int, default=None)
     parser.add_argument("--information-window", type=int, default=None)
+    parser.add_argument(
+        "--calendar-windows",
+        default=None,
+        help="Comma-separated calendar windows for regime features, or 'none' to disable.",
+    )
+    parser.add_argument("--calendar-min-periods", type=int, default=None)
+    parser.add_argument("--tail-quantile", type=float, default=None)
+    parser.add_argument("--robust-z-clip", type=float, default=None)
     parser.add_argument("--bet-size-step", type=float, default=None)
     parser.add_argument("--trade-notional", type=Decimal, default=None)
     parser.add_argument("--starting-balance", type=Decimal, default=None)
@@ -387,10 +349,37 @@ def first_not_none(*values: Any) -> Any:
     return None
 
 
+def parse_calendar_windows(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in {"", "none", "null", "off", "false"}:
+            return None
+        windows = tuple(item.strip() for item in text.split(",") if item.strip())
+    elif isinstance(value, (list, tuple)):
+        windows = tuple(str(item).strip() for item in value if str(item).strip())
+    else:
+        raise TypeError("calendar_windows must be a string, list, tuple, or null")
+    return windows or None
+
+
+def load_real_strategy_config(config: dict[str, Any], cli_path: str | None = None) -> dict[str, Any]:
+    strategy_path_value = cli_path or DEFAULT_REAL_STRATEGY_CONFIG
+    strategy_path = resolve_repo_path(strategy_path_value)
+    if not strategy_path.exists():
+        raise FileNotFoundError(f"Real strategy config does not exist: {strategy_path}")
+
+    payload = json.loads(strategy_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Real strategy config root must be a JSON object: {strategy_path}")
+    payload["_strategy_config_path"] = str(strategy_path)
+    return payload
+
+
 def apply_json_defaults(args: argparse.Namespace, strategy_config: dict[str, Any]) -> argparse.Namespace:
     workflow = section(strategy_config, "real_data_workflow")
     labeling = section(strategy_config, "real_data_labeling")
-    barrier_config = section(strategy_config, "barrier_optimization")
     features = section(strategy_config, "feature_engineering")
     meta_config = section(strategy_config, "meta_model")
     backtest = section(strategy_config, "backtest")
@@ -407,32 +396,11 @@ def apply_json_defaults(args: argparse.Namespace, strategy_config: dict[str, Any
     args.run_backtest = bool(workflow.get("run_backtest", True)) and not args.no_backtest
     args.no_progress = args.no_progress or not bool(workflow.get("show_progress", True))
 
-    args.volatility_span = int(first_not_none(args.volatility_span, labeling.get("volatility_span"), 100))
-    args.volatility_lookback_days = int(
-        first_not_none(args.volatility_lookback_days, labeling.get("volatility_lookback_days"), 1),
-    )
     args.volatility_ewma_span = int(
         first_not_none(
             args.volatility_ewma_span,
             labeling.get("volatility_ewma_span"),
-            labeling.get("volatility_span"),
             80,
-        ),
-    )
-    args.volatility_horizon_bars = int(
-        first_not_none(
-            args.volatility_horizon_bars,
-            labeling.get("volatility_horizon_bars"),
-            barrier_config.get("volatility_horizon_bars"),
-            barrier_config.get("vertical_barrier_bars"),
-            80,
-        ),
-    )
-    args.volatility_window_bars = int(
-        first_not_none(
-            args.volatility_window_bars,
-            labeling.get("volatility_window_bars"),
-            args.volatility_horizon_bars,
         ),
     )
     args.volatility_floor_quantile = float(
@@ -462,14 +430,21 @@ def apply_json_defaults(args: argparse.Namespace, strategy_config: dict[str, Any
     args.information_window = int(
         first_not_none(args.information_window, features.get("information_window"), 64),
     )
-
-    args.primary_probability_threshold = float(
-        first_not_none(
-            args.primary_probability_threshold,
-            meta_config.get("primary_probability_threshold"),
-            0.0,
-        ),
+    calendar_windows_value = args.calendar_windows
+    if calendar_windows_value is None:
+        calendar_windows_value = features.get("calendar_windows", DEFAULT_CALENDAR_WINDOWS)
+    args.calendar_windows = parse_calendar_windows(calendar_windows_value)
+    args.calendar_min_periods = int(
+        first_not_none(args.calendar_min_periods, features.get("calendar_min_periods"), 8),
     )
+    args.tail_quantile = float(
+        first_not_none(args.tail_quantile, features.get("tail_quantile"), 0.99),
+    )
+    robust_z_clip_value = args.robust_z_clip
+    if robust_z_clip_value is None:
+        robust_z_clip_value = features.get("robust_z_clip", 5.0)
+    args.robust_z_clip = None if robust_z_clip_value is None else float(robust_z_clip_value)
+
     args.meta_probability_threshold = first_not_none(
         args.meta_probability_threshold,
         meta_config.get("class_probability_threshold"),
@@ -481,6 +456,7 @@ def apply_json_defaults(args: argparse.Namespace, strategy_config: dict[str, Any
     args.progress_interval = int(
         first_not_none(args.progress_interval, meta_config.get("progress_interval"), 1),
     )
+    args.embargo_bars = int(first_not_none(args.embargo_bars, meta_config.get("embargo_bars"), 80))
     args.pca_components = first_not_none(args.pca_components, meta_config.get("pca_components"))
     args.pca_random_state = int(first_not_none(args.pca_random_state, meta_config.get("pca_random_state"), 42))
     args.bet_size_step = float(first_not_none(args.bet_size_step, meta_config.get("bet_size_step"), 0.1))
@@ -619,37 +595,20 @@ def threshold_binary_prediction(
 def primary_side_frame_from_rule(
     model: CvdSlopeRuleSideModel,
     features: pd.DataFrame,
-    *,
-    probability_threshold: float,
 ) -> pd.DataFrame:
-    if not 0.0 <= probability_threshold <= 1.0:
-        raise ValueError("primary_probability_threshold must be in [0, 1]")
     features = features.replace([np.inf, -np.inf], np.nan).dropna()
-    proba = model.predict_proba(features)
-    predictions = pd.Series(proba.idxmax(axis=1).astype(int), index=proba.index)
-    confidence = proba.max(axis=1)
-    side = predictions.where(confidence >= probability_threshold, 0).astype(int)
-    frame = pd.DataFrame(
+    side = model.primary_side(features).astype(int)
+    return pd.DataFrame(
         {
             "primary_side": side,
-            "primary_prediction": predictions,
-            "primary_confidence": confidence,
+            "primary_prediction": side,
         },
         index=features.index,
     )
-    for column in proba.columns:
-        frame[f"primary_prob_{int(column)}"] = proba[column]
-    frame["primary_prob_margin"] = proba[1] - proba[-1]
-    return frame
 
 
 def make_rule_meta_features(features: pd.DataFrame, primary_frame: pd.DataFrame) -> pd.DataFrame:
-    primary_columns = [
-        column
-        for column in primary_frame.columns
-        if column.startswith("primary_prob_") or column == "primary_confidence"
-    ]
-    return features.join(primary_frame[primary_columns], how="inner")
+    return features.loc[features.index.intersection(primary_frame.index)].copy()
 
 
 def split_dataset_indices_for_window(
@@ -675,6 +634,43 @@ def split_dataset_indices_for_window(
     if train_index.empty or test_index.empty:
         raise ValueError("Explicit train/test split leaves one side empty")
     return train_index, test_index
+
+
+def split_train_validation_indices_for_pruning(
+    dataset: Any,
+    train_index: pd.DatetimeIndex,
+    *,
+    validation_fraction: float,
+    embargo_bars: int,
+) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("mda_pruning_validation_fraction must be in (0, 1)")
+    ordered = pd.DatetimeIndex(train_index).intersection(dataset.X.index).sort_values()
+    if len(ordered) < 4:
+        raise ValueError("MDA pruning requires at least four training events")
+
+    split_pos = int(np.floor(len(ordered) * (1.0 - validation_fraction)))
+    split_pos = max(1, min(split_pos, len(ordered) - 1))
+    validation_index = pd.DatetimeIndex(ordered[split_pos:])
+    inner_train_index = pd.DatetimeIndex(ordered[:split_pos])
+    validation_start = validation_index.min()
+
+    if int(embargo_bars) > 0:
+        bar_index = pd.DatetimeIndex(dataset.close.index).sort_values()
+        if not bar_index.empty:
+            validation_start_pos = int(bar_index.searchsorted(validation_start, side="left"))
+            embargo_start_pos = max(0, validation_start_pos - int(embargo_bars))
+            embargo_cutoff = bar_index[embargo_start_pos]
+            inner_train_index = pd.DatetimeIndex(inner_train_index[inner_train_index <= embargo_cutoff])
+
+    if "t1" in dataset.events.columns and not inner_train_index.empty:
+        event_end = pd.to_datetime(dataset.events.loc[inner_train_index, "t1"], errors="coerce")
+        purged_index = event_end.index[event_end.isna() | (event_end <= validation_start)]
+        inner_train_index = pd.DatetimeIndex(purged_index)
+
+    if inner_train_index.empty or validation_index.empty:
+        raise ValueError("MDA pruning train/validation split is empty after purge and embargo")
+    return inner_train_index, validation_index
 
 
 def fit_meta_model(
@@ -712,14 +708,6 @@ def replace_dataset_features(dataset: AfmlDataset, features: pd.DataFrame) -> Af
     )
 
 
-def primary_context_feature_columns(columns: pd.Index | list[str]) -> list[str]:
-    return [
-        str(column)
-        for column in columns
-        if str(column).startswith("primary_prob_") or str(column) == "primary_confidence"
-    ]
-
-
 def feature_selection_config(strategy_config: dict[str, Any]) -> dict[str, Any]:
     meta_config = section(strategy_config, "meta_model")
     config = meta_config.get("feature_selection", {})
@@ -741,6 +729,11 @@ def selected_feature_count(
     if top_n is None:
         return available
     return max(1, min(int(top_n), available))
+
+
+def mda_pruning_enabled(strategy_config: dict[str, Any]) -> bool:
+    config = feature_selection_config(strategy_config)
+    return bool(config.get("mda_prune_negative", True))
 
 
 def write_importance_csv(frame: pd.DataFrame, path: Path) -> str | None:
@@ -773,10 +766,9 @@ def fit_rule_meta_model_with_feature_selection(
         if pca_components is None:
             pca_components = section(strategy_config, "meta_model").get("pca_components", 0.95)
         pca_components = float(pca_components)
-        context_columns = primary_context_feature_columns(meta_dataset.X.columns)
-        selectable_columns = [column for column in meta_dataset.X.columns if column not in context_columns]
+        selectable_columns = list(meta_dataset.X.columns)
         if not selectable_columns:
-            raise ValueError("PCA feature selection requires at least one non-primary feature")
+            raise ValueError("PCA feature selection requires at least one feature")
         selectable_dataset = replace_dataset_features(meta_dataset, meta_dataset.features[selectable_columns])
         pca_dataset, pca_transformer = _pca_dataset(
             selectable_dataset,
@@ -808,7 +800,7 @@ def fit_rule_meta_model_with_feature_selection(
             strategy_config=strategy_config,
         )
         selected_raw = pca_importance.head(top_n)["feature"].astype(str).tolist()
-        final_feature_columns = selected_raw + [column for column in context_columns if column in meta_dataset.X]
+        final_feature_columns = selected_raw
         final_dataset = replace_dataset_features(meta_dataset, meta_dataset.features[final_feature_columns])
         pca_train_pred = threshold_binary_prediction(
             pca_model,
@@ -833,18 +825,71 @@ def fit_rule_meta_model_with_feature_selection(
         pca_importance_path = output_dir / f"{symbol}_meta_pca_backprojected_importance.csv"
         diagnostics = {
             "enabled": True,
-            "method": "train_fold_standardize_pca_backproject_select_original",
+            "method": "train_fold_standardize_pca_backproject_select_original_then_mda_negative_prune",
             "pca_components": pca_components,
             "raw_feature_count": len(selectable_columns),
             "pca_component_count": int(pca_dataset.X.shape[1]),
             "selected_raw_feature_count": len(selected_raw),
-            "primary_context_feature_count": len(context_columns),
+            "primary_context_feature_count": 0,
             "selected_feature_count": len(final_feature_columns),
             "selected_features": final_feature_columns,
             "pca_importance_csv": write_importance_csv(pca_importance, pca_importance_path),
             "pca_train_metrics": pca_train_metrics,
             "pca_test_metrics": pca_test_metrics,
         }
+
+        if mda_pruning_enabled(strategy_config):
+            config = feature_selection_config(strategy_config)
+            pruning_validation_fraction = float(config.get("mda_pruning_validation_fraction", 0.25))
+            pruning_train_index, pruning_validation_index = split_train_validation_indices_for_pruning(
+                final_dataset,
+                train_index,
+                validation_fraction=pruning_validation_fraction,
+                embargo_bars=int(args.embargo_bars),
+            )
+            provisional_model = model_from_config(
+                role="meta-mda-prune",
+                strategy_config=strategy_config,
+                args=args,
+                seed_offset=10_000,
+            )
+            provisional_model = fit_meta_model(provisional_model, final_dataset, pruning_train_index)
+            pruning_mda = mda_feature_importance(
+                provisional_model,
+                final_dataset.X.loc[pruning_validation_index],
+                final_dataset.y.loc[pruning_validation_index],
+                sample_weight=final_dataset.sample_weight.loc[pruning_validation_index],
+                n_repeats=int(config.get("mda_repeats", 3)),
+                random_state=int(args.pca_random_state),
+            )
+            retained_features = pruning_mda.loc[pruning_mda["importance"] >= 0.0, "feature"].astype(str).tolist()
+            dropped_features = [
+                feature
+                for feature in final_feature_columns
+                if feature not in set(retained_features)
+            ]
+            if not retained_features:
+                raise ValueError("MDA pruning removed every selected feature; all pruning MDA scores are negative")
+            final_feature_columns = [
+                feature
+                for feature in final_feature_columns
+                if feature in set(retained_features)
+            ]
+            final_dataset = replace_dataset_features(meta_dataset, meta_dataset.features[final_feature_columns])
+            pruning_path = output_dir / f"{symbol}_meta_mda_pruning_importance.csv"
+            diagnostics["mda_pruning_enabled"] = True
+            diagnostics["mda_pruning_csv"] = write_importance_csv(pruning_mda, pruning_path)
+            diagnostics["mda_pruning_candidate_feature_count"] = len(selected_raw)
+            diagnostics["mda_pruning_retained_feature_count"] = len(final_feature_columns)
+            diagnostics["mda_pruning_dropped_feature_count"] = len(dropped_features)
+            diagnostics["mda_pruning_dropped_features"] = dropped_features
+            diagnostics["mda_pruning_validation_fraction"] = pruning_validation_fraction
+            diagnostics["mda_pruning_train_events"] = len(pruning_train_index)
+            diagnostics["mda_pruning_validation_events"] = len(pruning_validation_index)
+            diagnostics["selected_feature_count"] = len(final_feature_columns)
+            diagnostics["selected_features"] = final_feature_columns
+        else:
+            diagnostics["mda_pruning_enabled"] = False
 
     meta_model = model_from_config(
         role="meta",
@@ -930,15 +975,11 @@ def make_rule_meta_signal_frame(
             "prediction": primary_frame["primary_prediction"],
             "confidence": 0.0,
             "primary_side": primary_frame["primary_side"],
-            "primary_confidence": primary_frame["primary_confidence"],
             "meta_probability": 0.0,
             "meta_prediction": 0,
         },
         index=primary_frame.index,
     )
-    for column in primary_frame.columns:
-        if column.startswith("primary_prob_"):
-            frame[column] = primary_frame[column]
 
     if feature_columns is not None:
         meta_features = meta_features.reindex(columns=feature_columns)
@@ -1163,22 +1204,6 @@ def make_train_test_window(  # noqa: C901
     )
 
 
-def barrier_settings(
-    strategy_config: dict[str, Any],
-    args: argparse.Namespace,
-    *,
-    symbol: str,
-) -> tuple[tuple[float, float], int]:
-    exit_config, vertical_bars = directional_barrier_settings(strategy_config, args, symbol=symbol)
-    return (
-        (
-            float(exit_config["profit_taking_mult"]),
-            float(exit_config["stop_loss_mult"]),
-        ),
-        vertical_bars,
-    )
-
-
 def _exit_config_value(config: dict[str, Any] | None, key: str) -> Any:
     if not isinstance(config, dict):
         return None
@@ -1188,21 +1213,30 @@ def _exit_config_value(config: dict[str, Any] | None, key: str) -> Any:
     return config.get(key)
 
 
+def validate_runtime_candidate_exit_definition(candidate: dict[str, Any] | None, *, symbol: str) -> None:
+    if candidate is None:
+        return
+    exit_definition = candidate.get("exit_definition")
+    if not isinstance(exit_definition, dict):
+        raise ValueError(
+            f"Synthetic runtime candidate for {symbol} has no directional exit_definition",
+        )
+    missing = [key for key in EXIT_MULTIPLIER_KEYS if key not in exit_definition]
+    if missing:
+        raise ValueError(
+            f"Synthetic runtime candidate for {symbol} is missing exit_definition keys: {missing}",
+        )
+
+
 def _resolve_exit_multiplier(
     *,
-    cli_value: Any,
     runtime_config: dict[str, Any],
     synthetic_candidate: dict[str, Any] | None,
-    directional_key: str,
-    legacy_key: str,
+    key: str,
     default: float,
 ) -> float:
-    if cli_value is not None:
-        return float(cli_value)
     for config in (runtime_config, synthetic_candidate):
-        value = _exit_config_value(config, directional_key)
-        if value is None:
-            value = _exit_config_value(config, legacy_key)
+        value = _exit_config_value(config, key)
         if value is not None:
             return float(value)
     return float(default)
@@ -1217,57 +1251,36 @@ def directional_barrier_settings(
     barrier_config = section(strategy_config, "barrier_optimization")
     runtime_config = section(strategy_config, "runtime_strategy")
     synthetic_candidate = synthetic_runtime_strategy_candidate(strategy_config, symbol)
-    base_pt = _resolve_exit_multiplier(
-        cli_value=args.pt_mult,
+    validate_runtime_candidate_exit_definition(synthetic_candidate, symbol=symbol)
+    long_pt = _resolve_exit_multiplier(
         runtime_config=runtime_config,
         synthetic_candidate=synthetic_candidate,
-        directional_key="profit_taking_mult",
-        legacy_key="profit_taking_mult",
+        key="long_profit_taking_mult",
         default=1.0,
     )
-    base_sl = _resolve_exit_multiplier(
-        cli_value=args.sl_mult,
+    long_sl = _resolve_exit_multiplier(
         runtime_config=runtime_config,
         synthetic_candidate=synthetic_candidate,
-        directional_key="stop_loss_mult",
-        legacy_key="stop_loss_mult",
+        key="long_stop_loss_mult",
+        default=1.0,
+    )
+    short_pt = _resolve_exit_multiplier(
+        runtime_config=runtime_config,
+        synthetic_candidate=synthetic_candidate,
+        key="short_profit_taking_mult",
+        default=1.0,
+    )
+    short_sl = _resolve_exit_multiplier(
+        runtime_config=runtime_config,
+        synthetic_candidate=synthetic_candidate,
+        key="short_stop_loss_mult",
         default=1.0,
     )
     exit_config = {
-        "profit_taking_mult": base_pt,
-        "stop_loss_mult": base_sl,
-        "long_profit_taking_mult": _resolve_exit_multiplier(
-            cli_value=args.pt_mult,
-            runtime_config=runtime_config,
-            synthetic_candidate=synthetic_candidate,
-            directional_key="long_profit_taking_mult",
-            legacy_key="profit_taking_mult",
-            default=base_pt,
-        ),
-        "long_stop_loss_mult": _resolve_exit_multiplier(
-            cli_value=args.sl_mult,
-            runtime_config=runtime_config,
-            synthetic_candidate=synthetic_candidate,
-            directional_key="long_stop_loss_mult",
-            legacy_key="stop_loss_mult",
-            default=base_sl,
-        ),
-        "short_profit_taking_mult": _resolve_exit_multiplier(
-            cli_value=args.pt_mult,
-            runtime_config=runtime_config,
-            synthetic_candidate=synthetic_candidate,
-            directional_key="short_profit_taking_mult",
-            legacy_key="profit_taking_mult",
-            default=base_pt,
-        ),
-        "short_stop_loss_mult": _resolve_exit_multiplier(
-            cli_value=args.sl_mult,
-            runtime_config=runtime_config,
-            synthetic_candidate=synthetic_candidate,
-            directional_key="short_stop_loss_mult",
-            legacy_key="stop_loss_mult",
-            default=base_sl,
-        ),
+        "long_profit_taking_mult": long_pt,
+        "long_stop_loss_mult": long_sl,
+        "short_profit_taking_mult": short_pt,
+        "short_stop_loss_mult": short_sl,
     }
     vertical_bars = int(
         args.vertical_barrier_bars
@@ -1286,7 +1299,7 @@ def synthetic_runtime_strategy_candidate(
 ) -> dict[str, Any] | None:
     runtime_config = section(strategy_config, "runtime_strategy")
     source = str(runtime_config.get("source", "")).strip().lower()
-    if source not in {"synthetic_ml_summary", "synthetic_summary"}:
+    if source != "synthetic_ml_summary":
         return None
 
     summary_dir = runtime_config.get("synthetic_summary_dir") or strategy_config.get(
@@ -1350,8 +1363,6 @@ def runtime_event_definition(strategy_config: dict[str, Any], symbol: str) -> di
     if synthetic_candidate is None:
         return dict(base)
     candidate_event = synthetic_candidate.get("event_definition")
-    if candidate_event is None:
-        return dict(base)
     if not isinstance(candidate_event, dict):
         raise TypeError("runtime_strategy_candidate.event_definition must be a JSON object")
     return deep_merge_config(base, candidate_event)
@@ -1364,10 +1375,8 @@ def apply_directional_exit_columns(signals: pd.DataFrame, exit_config: dict[str,
     long_sl = float(exit_config["long_stop_loss_mult"])
     short_pt = float(exit_config["short_profit_taking_mult"])
     short_sl = float(exit_config["short_stop_loss_mult"])
-    base_pt = float(exit_config["profit_taking_mult"])
-    base_sl = float(exit_config["stop_loss_mult"])
-    out["profit_taking_mult"] = base_pt
-    out["stop_loss_mult"] = base_sl
+    out["profit_taking_mult"] = long_pt
+    out["stop_loss_mult"] = long_sl
     out.loc[side > 0, "profit_taking_mult"] = long_pt
     out.loc[side > 0, "stop_loss_mult"] = long_sl
     out.loc[side < 0, "profit_taking_mult"] = short_pt
@@ -1393,6 +1402,10 @@ def build_feature_matrix(
         volatility=volatility,
         microstructure_window=args.microstructure_window,
         information_window=args.information_window,
+        calendar_windows=args.calendar_windows,
+        calendar_min_periods=args.calendar_min_periods,
+        tail_quantile=args.tail_quantile,
+        robust_z_clip=args.robust_z_clip,
         fracdiff_d=args.feature_fracdiff_d,
         fracdiff_threshold=args.feature_fracdiff_threshold,
     )
@@ -1631,10 +1644,6 @@ def run_symbol(
     event_config = runtime_event_definition(strategy_config, symbol)
     runtime_strategy_config = deep_merge_config(strategy_config, {"event_definition": event_config})
     exit_config, vertical_bars = directional_barrier_settings(strategy_config, args, symbol=symbol)
-    pt_sl = (
-        float(exit_config["profit_taking_mult"]),
-        float(exit_config["stop_loss_mult"]),
-    )
 
     print(f"{symbol}: loading {input_csv}", flush=True)
     raw_frame = read_real_bars(input_csv, price_column=price_column)
@@ -1693,7 +1702,6 @@ def run_symbol(
     primary_frame = primary_side_frame_from_rule(
         primary_model,
         features,
-        probability_threshold=args.primary_probability_threshold,
     )
     primary_side = primary_frame["primary_side"]
     candidate_side = primary_side[primary_side != 0]
@@ -1705,7 +1713,11 @@ def run_symbol(
     meta_features = make_rule_meta_features(features, primary_frame)
     print(
         f"{symbol}: labeling rule-primary candidates for meta model "
-        f"pt={pt_sl[0]:g} sl={pt_sl[1]:g} vertical_bars={vertical_bars}",
+        f"long_pt={exit_config['long_profit_taking_mult']:g} "
+        f"long_sl={exit_config['long_stop_loss_mult']:g} "
+        f"short_pt={exit_config['short_profit_taking_mult']:g} "
+        f"short_sl={exit_config['short_stop_loss_mult']:g} "
+        f"vertical_bars={vertical_bars}",
         flush=True,
     )
     meta_dataset = build_afml_meta_dataset(
@@ -1788,7 +1800,6 @@ def run_symbol(
         "n_bars": len(frame),
         "n_features": int(features.shape[1]),
         "window": window_to_dict(window),
-        "pt_sl": {"profit_taking_mult": pt_sl[0], "stop_loss_mult": pt_sl[1]},
         "exit_definition": exit_config,
         "vertical_barrier_bars": vertical_bars,
         "volatility_target": {
@@ -1869,7 +1880,7 @@ def run_real_backtest(
         trade_execution=True,
     )
 
-    strategy_config_path = str(strategy_config.get("_strategy_config_path", "afml_strategies/cvdslope.json"))
+    strategy_config_path = str(strategy_config.get("_strategy_config_path", "afml_strategies/cvdslope_nooptuna.json"))
     all_bars: list[Bar] = []
     symbol_rows: list[dict[str, Any]] = []
     for summary in summaries:
@@ -1887,7 +1898,6 @@ def run_real_backtest(
             instrument,
             args.min_position_change,
         )
-        pt_sl = summary["pt_sl"]
         strategy_config_obj = AfmlSignalStrategyConfig(
             strategy_id=f"CVDSLOPE-{symbol}",
             instrument_id=instrument.id,
@@ -1896,8 +1906,8 @@ def run_real_backtest(
             trade_size=trade_size,
             strategy_config_path=strategy_config_path,
             confidence_threshold=args.confidence_threshold,
-            profit_taking_mult=float(pt_sl["profit_taking_mult"]),
-            stop_loss_mult=float(pt_sl["stop_loss_mult"]),
+            profit_taking_mult=None,
+            stop_loss_mult=None,
             vertical_barrier_bars=int(summary["vertical_barrier_bars"]),
             vertical_barrier_days=None,
             order_time_in_force=TimeInForce.GTC,
@@ -1985,7 +1995,7 @@ def run_real_backtest(
 def run() -> dict[str, Any]:
     args = parse_args()
     config = load_afml_data_config(args.config)
-    strategy_config = load_strategy_config(config, args.strategy_config)
+    strategy_config = load_real_strategy_config(config, args.strategy_config)
     args = apply_json_defaults(args, strategy_config)
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

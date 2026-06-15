@@ -24,6 +24,11 @@ from afml_strategies.config_loader import section  # noqa: E402
 from afml_strategies.config_loader import string_tuple  # noqa: E402
 
 
+VOLATILITY_TARGET_KIND = "ewma_1bar_log_return_std"
+DEFAULT_VOLATILITY_EWMA_SPAN = 80
+DEFAULT_SYNTHETIC_STRATEGY_CONFIG = Path("afml_strategies/cvdslope_nooptuna.json")
+
+
 @dataclass(frozen=True)
 class JointTrendOuModel:
     trend_drift: float
@@ -38,7 +43,6 @@ class JointTrendOuModel:
     innovation_covariance: np.ndarray
     observed_log_return_volatility: float
     observed_ewma_1bar_log_return_volatility: float
-    observed_horizon_volatility: float
     last_log_trend: float
     last_log_residual: float
 
@@ -67,14 +71,6 @@ def json_default(value: Any) -> Any:
 def deterministic_symbol_seed(seed: int, symbol: str) -> int:
     offset = sum((idx + 1) * ord(char) for idx, char in enumerate(symbol))
     return (int(seed) + offset) % (2**32 - 1)
-
-
-def grid_values(config: dict[str, Any]) -> np.ndarray:
-    start = float(config["start"])
-    stop = float(config["stop"])
-    step = float(config["step"])
-    count = round((stop - start) / step) + 1
-    return start + step * np.arange(count, dtype=float)
 
 
 def latest_input_csv(symbol: str, real_config: dict[str, Any]) -> Path | None:
@@ -131,14 +127,7 @@ def input_csv_for_symbol(
 
 
 def load_strategy_config(config: dict[str, Any], cli_path: str | None = None) -> dict[str, Any]:
-    synthetic_config = section(config, "synthetic_data")
-    strategy_path_value = cli_path or synthetic_config.get("strategy_config")
-    if not strategy_path_value:
-        legacy = {
-            "barrier_optimization": section(synthetic_config, "barrier_optimization"),
-        }
-        return legacy
-
+    strategy_path_value = cli_path or DEFAULT_SYNTHETIC_STRATEGY_CONFIG
     strategy_path = resolve_repo_path(strategy_path_value)
     if not strategy_path.exists():
         raise FileNotFoundError(f"Strategy config does not exist: {strategy_path}")
@@ -209,15 +198,6 @@ def timestamp_label(value: pd.Timestamp) -> str:
     return value.strftime("%Y%m%d")
 
 
-def horizon_log_return_volatility(log_price: np.ndarray, horizon: int) -> float:
-    horizon = max(1, min(int(horizon), len(log_price) - 1))
-    returns = log_price[horizon:] - log_price[:-horizon]
-    returns = finite_array(returns)
-    if len(returns) < 2:
-        return float("nan")
-    return float(np.std(returns, ddof=1))
-
-
 def ewma_1bar_log_return_volatility(log_price: np.ndarray, span: int = 80) -> float:
     if span < 1:
         raise ValueError("span must be positive")
@@ -277,8 +257,7 @@ def fit_joint_trend_ou_model(
     ou_innovation_std = float(np.std(ou_innovation, ddof=1)) * residual_scale
     ou_sigma = ou_innovation_std * math.sqrt(2.0 * ou_kappa / max(1.0 - ou_phi * ou_phi, 1e-12))
     log_return = np.diff(log_price)
-    volatility_horizon = int(barrier_config.get("volatility_horizon_bars", 100))
-    volatility_ewma_span = int(barrier_config.get("volatility_ewma_span", 80))
+    volatility_ewma_span = int(barrier_config.get("volatility_ewma_span", DEFAULT_VOLATILITY_EWMA_SPAN))
 
     return JointTrendOuModel(
         trend_drift=trend_drift,
@@ -296,7 +275,6 @@ def fit_joint_trend_ou_model(
             log_price,
             span=volatility_ewma_span,
         ),
-        observed_horizon_volatility=horizon_log_return_volatility(log_price, volatility_horizon),
         last_log_trend=float(log_trend[-1]),
         last_log_residual=float(log_residual[-1]),
     )
@@ -355,10 +333,8 @@ def simulate_paths(
 
 
 def barrier_unit(model: JointTrendOuModel, config: dict[str, Any]) -> float:
-    unit = str(config.get("barrier_unit", "horizon_log_return_volatility"))
-    if unit == "horizon_log_return_volatility":
-        value = model.observed_horizon_volatility
-    elif unit == "ewma_1bar_log_return_volatility":
+    unit = str(config.get("barrier_unit", "ewma_1bar_log_return_volatility"))
+    if unit == "ewma_1bar_log_return_volatility":
         value = model.observed_ewma_1bar_log_return_volatility
     elif unit == "one_step_log_return_volatility":
         value = model.observed_log_return_volatility
@@ -371,73 +347,21 @@ def barrier_unit(model: JointTrendOuModel, config: dict[str, Any]) -> float:
     return float(value)
 
 
-def first_hit_index(mask: np.ndarray, horizon: int) -> np.ndarray:
-    has_hit = mask.any(axis=1)
-    first = np.full(mask.shape[0], horizon + 1, dtype=np.int32)
-    first[has_hit] = np.argmax(mask[has_hit], axis=1).astype(np.int32) + 1
-    return first
+def volatility_target_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": VOLATILITY_TARGET_KIND,
+        "span": int(config.get("volatility_ewma_span", DEFAULT_VOLATILITY_EWMA_SPAN)),
+    }
 
 
-def optimize_profit_take_stop_loss(
-    log_return_paths: np.ndarray,
-    model: JointTrendOuModel,
-    config: dict[str, Any],
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    horizon = min(int(config.get("vertical_barrier_bars", 100)), log_return_paths.shape[1] - 1)
-    returns = log_return_paths[:, 1 : horizon + 1]
-    terminal_return = returns[:, -1]
-    unit = barrier_unit(model, config)
-    pt_grid = grid_values(section(config, "profit_taking_grid"))
-    sl_grid = grid_values(section(config, "stop_loss_grid"))
-    tie_policy = str(config.get("tie_policy", "stop_loss_first"))
-    rows: list[dict[str, Any]] = []
-
-    for pt_multiplier in pt_grid:
-        profit_take = float(pt_multiplier * unit)
-        up_first = first_hit_index(returns >= profit_take, horizon)
-        for sl_multiplier in sl_grid:
-            stop_loss = float(sl_multiplier * unit)
-            down_first = first_hit_index(returns <= -stop_loss, horizon)
-            vertical = (up_first > horizon) & (down_first > horizon)
-            if tie_policy == "stop_loss_first":
-                up_wins = (up_first < down_first) & ~vertical
-                down_wins = (down_first <= up_first) & ~vertical
-            elif tie_policy == "profit_taking_first":
-                up_wins = (up_first <= down_first) & ~vertical
-                down_wins = (down_first < up_first) & ~vertical
-            else:
-                raise ValueError(f"Unsupported tie_policy: {tie_policy}")
-
-            payoff = terminal_return.copy()
-            payoff[up_wins] = profit_take
-            payoff[down_wins] = -stop_loss
-            payoff_std = float(np.std(payoff, ddof=1))
-            rows.append(
-                {
-                    "pt_multiplier": float(pt_multiplier),
-                    "sl_multiplier": float(sl_multiplier),
-                    "profit_take_log_return": profit_take,
-                    "stop_loss_log_return": stop_loss,
-                    "expected_log_return": float(np.mean(payoff)),
-                    "std_log_return": payoff_std,
-                    "sharpe_like": float(np.mean(payoff) / payoff_std) if payoff_std > 0.0 else None,
-                    "profit_take_hit_rate": float(np.mean(up_wins)),
-                    "stop_loss_hit_rate": float(np.mean(down_wins)),
-                    "vertical_barrier_rate": float(np.mean(vertical)),
-                    "mean_exit_step": float(np.mean(np.minimum(np.minimum(up_first, down_first), horizon))),
-                },
-            )
-
-    frame = pd.DataFrame(rows)
-    frame = frame.sort_values(
-        ["expected_log_return", "sharpe_like"],
-        ascending=[False, False],
-        na_position="last",
-    ).reset_index(drop=True)
-    best = frame.iloc[0].to_dict()
-    best["barrier_unit"] = unit
-    best["vertical_barrier_bars"] = horizon
-    return frame, best
+def barrier_metadata(model: JointTrendOuModel, config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "vertical_barrier_bars": int(config.get("vertical_barrier_bars", 100)),
+        "barrier_unit": str(config.get("barrier_unit", "ewma_1bar_log_return_volatility")),
+        "barrier_unit_value": barrier_unit(model, config),
+        "payoff_policy": config.get("payoff_policy"),
+        "tie_policy": config.get("tie_policy"),
+    }
 
 
 def dtype_from_config(config: dict[str, Any]) -> np.dtype:
@@ -486,7 +410,6 @@ def model_fit_summary(model: JointTrendOuModel) -> dict[str, Any]:
         "innovation_covariance": model.innovation_covariance,
         "observed_log_return_volatility": model.observed_log_return_volatility,
         "observed_ewma_1bar_log_return_volatility": model.observed_ewma_1bar_log_return_volatility,
-        "observed_horizon_volatility": model.observed_horizon_volatility,
     }
 
 
@@ -534,29 +457,18 @@ def generate_model_paths(
         long_csv_path = symbol_output_dir / f"{stem}_paths.csv"
         maybe_write_long_csv(long_csv_path, arrays)
 
-    grid_csv_path = None
-    best_barrier = None
-    if bool(barrier_config.get("enabled", True)):
-        grid, best_barrier = optimize_profit_take_stop_loss(
-            arrays["log_return"],
-            model=model,
-            config=barrier_config,
-        )
-        grid_csv_path = symbol_output_dir / f"{stem}_tp_sl_grid.csv"
-        grid.to_csv(grid_csv_path, index=False)
-
     summary = {
         "symbol": symbol,
         "source_csv": str(input_csv),
         "paths_npz": str(npz_path),
         "long_csv": str(long_csv_path) if long_csv_path is not None else None,
-        "tp_sl_grid_csv": str(grid_csv_path) if grid_csv_path is not None else None,
         "n_paths": n_paths,
         "max_horizon_bars": horizon,
         "seed": seed,
+        "volatility_target": volatility_target_metadata(barrier_config),
+        "barrier": barrier_metadata(model, barrier_config),
         "fit": model_fit_summary(model),
         "synthetic": synthetic_path_summary(arrays),
-        "best_barrier": best_barrier,
     }
     if extra_summary:
         summary.update(extra_summary)
@@ -605,81 +517,32 @@ def generate_for_symbol(
     n_paths = int(monte_carlo_config.get("n_paths", 25_000))
     horizon = int(monte_carlo_config.get("max_horizon_bars", 100))
     seed = deterministic_symbol_seed(int(monte_carlo_config.get("seed", 42)), symbol)
-    rng = np.random.default_rng(seed)
-    arrays = simulate_paths(
-        model,
-        n_paths=n_paths,
-        horizon=horizon,
-        seed_policy=str(ou_config.get("seed_policy", "stationary_distribution")),
-        rng=rng,
-    )
-
-    symbol_output_dir = output_dir / "mc_paths" / symbol
-    symbol_output_dir.mkdir(parents=True, exist_ok=True)
     q = float(fair_value_config.get("q_over_r", 0.001))
     stem = f"{symbol}_OU_KALMAN_QR_{q_label(q)}_{n_paths}x{horizon}"
-    npz_path = symbol_output_dir / f"{stem}.npz"
-    write_paths_npz(npz_path, arrays, dtype=dtype_from_config(monte_carlo_config))
-
-    long_csv_path = None
-    if bool(monte_carlo_config.get("write_long_csv", False)):
-        long_csv_path = symbol_output_dir / f"{stem}_paths.csv"
-        maybe_write_long_csv(long_csv_path, arrays)
-
-    grid_csv_path = None
-    best_barrier = None
-    if bool(barrier_config.get("enabled", True)):
-        grid, best_barrier = optimize_profit_take_stop_loss(
-            arrays["log_return"],
-            model=model,
-            config=barrier_config,
-        )
-        grid_csv_path = symbol_output_dir / f"{stem}_tp_sl_grid.csv"
-        grid.to_csv(grid_csv_path, index=False)
-
-    summary = {
-        "symbol": symbol,
-        "source_csv": str(input_csv),
-        "paths_npz": str(npz_path),
-        "long_csv": str(long_csv_path) if long_csv_path is not None else None,
-        "tp_sl_grid_csv": str(grid_csv_path) if grid_csv_path is not None else None,
-        "n_paths": n_paths,
-        "max_horizon_bars": horizon,
-        "seed": seed,
-        "price_model": price_model_config,
-        "fair_value": fair_value_config,
-        "trend_process": trend_config,
-        "ou_process": ou_config,
-        "monte_carlo": monte_carlo_config,
-        "barrier_optimization": barrier_config,
-        "strategy_config_path": strategy_config.get("_strategy_config_path"),
-        "fit": {
-            "trend_drift": model.trend_drift,
-            "trend_std": model.trend_std,
-            "ou_intercept": model.ou_intercept,
-            "ou_phi": model.ou_phi,
-            "ou_mean": model.ou_mean,
-            "ou_kappa": model.ou_kappa,
-            "ou_half_life_bars": model.ou_half_life_bars,
-            "ou_innovation_std": model.ou_innovation_std,
-            "ou_sigma": model.ou_sigma,
-            "innovation_covariance": model.innovation_covariance,
-            "observed_log_return_volatility": model.observed_log_return_volatility,
-            "observed_ewma_1bar_log_return_volatility": model.observed_ewma_1bar_log_return_volatility,
-            "observed_horizon_volatility": model.observed_horizon_volatility,
+    return generate_model_paths(
+        symbol=symbol,
+        input_csv=input_csv,
+        output_dir=output_dir,
+        output_subdir=Path("mc_paths") / symbol,
+        stem=stem,
+        model=model,
+        n_paths=n_paths,
+        horizon=horizon,
+        seed=seed,
+        seed_policy=str(ou_config.get("seed_policy", "stationary_distribution")),
+        monte_carlo_config=monte_carlo_config,
+        barrier_config=barrier_config,
+        extra_summary={
+            "calibration_mode": "full_sample",
+            "price_model": price_model_config,
+            "fair_value": fair_value_config,
+            "trend_process": trend_config,
+            "ou_process": ou_config,
+            "monte_carlo": monte_carlo_config,
+            "barrier_config": barrier_config,
+            "strategy_config_path": strategy_config.get("_strategy_config_path"),
         },
-        "synthetic": {
-            "terminal_log_return_mean": float(np.mean(arrays["log_return"][:, -1])),
-            "terminal_log_return_std": float(np.std(arrays["log_return"][:, -1], ddof=1)),
-            "terminal_relative_price_mean": float(np.mean(arrays["relative_price"][:, -1])),
-            "terminal_relative_price_std": float(np.std(arrays["relative_price"][:, -1], ddof=1)),
-        },
-        "best_barrier": best_barrier,
-    }
-    summary_path = symbol_output_dir / f"{stem}_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, default=json_default), encoding="utf-8")
-    summary["summary_path"] = str(summary_path)
-    return summary
+    )
 
 
 def generate_rolling_for_symbol(
@@ -778,7 +641,7 @@ def generate_rolling_for_symbol(
                     "trend_process": trend_config,
                     "ou_process": ou_config,
                     "monte_carlo": monte_carlo_config,
-                    "barrier_optimization": barrier_config,
+                    "barrier_config": barrier_config,
                     "strategy_config_path": strategy_config.get("_strategy_config_path"),
                 },
             )
@@ -823,7 +686,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-paths", type=int, default=None)
     parser.add_argument("--max-horizon-bars", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--strategy-config", default=None)
+    parser.add_argument(
+        "--strategy-config",
+        default=None,
+        help=f"Override strategy JSON path (default: {DEFAULT_SYNTHETIC_STRATEGY_CONFIG}).",
+    )
     parser.add_argument(
         "--rolling-window-days",
         type=float,
@@ -893,12 +760,11 @@ def main() -> None:
                 cli_seed=args.seed,
             )
             summaries.append(summary)
-            best = summary["best_barrier"] or {}
             print(
                 f"{symbol}: paths={summary['n_paths']:,} horizon={summary['max_horizon_bars']} "
                 f"OU_half_life={summary['fit']['ou_half_life_bars']:.2f} "
-                f"best_pt={best.get('pt_multiplier')} best_sl={best.get('sl_multiplier')} "
-                f"E={best.get('expected_log_return')}",
+                f"vol_target={summary['volatility_target']['kind']}[{summary['volatility_target']['span']}] "
+                f"barrier_unit={summary['barrier']['barrier_unit_value']:.6g}",
             )
 
     manifest = {

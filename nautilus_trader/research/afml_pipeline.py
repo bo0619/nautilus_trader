@@ -2177,6 +2177,22 @@ def _rolling_zscore(series: pd.Series, window: int) -> pd.Series:
     return _safe_divide(series - mean, std)
 
 
+def _rolling_iqr_zscore(
+    series: pd.Series,
+    window: int | str,
+    *,
+    min_periods: int,
+    clip: float | None,
+) -> pd.Series:
+    rolling = series.astype(float).rolling(window=window, min_periods=min_periods)
+    median = rolling.median()
+    iqr = rolling.quantile(0.75) - rolling.quantile(0.25)
+    zscore = _safe_divide(series.astype(float) - median, iqr / 1.349)
+    if clip is not None:
+        zscore = zscore.clip(lower=-float(clip), upper=float(clip))
+    return zscore
+
+
 def _rolling_ols_slope(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
     min_periods = max(3, window // 2)
     x = x.astype(float)
@@ -2197,6 +2213,131 @@ def _first_numeric_column(
     return None
 
 
+def _calendar_window_label(window: str) -> str:
+    days = pd.Timedelta(window).total_seconds() / 86_400.0
+    if math.isclose(days, 1.0):
+        return "1d"
+    if math.isclose(days, 3.0):
+        return "3d"
+    if math.isclose(days, 7.0):
+        return "1w"
+    if math.isclose(days, 14.0):
+        return "2w"
+    if math.isclose(days, 30.0):
+        return "1m"
+    if days.is_integer():
+        return f"{int(days)}d"
+    return f"{days:g}d".replace(".", "p")
+
+
+def _calendar_window_days(window: str) -> float:
+    days = pd.Timedelta(window).total_seconds() / 86_400.0
+    if days <= 0.0:
+        raise ValueError("calendar windows must be positive")
+    return days
+
+
+def _add_calendar_regime_features(
+    features: pd.DataFrame,
+    *,
+    close: pd.Series,
+    log_return: pd.Series,
+    total_notional: pd.Series,
+    signed_notional: pd.Series,
+    theta_to_threshold: pd.Series | None,
+    calendar_windows: tuple[str, ...],
+    min_periods: int,
+    tail_quantile: float,
+    robust_z_clip: float | None,
+) -> None:
+    abs_return = log_return.abs()
+    signed_abs_notional = signed_notional.abs()
+
+    for window in calendar_windows:
+        label = _calendar_window_label(window)
+        window_days = _calendar_window_days(window)
+        rolling_return = log_return.rolling(window=window, min_periods=min_periods)
+        rolling_abs_return = abs_return.rolling(window=window, min_periods=min_periods)
+        rolling_notional = total_notional.rolling(window=window, min_periods=min_periods)
+        rolling_signed_abs_notional = signed_abs_notional.rolling(
+            window=window,
+            min_periods=min_periods,
+        )
+
+        bar_count = close.rolling(window=window, min_periods=1).count()
+        return_skew = rolling_return.skew()
+        return_excess_kurt = rolling_return.kurt()
+        jb_moment_distance = np.sqrt(return_skew.pow(2) + return_excess_kurt.pow(2) / 4.0)
+        abs_return_tail = rolling_abs_return.quantile(tail_quantile)
+        tail_event = (abs_return >= abs_return_tail).astype(float)
+        tail_event_count = tail_event.rolling(window=window, min_periods=min_periods).sum()
+
+        features[f"calendar_bar_count_{label}"] = bar_count
+        features[f"calendar_bar_density_per_day_{label}"] = bar_count / window_days
+        features[f"calendar_realized_vol_{label}"] = rolling_return.std()
+        features[f"calendar_return_skew_{label}"] = return_skew
+        features[f"calendar_return_excess_kurt_{label}"] = return_excess_kurt
+        features[f"calendar_jb_moment_distance_{label}"] = jb_moment_distance
+        features[f"calendar_abs_return_max_{label}"] = rolling_abs_return.max()
+        features[f"calendar_abs_return_q{int(tail_quantile * 100):02d}_{label}"] = (
+            abs_return_tail
+        )
+        features[f"calendar_tail_event_count_{label}"] = tail_event_count
+        features[f"calendar_tail_event_share_{label}"] = _safe_divide(
+            tail_event_count,
+            bar_count,
+        )
+        features[f"calendar_log_return_robust_z_{label}"] = _rolling_iqr_zscore(
+            log_return,
+            window,
+            min_periods=min_periods,
+            clip=robust_z_clip,
+        )
+        features[f"calendar_abs_return_robust_z_{label}"] = _rolling_iqr_zscore(
+            abs_return,
+            window,
+            min_periods=min_periods,
+            clip=robust_z_clip,
+        )
+        features[f"calendar_dollar_volume_sum_{label}"] = rolling_notional.sum()
+        features[f"calendar_dollar_volume_robust_z_{label}"] = _rolling_iqr_zscore(
+            total_notional,
+            window,
+            min_periods=min_periods,
+            clip=robust_z_clip,
+        )
+        features[f"calendar_signed_notional_robust_z_{label}"] = _rolling_iqr_zscore(
+            signed_notional,
+            window,
+            min_periods=min_periods,
+            clip=robust_z_clip,
+        )
+        features[f"calendar_order_flow_imbalance_{label}"] = _safe_divide(
+            signed_notional.rolling(window=window, min_periods=min_periods).sum(),
+            rolling_notional.sum(),
+        )
+        features[f"calendar_vpin_{label}"] = _safe_divide(
+            rolling_signed_abs_notional.sum(),
+            rolling_notional.sum(),
+        )
+
+        if theta_to_threshold is not None:
+            features[f"calendar_theta_to_threshold_mean_{label}"] = theta_to_threshold.rolling(
+                window=window,
+                min_periods=min_periods,
+            ).mean()
+            features[f"calendar_theta_to_threshold_max_{label}"] = theta_to_threshold.rolling(
+                window=window,
+                min_periods=min_periods,
+            ).max()
+            features[f"calendar_theta_to_threshold_robust_z_{label}"] = _rolling_iqr_zscore(
+                theta_to_threshold,
+                window,
+                min_periods=min_periods,
+                clip=robust_z_clip,
+            )
+
+
 def make_pipeline_features(  # noqa: C901
     frame: pd.DataFrame,
     volatility: pd.Series | None = None,
@@ -2205,6 +2346,10 @@ def make_pipeline_features(  # noqa: C901
     slow_span: int = 32,
     microstructure_window: int = 50,
     information_window: int = 64,
+    calendar_windows: tuple[str, ...] | None = ("1D", "3D", "7D", "14D", "30D"),
+    calendar_min_periods: int = 8,
+    tail_quantile: float = 0.99,
+    robust_z_clip: float | None = 5.0,
     sadf_windows: tuple[int, ...] = (32, 64, 128),
     fracdiff_d: float = DEFAULT_FEATURE_FRACDIFF_D,
     fracdiff_threshold: float = DEFAULT_FEATURE_FRACDIFF_THRESHOLD,
@@ -2215,7 +2360,9 @@ def make_pipeline_features(  # noqa: C901
     The output intentionally groups the AFML pipeline's feature families:
     fixed-width fractional differentiation, Chapter 17 structural-break
     features, Chapter 18 entropy features, and Chapter 19 microstructure /
-    price-impact features.
+    price-impact features. Calendar-window regime features keep the input in
+    DRB/event time while describing volatility, tail, and bar-density state over
+    elapsed clock time.
     """
     if "close" not in frame.columns:
         raise ValueError("frame must contain a 'close' column")
@@ -2223,6 +2370,10 @@ def make_pipeline_features(  # noqa: C901
         raise ValueError("microstructure_window must be at least 2")
     if information_window < 2:
         raise ValueError("information_window must be at least 2")
+    if calendar_min_periods < 2:
+        raise ValueError("calendar_min_periods must be at least 2")
+    if not 0.0 < tail_quantile < 1.0:
+        raise ValueError("tail_quantile must be in the interval (0, 1)")
 
     frame = frame.copy().sort_index()
     frame.index = _as_utc_datetime_index(frame.index)
@@ -2438,6 +2589,42 @@ def make_pipeline_features(  # noqa: C901
             value = frame[column].astype(float).reindex(close.index)
             features[column] = value
             features[f"{column}_chg"] = value.pct_change().replace([np.inf, -np.inf], np.nan)
+
+    theta_to_threshold: pd.Series | None = None
+    if {"theta", "threshold"}.issubset(frame.columns):
+        theta = frame["theta"].astype(float).reindex(close.index)
+        threshold = frame["threshold"].astype(float).reindex(close.index)
+        theta_to_threshold = _safe_divide(theta.abs(), threshold)
+        features["theta_to_threshold"] = theta_to_threshold
+        features["theta_to_threshold_chg"] = theta_to_threshold.pct_change().replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        features["theta_to_threshold_zscore"] = _rolling_zscore(
+            theta_to_threshold,
+            microstructure_window,
+        )
+        features["theta_to_threshold_robust_zscore"] = _rolling_iqr_zscore(
+            theta_to_threshold,
+            microstructure_window,
+            min_periods=max(3, microstructure_window // 2),
+            clip=robust_z_clip,
+        )
+
+    if calendar_windows:
+        _add_calendar_regime_features(
+            features,
+            close=close,
+            log_return=log_return,
+            total_notional=total_notional,
+            signed_notional=signed_notional,
+            theta_to_threshold=theta_to_threshold,
+            calendar_windows=tuple(calendar_windows),
+            min_periods=calendar_min_periods,
+            tail_quantile=tail_quantile,
+            robust_z_clip=robust_z_clip,
+        )
+        features = features.copy()
 
     features["shannon_entropy"] = rolling_binary_entropy(log_return, window=information_window)
     features["lz_complexity"] = rolling_lz_complexity(log_return, window=information_window)
@@ -2982,7 +3169,7 @@ def pca_sfi_feature_importance(
     train_index: pd.DatetimeIndex,
     test_index: pd.DatetimeIndex,
     model_factory: Any,
-    pca_components: float | int,
+    pca_components: float,
     pca_random_state: int | None = None,
 ) -> pd.DataFrame:
     pca_dataset, transformer = _pca_dataset(

@@ -2,7 +2,7 @@
   "description": "Data-generation configuration for real Binance AFML DRB bars and OU synthetic data.",
   "real_data": {
     "script": "binance_scripts/generate_afml_drb_from_aggtrades.py",
-    "symbols": ["BTCUSDT.P", "ETHUSDT.P", "BNBUSDT.P", "SOLUSDT.P"],
+    "symbols": ["BTCUSDT.P"],
     "threshold_history_start": "2025-01-01",
     "generation_start": "2025-02-01",
     "generation_end": "2026-04-30",
@@ -27,7 +27,7 @@
       "download_start_fallback": "2025-01-01",
       "generation_start_fallback": "2025-02-01"
     },
-    "input_dir": "binance_scripts/data/binance_vision",
+    "input_dir": "binance_scripts/data",
     "output_dir": "binance_scripts/data/afml_bars",
     "catalog_dir": "binance_scripts/data/afml_catalog",
     "calibration_output_dir": "binance_scripts/data/afml_bar_calibration",
@@ -44,7 +44,7 @@
   "synthetic_data": {
     "script": "afml_scripts/generate_ou_residual_synthetic.py",
     "enabled": true,
-    "symbols": ["BTCUSDT.P", "ETHUSDT.P", "BNBUSDT.P", "SOLUSDT.P"],
+    "symbols": ["BTCUSDT.P"],
     "input_csv": "binance_scripts/data/afml_bars/BTCUSDT/BTCUSDT_20250201_20260531_250tpd_DRB.csv",
     "input_csvs": {
       "BTCUSDT": "binance_scripts/data/afml_bars/BTCUSDT/BTCUSDT_20250201_20260531_250tpd_DRB.csv",
@@ -54,7 +54,6 @@
     },
     "output_dir": "afml_scripts/output/ou_synthetic",
     "symbol": "BTCUSDT.P",
-    "strategy_config": "afml_strategies/cvdslope.json",
     "price_model": {
       "kind": "log_price_trend_plus_ou_residual",
       "price_column": "close",
