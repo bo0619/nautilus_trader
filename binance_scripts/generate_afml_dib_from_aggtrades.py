@@ -12,20 +12,18 @@ import calendar
 import csv
 import gc
 import json
+import math
 import os
 import shutil
 import sys
 import time
 import zipfile
-from bisect import bisect_right
 from datetime import UTC
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
-
-import numpy as np
 
 
 # ruff: noqa: E402
@@ -37,6 +35,11 @@ from afml_strategies.config_loader import load_afml_data_config
 from afml_strategies.config_loader import resolve_repo_path
 from afml_strategies.config_loader import section
 from afml_strategies.config_loader import string_tuple
+from binance_scripts.afml_generation_utils import RollingDensityConfig
+from binance_scripts.afml_generation_utils import RollingDensityController
+from binance_scripts.afml_generation_utils import afml_expectations_to_dict
+from binance_scripts.afml_generation_utils import assert_no_stale_output_tmp
+from nautilus_trader.data.afml_bars import AfmlBarExpectations
 from nautilus_trader.data.afml_bars import AfmlBarMeta
 from nautilus_trader.data.afml_bars import AfmlDollarImbalanceBarAggregator
 from nautilus_trader.data.afml_bars import estimate_afml_dollar_expectations
@@ -62,6 +65,15 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 CONFIG = load_afml_data_config()
 REAL_DATA_CONFIG = section(CONFIG, "real_data")
 INCREMENTAL_CONFIG = section(REAL_DATA_CONFIG, "incremental")
+ROLLING_DENSITY_SECTION = section(REAL_DATA_CONFIG, "rolling_density")
+
+
+def int_sequence_config(value: object, default: tuple[int, ...]) -> list[int]:
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [int(part.strip()) for part in value.split(",") if part.strip()]
+    return [int(item) for item in value]  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------
@@ -69,23 +81,61 @@ INCREMENTAL_CONFIG = section(REAL_DATA_CONFIG, "incremental")
 # --------------------------------------------------------------------------
 SYMBOLS = list(string_tuple(REAL_DATA_CONFIG.get("symbols"), default=("BTCUSDT.P",)))
 
-THRESHOLD_HISTORY_START = str(REAL_DATA_CONFIG.get("threshold_history_start", "2025-01-01"))
 GENERATION_START_CONFIG = str(REAL_DATA_CONFIG.get("generation_start", "2025-02-01"))
 GENERATION_END_CONFIG = str(REAL_DATA_CONFIG.get("generation_end", "2026-04-30"))
 GENERATION_START = GENERATION_START_CONFIG
 GENERATION_END = GENERATION_END_CONFIG
+DEFAULT_CALIBRATION_END = (date.fromisoformat(GENERATION_START_CONFIG) - timedelta(days=1)).isoformat()
+CALIBRATION_START_CONFIG = str(REAL_DATA_CONFIG.get("calibration_start", "2025-01-01"))
+CALIBRATION_END_CONFIG = str(REAL_DATA_CONFIG.get("calibration_end", DEFAULT_CALIBRATION_END))
 
 PRODUCT = str(REAL_DATA_CONFIG.get("product", "um"))
-THRESHOLD_ROLLING_WINDOW_DAYS = int(REAL_DATA_CONFIG.get("threshold_rolling_window_days", 30))
-THRESHOLD_DAILY_NOTIONAL_DIVISOR = int(REAL_DATA_CONFIG.get("threshold_daily_notional_divisor", 250))
-THRESHOLD_UPDATE_FREQUENCY = str(REAL_DATA_CONFIG.get("threshold_update_frequency", "monthly"))
-THRESHOLD_MIN_LOOKBACK_DAYS = int(REAL_DATA_CONFIG.get("threshold_min_lookback_days", 7))
-TARGET_BARS_PER_DAY = THRESHOLD_DAILY_NOTIONAL_DIVISOR
-EWMA_SPAN = int(REAL_DATA_CONFIG.get("ewma_span", 20))
+TARGET_BARS_PER_DAY = int(REAL_DATA_CONFIG.get("target_bars_per_day", 1440))
+EWMA_SPAN_CANDIDATES = int_sequence_config(
+    REAL_DATA_CONFIG.get("ewma_span_candidates"),
+    (10, 20, 50),
+)
+SCALE_SEARCH_ITERATIONS = int(REAL_DATA_CONFIG.get("scale_search_iterations", 6))
+SCALE_SEARCH_DAMPING = float(REAL_DATA_CONFIG.get("scale_search_damping", 0.80))
+IMBALANCE_FLOOR_FRAC = float(REAL_DATA_CONFIG.get("imbalance_floor_frac", 0.01))
+ADAPTIVE_DENSITY = bool(REAL_DATA_CONFIG.get("adaptive_density", False))
+DENSITY_ADJUSTMENT_STRENGTH = float(REAL_DATA_CONFIG.get("density_adjustment_strength", 0.5))
+DENSITY_MIN_SCALE = float(REAL_DATA_CONFIG.get("density_min_scale", 0.25))
+DENSITY_MAX_SCALE = float(REAL_DATA_CONFIG.get("density_max_scale", 4.0))
+DENSITY_MIN_ELAPSED_FRACTION = float(REAL_DATA_CONFIG.get("density_min_elapsed_fraction", 1.0 / 24.0))
+ROLLING_DENSITY_ENABLED = bool(ROLLING_DENSITY_SECTION.get("enabled", False))
+ROLLING_DENSITY_CONFIG = RollingDensityConfig(
+    target_bars_per_day=TARGET_BARS_PER_DAY,
+    activity_half_life_days=float(
+        ROLLING_DENSITY_SECTION.get("activity_half_life_days", 7.0),
+    ),
+    error_half_life_days=float(
+        ROLLING_DENSITY_SECTION.get("error_half_life_days", 7.0),
+    ),
+    feedback_gain=float(ROLLING_DENSITY_SECTION.get("feedback_gain", 0.20)),
+    max_daily_scale_change=float(
+        ROLLING_DENSITY_SECTION.get("max_daily_scale_change", 0.10),
+    ),
+    min_scale=float(ROLLING_DENSITY_SECTION.get("min_scale", 0.25)),
+    max_scale=float(ROLLING_DENSITY_SECTION.get("max_scale", 4.0)),
+    activity_clip_min_ratio=float(
+        ROLLING_DENSITY_SECTION.get("activity_clip_min_ratio", 0.25),
+    ),
+    activity_clip_max_ratio=float(
+        ROLLING_DENSITY_SECTION.get("activity_clip_max_ratio", 4.0),
+    ),
+    density_error_clip_ratio=float(
+        ROLLING_DENSITY_SECTION.get("density_error_clip_ratio", 4.0),
+    ),
+)
+if ROLLING_DENSITY_ENABLED and ADAPTIVE_DENSITY:
+    raise ValueError("rolling_density and adaptive_density cannot both be enabled")
 
 # Keep E[T] fixed to the target density. The DIB side/notional expectations
 # still update online after each closed bar.
 UPDATE_EXPECTED_TICKS = bool(REAL_DATA_CONFIG.get("update_expected_ticks", False))
+if ROLLING_DENSITY_ENABLED and UPDATE_EXPECTED_TICKS:
+    raise ValueError("rolling_density requires update_expected_ticks=false")
 INCREMENTAL_ENABLED = bool(INCREMENTAL_CONFIG.get("enabled", False))
 INCREMENTAL_END_POLICY = str(INCREMENTAL_CONFIG.get("end_policy", "configured"))
 GENERATION_START_FALLBACK = str(
@@ -674,140 +724,6 @@ def load_trade_ticks(
     return ticks
 
 
-def next_month_start(value: date) -> date:
-    if value.month == 12:
-        return date(value.year + 1, 1, 1)
-    return date(value.year, value.month + 1, 1)
-
-
-def threshold_update_dates(start: date, end: date, frequency: str) -> list[date]:
-    frequency = frequency.strip().lower()
-    if frequency not in {"monthly", "weekly"}:
-        raise ValueError("THRESHOLD_UPDATE_FREQUENCY must be 'monthly' or 'weekly'")
-
-    updates = [start]
-    if frequency == "monthly":
-        current = next_month_start(start)
-        while current <= end:
-            updates.append(current)
-            current = next_month_start(current)
-    else:
-        current = start + timedelta(days=7)
-        while current <= end:
-            updates.append(current)
-            current += timedelta(days=7)
-    return updates
-
-
-def daily_notional_from_ticks(
-    paths,
-    instrument,
-    *,
-    start: date,
-    end: date,
-) -> dict[str, float]:
-    totals = {day.isoformat(): 0.0 for day in iter_days(start, end)}
-    start_ms = date_to_ms(start)
-    end_ms = next_date_ms(end)
-    if not USE_TICK_CACHE:
-        for tick in iter_trade_ticks(
-            paths,
-            instrument,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            use_cache=False,
-        ):
-            totals[day_key(int(tick.ts_event))] += float(tick.price) * float(tick.size)
-        return totals
-
-    _, pq = pyarrow_modules()
-    day_ms = 86_400_000
-    for path in paths:
-        cache_path = ensure_tick_cache(path, TICK_CACHE_DIR)
-        print(f"summing daily notional {cache_path.name}")
-        parquet_file = pq.ParquetFile(cache_path)
-        for batch in parquet_file.iter_batches(
-            batch_size=TICK_CACHE_READ_BATCH_SIZE,
-            columns=["price", "quantity", "ts_ms"],
-        ):
-            names = batch.schema.names
-            prices = batch.column(names.index("price")).to_numpy(zero_copy_only=False)
-            quantities = batch.column(names.index("quantity")).to_numpy(zero_copy_only=False)
-            ts_ms_values = batch.column(names.index("ts_ms")).to_numpy(zero_copy_only=False)
-            mask = (ts_ms_values >= start_ms) & (ts_ms_values < end_ms)
-            if not mask.any():
-                continue
-            day_numbers = ts_ms_values[mask] // day_ms
-            notionals = prices[mask] * quantities[mask]
-            unique_days, inverse = np.unique(day_numbers, return_inverse=True)
-            sums = np.bincount(inverse, weights=notionals)
-            for day_number, total in zip(unique_days, sums, strict=True):
-                day = datetime.fromtimestamp(int(day_number) * 86_400, tz=UTC).date()
-                key = day.isoformat()
-                if key in totals:
-                    totals[key] += float(total)
-    return totals
-
-
-def build_threshold_schedule(
-    daily_notional: dict[str, float],
-    *,
-    start: date,
-    end: date,
-) -> list[dict]:
-    updates = threshold_update_dates(start, end, THRESHOLD_UPDATE_FREQUENCY)
-    rows: list[dict] = []
-    for index, effective_start in enumerate(updates):
-        effective_end = (
-            updates[index + 1] - timedelta(days=1) if index + 1 < len(updates) else end
-        )
-        lookback_end = effective_start - timedelta(days=1)
-        lookback_start = lookback_end - timedelta(days=THRESHOLD_ROLLING_WINDOW_DAYS - 1)
-        lookback_days = list(iter_days(lookback_start, lookback_end))
-        values = [
-            float(daily_notional.get(day.isoformat(), 0.0))
-            for day in lookback_days
-            if float(daily_notional.get(day.isoformat(), 0.0)) > 0.0
-        ]
-        if len(values) < THRESHOLD_MIN_LOOKBACK_DAYS:
-            raise ValueError(
-                f"Not enough positive daily notional values for {effective_start}: "
-                f"{len(values)} < THRESHOLD_MIN_LOOKBACK_DAYS={THRESHOLD_MIN_LOOKBACK_DAYS}. "
-                "Move GENERATION_START later or download more lookback history.",
-            )
-        daily_sma = sum(values) / len(values)
-        rows.append(
-            {
-                "effective_start": effective_start.isoformat(),
-                "effective_end": effective_end.isoformat(),
-                "lookback_start": lookback_start.isoformat(),
-                "lookback_end": lookback_end.isoformat(),
-                "lookback_days": len(values),
-                "daily_notional_sma": daily_sma,
-                "threshold": daily_sma / THRESHOLD_DAILY_NOTIONAL_DIVISOR,
-            },
-        )
-    return rows
-
-
-class NotionalThresholdSchedule:
-    def __init__(self, rows: list[dict]) -> None:
-        if not rows:
-            raise ValueError("threshold schedule cannot be empty")
-        self.rows = sorted(rows, key=lambda row: row["effective_start"])
-        self.starts_ns = [
-            millis_to_nanos(date_to_ms(date.fromisoformat(row["effective_start"])))
-            for row in self.rows
-        ]
-        self.thresholds = [float(row["threshold"]) for row in self.rows]
-
-    def __call__(self, ts_ns: int) -> float | None:
-        position = bisect_right(self.starts_ns, int(ts_ns)) - 1
-        if position < 0:
-            return None
-        return self.thresholds[position]
-
-
 class StreamingDibCsvWriter:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -816,7 +732,7 @@ class StreamingDibCsvWriter:
         self.daily_counts: dict[str, int] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.tmp_path.exists():
-            self.tmp_path.unlink()
+            raise RuntimeError(f"Refusing to overwrite stale DIB temp output: {self.tmp_path}")
         self.file = self.tmp_path.open("w", newline="", encoding="utf-8")
         fields = [
             "bar_type",
@@ -961,192 +877,263 @@ def backup_existing_path(path: Path) -> Path:
     return backup_path
 
 
-def threshold_plan_path(symbol: str) -> Path:
+def calibration_plan_path(symbol: str) -> Path:
     stem = (
-        f"{symbol}_{THRESHOLD_HISTORY_START.replace('-', '')}_{GENERATION_START.replace('-', '')}"
-        f"_{GENERATION_END.replace('-', '')}_{THRESHOLD_ROLLING_WINDOW_DAYS}d"
-        f"_{THRESHOLD_UPDATE_FREQUENCY}_{TARGET_BARS_PER_DAY}tpd_DIB_threshold_plan.json"
+        f"{symbol}_{CALIBRATION_START_CONFIG.replace('-', '')}_"
+        f"{CALIBRATION_END_CONFIG.replace('-', '')}_{TARGET_BARS_PER_DAY}tpd_"
+        "DIB_calibration_plan.json"
     )
     return CALIBRATION_OUTPUT_DIR / symbol / stem
 
 
-def expected_threshold_plan_config(symbol: str) -> dict:
+def expected_calibration_plan_config(symbol: str) -> dict:
     return {
         "symbol": symbol,
         "kind": "DIB",
-        "threshold_method": "rolling_daily_notional_sma",
-        "threshold_history_start": THRESHOLD_HISTORY_START,
-        "generation_start": GENERATION_START,
-        "generation_end": GENERATION_END,
-        "threshold_rolling_window_days": THRESHOLD_ROLLING_WINDOW_DAYS,
-        "threshold_daily_notional_divisor": THRESHOLD_DAILY_NOTIONAL_DIVISOR,
-        "threshold_update_frequency": THRESHOLD_UPDATE_FREQUENCY,
-        "threshold_min_lookback_days": THRESHOLD_MIN_LOOKBACK_DAYS,
+        "threshold_method": "calibrated_ewma_threshold_scale",
+        "calibration_start_date": CALIBRATION_START_CONFIG,
+        "calibration_end_date": CALIBRATION_END_CONFIG,
         "target_bars_per_day": TARGET_BARS_PER_DAY,
         "product": PRODUCT,
-        "ewma_span": EWMA_SPAN,
+        "ewma_span_candidates": EWMA_SPAN_CANDIDATES,
+        "scale_search_iterations": SCALE_SEARCH_ITERATIONS,
+        "scale_search_damping": SCALE_SEARCH_DAMPING,
+        "imbalance_floor_frac": IMBALANCE_FLOOR_FRAC,
+        "adaptive_density": ADAPTIVE_DENSITY,
+        "density_adjustment_strength": DENSITY_ADJUSTMENT_STRENGTH,
+        "density_min_scale": DENSITY_MIN_SCALE,
+        "density_max_scale": DENSITY_MAX_SCALE,
+        "density_min_elapsed_fraction": DENSITY_MIN_ELAPSED_FRACTION,
         "update_expected_ticks": UPDATE_EXPECTED_TICKS,
         "write_catalog": WRITE_CATALOG,
     }
 
 
-def threshold_plan_mismatch_reason(payload: dict, symbol: str) -> str | None:
-    for key, expected_value in expected_threshold_plan_config(symbol).items():
+def calibration_plan_mismatch_reason(payload: dict, symbol: str) -> str | None:
+    for key, expected_value in expected_calibration_plan_config(symbol).items():
         if payload.get(key) != expected_value:
             return f"{key} cached={payload.get(key)!r} current={expected_value!r}"
-    if "threshold_schedule" not in payload:
-        return "missing threshold_schedule"
+    selected = payload.get("selected")
+    if not isinstance(selected, dict):
+        return "missing selected"
+    if "ewma_span" not in selected or "threshold_scale" not in selected:
+        return "selected missing ewma_span or threshold_scale"
     return None
 
 
-def reusable_daily_notional_mismatch_reason(payload: dict, symbol: str) -> str | None:
-    expected = expected_threshold_plan_config(symbol)
-    reusable_keys = {
-        "symbol",
-        "kind",
-        "threshold_method",
-        "threshold_history_start",
-        "threshold_rolling_window_days",
-        "threshold_daily_notional_divisor",
-        "threshold_update_frequency",
-        "threshold_min_lookback_days",
-        "target_bars_per_day",
-        "product",
+def aggregator_density_kwargs() -> dict:
+    if not ADAPTIVE_DENSITY:
+        return {}
+    return {
+        "target_bars_per_day": TARGET_BARS_PER_DAY,
+        "density_adjustment_strength": DENSITY_ADJUSTMENT_STRENGTH,
+        "density_min_scale": DENSITY_MIN_SCALE,
+        "density_max_scale": DENSITY_MAX_SCALE,
+        "density_min_elapsed_fraction": DENSITY_MIN_ELAPSED_FRACTION,
     }
-    for key in reusable_keys:
-        if payload.get(key) != expected[key]:
-            return f"{key} cached={payload.get(key)!r} current={expected[key]!r}"
-    if not isinstance(payload.get("daily_notional"), dict):
-        return "missing daily_notional"
-    return None
 
 
-def latest_reusable_threshold_plan(symbol: str) -> dict | None:
-    plan_dir = CALIBRATION_OUTPUT_DIR / symbol
-    if not plan_dir.exists():
-        return None
-
-    latest_payload: dict | None = None
-    latest_end: date | None = None
-    for path in plan_dir.glob("*_DIB_threshold_plan.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if reusable_daily_notional_mismatch_reason(payload, symbol) is not None:
-            continue
-        end_value = payload.get("generation_end")
-        if not isinstance(end_value, str):
-            continue
-        end_date = parse_date(end_value)
-        if latest_end is None or end_date > latest_end:
-            latest_payload = payload
-            latest_end = end_date
-    return latest_payload
+def generation_threshold_method() -> str:
+    if ROLLING_DENSITY_ENABLED:
+        return "rolling_daily_activity_density_v1"
+    return "calibrated_ewma_threshold_scale"
 
 
-def latest_daily_notional_date(daily_notional: dict[str, float]) -> date | None:
-    latest: date | None = None
-    for key in daily_notional:
-        parsed = parse_date(key)
-        if latest is None or parsed > latest:
-            latest = parsed
-    return latest
+def rolling_density_summary_config() -> dict:
+    return {
+        "enabled": ROLLING_DENSITY_ENABLED,
+        **ROLLING_DENSITY_CONFIG.to_dict(),
+        "monthly_state_reset": True,
+    }
 
 
-def load_incremental_daily_notional(
-    *,
-    symbol: str,
-    instrument,
-    history_start: date,
-    generation_end: date,
-) -> dict[str, float]:
-    daily_notional: dict[str, float] = {}
-    previous_plan = latest_reusable_threshold_plan(symbol)
-    if previous_plan is not None:
-        daily_notional = {
-            str(day): float(value)
-            for day, value in previous_plan.get("daily_notional", {}).items()
+def has_valid_rolling_density_checkpoint(payload: dict) -> bool:
+    if not ROLLING_DENSITY_ENABLED:
+        return True
+    state = payload.get("density_controller_state")
+    expectations = payload.get("final_expectations")
+    return (
+        isinstance(state, dict)
+        and state.get("version") == RollingDensityController.STATE_VERSION
+        and {"tick_forecast", "threshold_scale", "log_density_error"} <= state.keys()
+        and isinstance(expectations, dict)
+        and {
+            "expected_ticks",
+            "p_buy",
+            "buy_mean_notional",
+            "sell_mean_notional",
+            "mean_notional",
         }
-        latest_day = latest_daily_notional_date(daily_notional)
-        latest_text = latest_day.isoformat() if latest_day is not None else "none"
-        print(f"{symbol} incremental: reused daily notional through {latest_text}")
-    else:
-        latest_day = None
-
-    missing_start = history_start if latest_day is None else max(history_start, latest_day + timedelta(days=1))
-    if missing_start > generation_end:
-        return daily_notional
-
-    paths = archive_paths_for_range(
-        input_dir=INPUT_DIR,
-        product=PRODUCT,
-        symbol=symbol,
-        start=missing_start,
-        end=generation_end,
+        <= expectations.keys()
     )
-    daily_notional.update(
-        daily_notional_from_ticks(
-            paths,
-            instrument,
-            start=missing_start,
-            end=generation_end,
-        ),
+
+
+def count_daily_dib_bars(
+    *,
+    ticks: list[TradeTick],
+    instrument,
+    target_bars: int,
+    ewma_span: int,
+    threshold_scale: float,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    expectations = estimate_afml_dollar_expectations(ticks, target_bars)
+    bar_type = make_bar_type(instrument, TARGET_BARS_PER_DAY)
+
+    def record(bar: Bar, _meta: AfmlBarMeta) -> None:
+        key = day_key(int(bar.ts_event))
+        counts[key] = counts.get(key, 0) + 1
+
+    aggregator = AfmlDollarImbalanceBarAggregator(
+        instrument=instrument,
+        bar_type=bar_type,
+        handler=None,
+        meta_handler=record,
+        expectations=expectations,
+        ewma_span=ewma_span,
+        threshold_scale=threshold_scale,
+        imbalance_floor_frac=IMBALANCE_FLOOR_FRAC,
+        update_expected_ticks=UPDATE_EXPECTED_TICKS,
+        **aggregator_density_kwargs(),
     )
-    return daily_notional
+    for tick in ticks:
+        aggregator.handle_trade_tick(tick)
+    return counts
 
 
-def load_or_create_threshold_plan(symbol_arg: str) -> dict:
+def daily_bar_loss(
+    counts: dict[str, int],
+    *,
+    days: list[date],
+) -> tuple[float, int, float, int, int]:
+    values = [int(counts.get(day.isoformat(), 0)) for day in days]
+    total = sum(values)
+    mean_abs_error = sum(abs(value - TARGET_BARS_PER_DAY) for value in values) / len(values)
+    avg_per_day = total / len(values)
+    return mean_abs_error, total, avg_per_day, min(values), max(values)
+
+
+def next_threshold_scale(scale: float, total_bars: int, target_bars: int) -> float:
+    if total_bars <= 0 or target_bars <= 0:
+        return scale * 0.5
+    ratio = total_bars / target_bars
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        return scale
+    return max(1e-9, scale * (ratio**SCALE_SEARCH_DAMPING))
+
+
+def calibrate_dib_parameters(
+    *,
+    ticks: list[TradeTick],
+    instrument,
+    days: list[date],
+    target_bars: int,
+) -> tuple[dict, list[dict]]:
+    best: dict | None = None
+    rows: list[dict] = []
+    for ewma_span in EWMA_SPAN_CANDIDATES:
+        scale = 1.0
+        for iteration in range(1, SCALE_SEARCH_ITERATIONS + 1):
+            counts = count_daily_dib_bars(
+                ticks=ticks,
+                instrument=instrument,
+                target_bars=target_bars,
+                ewma_span=ewma_span,
+                threshold_scale=scale,
+            )
+            mean_abs_error, total, avg_per_day, min_daily, max_daily = daily_bar_loss(
+                counts,
+                days=days,
+            )
+            row = {
+                "ewma_span": ewma_span,
+                "threshold_scale": scale,
+                "iteration": iteration,
+                "bars": total,
+                "bars_per_day_avg": avg_per_day,
+                "min_daily_bars": min_daily,
+                "max_daily_bars": max_daily,
+                "mean_abs_daily_error": mean_abs_error,
+                "daily_counts": counts,
+            }
+            rows.append(row)
+            if best is None or (mean_abs_error, abs(total - target_bars)) < (
+                best["mean_abs_daily_error"],
+                abs(best["bars"] - target_bars),
+            ):
+                best = row
+            scale = next_threshold_scale(scale, total, target_bars)
+            gc.collect()
+    if best is None:
+        raise RuntimeError("DIB calibration produced no candidates")
+    selected = dict(best)
+    selected["threshold_scale"] = float(selected["threshold_scale"])
+    return selected, rows
+
+
+def load_or_create_calibration_plan(symbol_arg: str) -> dict:
     started = time.perf_counter()
     symbol = normalize_symbol(symbol_arg)
-    output_path = threshold_plan_path(symbol)
+    output_path = calibration_plan_path(symbol)
     if RESUME_CALIBRATION and output_path.exists():
         payload = json.loads(output_path.read_text(encoding="utf-8"))
-        mismatch_reason = threshold_plan_mismatch_reason(payload, symbol)
+        mismatch_reason = calibration_plan_mismatch_reason(payload, symbol)
         if mismatch_reason is None:
-            print(f"{symbol} resume: using DIB threshold plan -> {output_path}")
+            print(f"{symbol} resume: using DIB calibration plan -> {output_path}")
             return payload
-        print(f"{symbol} resume: ignoring stale DIB threshold plan ({mismatch_reason}) -> {output_path}")
+        print(f"{symbol} resume: ignoring stale DIB calibration plan ({mismatch_reason}) -> {output_path}")
 
-    history_start = parse_date(THRESHOLD_HISTORY_START)
-    generation_start = parse_date(GENERATION_START)
-    generation_end = parse_date(GENERATION_END)
-    if generation_start <= history_start:
-        raise SystemExit("GENERATION_START must be after THRESHOLD_HISTORY_START")
-    paths = archive_paths_for_range(
+    calibration_start = parse_date(CALIBRATION_START_CONFIG)
+    calibration_end = parse_date(CALIBRATION_END_CONFIG)
+    generation_start = parse_date(GENERATION_START_CONFIG)
+    if calibration_end < calibration_start:
+        raise SystemExit("CALIBRATION_END must be on or after CALIBRATION_START")
+    if calibration_end >= generation_start:
+        raise SystemExit("CALIBRATION_END must be before GENERATION_START to avoid overlap")
+
+    calibration_paths = archive_paths_for_range(
         input_dir=INPUT_DIR,
         product=PRODUCT,
         symbol=symbol,
-        start=history_start,
-        end=generation_end,
+        start=calibration_start,
+        end=calibration_end,
     )
-    instrument = make_binance_perpetual(symbol, paths)
-    daily_notional = load_incremental_daily_notional(
-        symbol=symbol,
+    instrument = make_binance_perpetual(symbol, calibration_paths)
+    calibration_ticks = load_trade_ticks(
+        calibration_paths,
+        instrument,
+        start_ms=date_to_ms(calibration_start),
+        end_ms=next_date_ms(calibration_end),
+        use_cache=USE_TICK_CACHE,
+        cache_dir=TICK_CACHE_DIR,
+    )
+    calibration_days = list(iter_days(calibration_start, calibration_end))
+    calibration_target_bars = TARGET_BARS_PER_DAY * len(calibration_days)
+    selected, candidates = calibrate_dib_parameters(
+        ticks=calibration_ticks,
         instrument=instrument,
-        history_start=history_start,
-        generation_end=generation_end,
-    )
-    threshold_schedule = build_threshold_schedule(
-        daily_notional,
-        start=generation_start,
-        end=generation_end,
+        days=calibration_days,
+        target_bars=calibration_target_bars,
     )
     payload = {
-        **expected_threshold_plan_config(symbol),
+        **expected_calibration_plan_config(symbol),
+        "calibration_days": len(calibration_days),
+        "calibration_target_bars": calibration_target_bars,
+        "calibration_ticks": len(calibration_ticks),
+        "selected": selected,
+        "candidates": candidates,
         "use_tick_cache": USE_TICK_CACHE,
         "tick_cache_dir": str(TICK_CACHE_DIR),
-        "daily_notional": daily_notional,
-        "threshold_schedule": threshold_schedule,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(
-        f"{symbol} threshold plan periods={len(threshold_schedule)} "
-        f"first_threshold={threshold_schedule[0]['threshold']:.2f}",
+        f"{symbol} DIB calibration selected ewma_span={selected['ewma_span']} "
+        f"scale={selected['threshold_scale']:.8f} bars={selected['bars']:,} "
+        f"avg/day={selected['bars_per_day_avg']:.2f}",
     )
-    print(f"{symbol} wrote threshold plan -> {output_path}")
+    print(f"{symbol} wrote DIB calibration plan -> {output_path}")
     return payload
 
 
@@ -1163,25 +1150,45 @@ def cumulative_catalog_path(symbol: str, end: date) -> Path:
     return CATALOG_DIR / symbol / output_label_with_kind(symbol, start, end)
 
 
-def summary_matches_generation_config(payload: dict, symbol: str) -> bool:
+def summary_matches_generation_config(
+    payload: dict,
+    symbol: str,
+    calibration_payload: dict | None = None,
+) -> bool:
     expected = {
         "symbol": symbol,
         "kind": "DIB",
-        "threshold_method": "rolling_daily_notional_sma",
-        "threshold_history_start": THRESHOLD_HISTORY_START,
-        "threshold_rolling_window_days": THRESHOLD_ROLLING_WINDOW_DAYS,
-        "threshold_daily_notional_divisor": THRESHOLD_DAILY_NOTIONAL_DIVISOR,
-        "threshold_update_frequency": THRESHOLD_UPDATE_FREQUENCY,
-        "threshold_min_lookback_days": THRESHOLD_MIN_LOOKBACK_DAYS,
+        "threshold_method": generation_threshold_method(),
+        "calibration_start_date": CALIBRATION_START_CONFIG,
+        "calibration_end_date": CALIBRATION_END_CONFIG,
         "target_bars_per_day": TARGET_BARS_PER_DAY,
-        "ewma_span": EWMA_SPAN,
+        "ewma_span_candidates": EWMA_SPAN_CANDIDATES,
+        "scale_search_iterations": SCALE_SEARCH_ITERATIONS,
+        "scale_search_damping": SCALE_SEARCH_DAMPING,
+        "imbalance_floor_frac": IMBALANCE_FLOOR_FRAC,
+        "adaptive_density": ADAPTIVE_DENSITY,
+        "rolling_density": rolling_density_summary_config(),
         "update_expected_ticks": UPDATE_EXPECTED_TICKS,
         "write_catalog": WRITE_CATALOG,
     }
-    return all(payload.get(key) == value for key, value in expected.items())
+    if not all(payload.get(key) == value for key, value in expected.items()):
+        return False
+    if not has_valid_rolling_density_checkpoint(payload):
+        return False
+    if calibration_payload is None:
+        return True
+    selected = calibration_payload["selected"]
+    if payload.get("ewma_span") != int(selected["ewma_span"]):
+        return False
+    return abs(
+        float(payload.get("threshold_scale", 0.0)) - float(selected["threshold_scale"]),
+    ) <= 1e-12
 
 
-def matching_generated_summaries(symbol_arg: str) -> list[dict]:
+def matching_generated_summaries(
+    symbol_arg: str,
+    calibration_payload: dict | None = None,
+) -> list[dict]:
     symbol = normalize_symbol(symbol_arg)
     symbol_dir = OUTPUT_DIR / symbol
     if not symbol_dir.exists():
@@ -1193,7 +1200,7 @@ def matching_generated_summaries(symbol_arg: str) -> list[dict]:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if not summary_matches_generation_config(payload, symbol):
+        if not summary_matches_generation_config(payload, symbol, calibration_payload):
             continue
         start_value = payload.get("start_date")
         end_date = payload.get("end_date")
@@ -1217,29 +1224,55 @@ def matching_generated_summaries(symbol_arg: str) -> list[dict]:
     return sorted(summaries, key=lambda item: (item["start"], item["end"]))
 
 
-def latest_generated_summary_end(symbol_arg: str) -> date | None:
+def latest_generated_summary_end(
+    symbol_arg: str,
+    calibration_payload: dict | None = None,
+) -> date | None:
     latest: date | None = None
-    for summary in matching_generated_summaries(symbol_arg):
+    for summary in matching_generated_summaries(symbol_arg, calibration_payload):
         end = summary["end"]
         if latest is None or end > latest:
             latest = end
     return latest
 
 
-def generation_range_for_symbol(symbol_arg: str) -> tuple[date, date]:
+def generation_range_for_symbol(
+    symbol_arg: str,
+    calibration_payload: dict | None = None,
+) -> tuple[date, date]:
     end = resolve_generation_end(GENERATION_END_CONFIG, incremental=INCREMENTAL_ENABLED)
     if INCREMENTAL_ENABLED:
-        latest_end = latest_generated_summary_end(symbol_arg)
+        latest_end = latest_generated_summary_end(symbol_arg, calibration_payload)
         start = latest_end + timedelta(days=1) if latest_end is not None else parse_date(GENERATION_START_FALLBACK)
     else:
         start = parse_date(GENERATION_START_CONFIG)
     return start, end
 
 
-def base_catalog_summary(symbol_arg: str) -> dict | None:
+def previous_generation_summary(
+    symbol_arg: str,
+    *,
+    start: date,
+    calibration_payload: dict,
+) -> dict | None:
+    previous_end = start - timedelta(days=1)
+    matches = [
+        summary
+        for summary in matching_generated_summaries(symbol_arg, calibration_payload)
+        if summary["end"] == previous_end
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: item["start"])
+
+
+def base_catalog_summary(
+    symbol_arg: str,
+    calibration_payload: dict | None = None,
+) -> dict | None:
     summaries = [
         summary
-        for summary in matching_generated_summaries(symbol_arg)
+        for summary in matching_generated_summaries(symbol_arg, calibration_payload)
         if summary["catalog_path"] is not None and summary["catalog_path"].exists()
     ]
     if not summaries:
@@ -1252,20 +1285,28 @@ def base_catalog_summary(symbol_arg: str) -> dict | None:
     return summaries[0]
 
 
-def catalog_path_for_generation(symbol: str, label: str) -> tuple[Path, bool]:
+def catalog_path_for_generation(
+    symbol: str,
+    label: str,
+    calibration_payload: dict | None = None,
+) -> tuple[Path, bool]:
     default_path = CATALOG_DIR / symbol / label
     if not INCREMENTAL_ENABLED:
         return default_path, False
 
-    summary = base_catalog_summary(symbol)
+    summary = base_catalog_summary(symbol, calibration_payload)
     if summary is None:
         return default_path, False
     return summary["catalog_path"], True
 
 
-def update_matching_summary_catalog_paths(symbol_arg: str, catalog_path: Path) -> None:
+def update_matching_summary_catalog_paths(
+    symbol_arg: str,
+    catalog_path: Path,
+    calibration_payload: dict | None = None,
+) -> None:
     catalog_path_text = str(catalog_path)
-    for summary in matching_generated_summaries(symbol_arg):
+    for summary in matching_generated_summaries(symbol_arg, calibration_payload):
         payload = summary["payload"]
         if payload.get("catalog_path") == catalog_path_text:
             continue
@@ -1311,39 +1352,48 @@ def move_catalog_path(source: Path, destination: Path) -> Path:
     return destination
 
 
-def finalize_incremental_catalog_path(symbol: str, catalog_path: Path, end: date) -> Path:
+def finalize_incremental_catalog_path(
+    symbol: str,
+    catalog_path: Path,
+    end: date,
+    calibration_payload: dict | None = None,
+) -> Path:
     if not INCREMENTAL_ENABLED or not WRITE_CATALOG:
         return catalog_path
 
     final_path = move_catalog_path(catalog_path, cumulative_catalog_path(symbol, end))
-    update_matching_summary_catalog_paths(symbol, final_path)
+    update_matching_summary_catalog_paths(symbol, final_path, calibration_payload)
     return final_path
 
 
-def repair_split_incremental_catalogs(symbol_arg: str) -> None:
+def repair_split_incremental_catalogs(
+    symbol_arg: str,
+    calibration_payload: dict | None = None,
+) -> None:
     if not INCREMENTAL_ENABLED or not WRITE_CATALOG:
         return
 
-    base_summary = base_catalog_summary(symbol_arg)
+    base_summary = base_catalog_summary(symbol_arg, calibration_payload)
     if base_summary is None:
         return
     base_path = base_summary["catalog_path"]
     copied = 0
-    for summary in matching_generated_summaries(symbol_arg):
+    for summary in matching_generated_summaries(symbol_arg, calibration_payload):
         catalog_path = summary["catalog_path"]
         if catalog_path is None or not catalog_path.exists() or paths_equal(catalog_path, base_path):
             continue
         copied += copy_catalog_files(catalog_path, base_path)
     if copied:
         print(f"{normalize_symbol(symbol_arg)} repaired split catalog files={copied} -> {base_path}")
-    latest_end = latest_generated_summary_end(symbol_arg)
+    latest_end = latest_generated_summary_end(symbol_arg, calibration_payload)
     if latest_end is not None:
         final_path = finalize_incremental_catalog_path(
             normalize_symbol(symbol_arg),
             base_path,
             latest_end,
+            calibration_payload,
         )
-        update_matching_summary_catalog_paths(symbol_arg, final_path)
+        update_matching_summary_catalog_paths(symbol_arg, final_path, calibration_payload)
 
 
 def completed_csv_summary_matches(  # noqa: C901
@@ -1354,7 +1404,7 @@ def completed_csv_summary_matches(  # noqa: C901
     symbol: str,
     start: date,
     end: date,
-    threshold_payload: dict,
+    calibration_payload: dict,
 ) -> dict | None:
     if not summary_path.exists() or not output_path.exists() or tmp_path.exists():
         return None
@@ -1367,12 +1417,17 @@ def completed_csv_summary_matches(  # noqa: C901
         "kind": "DIB",
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
-        "threshold_method": "rolling_daily_notional_sma",
-        "threshold_rolling_window_days": THRESHOLD_ROLLING_WINDOW_DAYS,
-        "threshold_daily_notional_divisor": THRESHOLD_DAILY_NOTIONAL_DIVISOR,
-        "threshold_update_frequency": THRESHOLD_UPDATE_FREQUENCY,
+        "threshold_method": generation_threshold_method(),
+        "calibration_start_date": CALIBRATION_START_CONFIG,
+        "calibration_end_date": CALIBRATION_END_CONFIG,
         "target_bars_per_day": TARGET_BARS_PER_DAY,
-        "ewma_span": int(threshold_payload["ewma_span"]),
+        "ewma_span_candidates": EWMA_SPAN_CANDIDATES,
+        "scale_search_iterations": SCALE_SEARCH_ITERATIONS,
+        "scale_search_damping": SCALE_SEARCH_DAMPING,
+        "imbalance_floor_frac": IMBALANCE_FLOOR_FRAC,
+        "adaptive_density": ADAPTIVE_DENSITY,
+        "rolling_density": rolling_density_summary_config(),
+        "ewma_span": int(calibration_payload["selected"]["ewma_span"]),
         "update_expected_ticks": UPDATE_EXPECTED_TICKS,
     }
     for key, expected_value in expected.items():
@@ -1382,7 +1437,12 @@ def completed_csv_summary_matches(  # noqa: C901
                 return None
         elif actual_value != expected_value:
             return None
-    if summary.get("threshold_schedule") != threshold_payload.get("threshold_schedule"):
+    if not has_valid_rolling_density_checkpoint(summary):
+        return None
+    if abs(
+        float(summary.get("threshold_scale", 0.0))
+        - float(calibration_payload["selected"]["threshold_scale"])
+    ) > 1e-12:
         return None
     if int(summary.get("bars", -1)) <= 0:
         return None
@@ -1393,7 +1453,10 @@ def completed_csv_summary_matches(  # noqa: C901
     return summary
 
 
-def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
+def generate_dib_for_symbol(  # noqa: C901
+    symbol_arg: str,
+    calibration_payload: dict,
+) -> None:
     started = time.perf_counter()
     symbol = normalize_symbol(symbol_arg)
     start = parse_date(GENERATION_START)
@@ -1401,24 +1464,33 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     if end < start:
         raise SystemExit("GENERATION_END must be on or after GENERATION_START")
 
-    history_start = parse_date(THRESHOLD_HISTORY_START)
-    expectation_start = start - timedelta(days=THRESHOLD_ROLLING_WINDOW_DAYS)
-    if expectation_start < history_start:
-        expectation_start = history_start
-    expectation_end = start - timedelta(days=1)
-    ewma_span = int(threshold_payload["ewma_span"])
-    threshold_schedule = threshold_payload["threshold_schedule"]
-    threshold_provider = NotionalThresholdSchedule(threshold_schedule)
+    calibration_start = parse_date(CALIBRATION_START_CONFIG)
+    calibration_end = parse_date(CALIBRATION_END_CONFIG)
+    if calibration_end >= start:
+        raise SystemExit("CALIBRATION_END must be before generation start to avoid overlap")
+    selected = calibration_payload["selected"]
+    ewma_span = int(selected["ewma_span"])
+    threshold_scale = float(selected["threshold_scale"])
     days = (end - start).days + 1
     target_bars_total = TARGET_BARS_PER_DAY * days
 
     label = output_label(symbol, start, end)
     catalog_label = output_label_with_kind(symbol, start, end)
-    catalog_path, append_existing_catalog = catalog_path_for_generation(symbol, catalog_label)
+    catalog_path, append_existing_catalog = catalog_path_for_generation(
+        symbol,
+        catalog_label,
+        calibration_payload,
+    )
     output_dir = OUTPUT_DIR / symbol
     output_path = output_dir / f"{label}_DIB.csv"
     summary_path = output_dir / f"{label}_DIB_summary.json"
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    assert_no_stale_output_tmp(
+        tmp_path=tmp_path,
+        output_path=output_path,
+        summary_path=summary_path,
+        kind="DIB",
+    )
 
     if RESUME_COMPLETED_CSV:
         existing_summary = completed_csv_summary_matches(
@@ -1428,7 +1500,7 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
             symbol=symbol,
             start=start,
             end=end,
-            threshold_payload=threshold_payload,
+            calibration_payload=calibration_payload,
         )
         if existing_summary is not None:
             print(
@@ -1446,30 +1518,53 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     )
     instrument = make_binance_perpetual(symbol, generation_paths)
 
-    expectation_paths = archive_paths_for_range(
+    calibration_paths = archive_paths_for_range(
         input_dir=INPUT_DIR,
         product=PRODUCT,
         symbol=symbol,
-        start=expectation_start,
-        end=expectation_end,
+        start=calibration_start,
+        end=calibration_end,
     )
-    expectation_ticks = load_trade_ticks(
-        expectation_paths,
+    calibration_ticks = load_trade_ticks(
+        calibration_paths,
         instrument,
-        start_ms=date_to_ms(expectation_start),
-        end_ms=next_date_ms(expectation_end),
+        start_ms=date_to_ms(calibration_start),
+        end_ms=next_date_ms(calibration_end),
         use_cache=USE_TICK_CACHE,
         cache_dir=TICK_CACHE_DIR,
     )
-    expectation_days = (expectation_end - expectation_start).days + 1
-    expectation_target = TARGET_BARS_PER_DAY * expectation_days
-    expectations = estimate_afml_dollar_expectations(expectation_ticks, expectation_target)
+    calibration_days = (calibration_end - calibration_start).days + 1
+    calibration_target = TARGET_BARS_PER_DAY * calibration_days
+    expectations = estimate_afml_dollar_expectations(calibration_ticks, calibration_target)
+    previous_summary = previous_generation_summary(
+        symbol,
+        start=start,
+        calibration_payload=calibration_payload,
+    )
+    density_controller: RollingDensityController | None = None
+    density_state_source: str | None = None
+    if ROLLING_DENSITY_ENABLED:
+        if previous_summary is None:
+            density_controller = RollingDensityController(
+                config=ROLLING_DENSITY_CONFIG,
+                initial_tick_forecast=expectations.expected_ticks * TARGET_BARS_PER_DAY,
+                initial_threshold_scale=threshold_scale,
+            )
+        else:
+            previous_payload = previous_summary["payload"]
+            expectations = AfmlBarExpectations(**previous_payload["final_expectations"])
+            density_controller = RollingDensityController.from_state(
+                config=ROLLING_DENSITY_CONFIG,
+                state=previous_payload["density_controller_state"],
+            )
+            density_state_source = str(previous_summary["summary_path"])
+        expectations.expected_ticks = density_controller.expected_ticks
 
     print(
         f"{symbol} DIB generation={start:%Y-%m-%d}..{end:%Y-%m-%d} "
-        f"threshold=daily_notional_sma({THRESHOLD_ROLLING_WINDOW_DAYS}d)/"
-        f"{THRESHOLD_DAILY_NOTIONAL_DIVISOR} "
-        f"update={THRESHOLD_UPDATE_FREQUENCY} ewma_span={ewma_span}",
+        f"threshold={generation_threshold_method()} "
+        f"calibration={calibration_start:%Y-%m-%d}..{calibration_end:%Y-%m-%d} "
+        f"ewma_span={ewma_span} scale={threshold_scale:.8f}",
     )
 
     writer = StreamingDibCsvWriter(output_path)
@@ -1483,17 +1578,31 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
         else NullCatalogSink()
     )
     bar_type = make_bar_type(instrument, TARGET_BARS_PER_DAY)
-    aggregator = AfmlDollarImbalanceBarAggregator(
-        instrument=instrument,
-        bar_type=bar_type,
-        handler=catalog_sink.append,
-        meta_handler=writer.handle,
-        expectations=expectations,
-        ewma_span=ewma_span,
-        threshold_scale=1.0,
-        update_expected_ticks=UPDATE_EXPECTED_TICKS,
-        threshold_provider=threshold_provider,
-    )
+
+    def create_aggregator(
+        expectation_state: AfmlBarExpectations,
+    ) -> AfmlDollarImbalanceBarAggregator:
+        effective_scale = (
+            density_controller.threshold_scale
+            if density_controller is not None
+            else threshold_scale
+        )
+        return AfmlDollarImbalanceBarAggregator(
+            instrument=instrument,
+            bar_type=bar_type,
+            handler=catalog_sink.append,
+            meta_handler=writer.handle,
+            expectations=expectation_state,
+            ewma_span=ewma_span,
+            threshold_scale=effective_scale,
+            imbalance_floor_frac=IMBALANCE_FLOOR_FRAC,
+            update_expected_ticks=UPDATE_EXPECTED_TICKS,
+            **aggregator_density_kwargs(),
+        )
+
+    aggregator = create_aggregator(expectations)
+    active_month: str | None = None
+    monthly_state_resets: list[dict] = []
 
     ticks_processed = 0
     try:
@@ -1505,10 +1614,40 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
             use_cache=USE_TICK_CACHE,
             cache_dir=TICK_CACHE_DIR,
         ):
+            if density_controller is not None:
+                settings_changed = density_controller.on_tick(
+                    int(tick.ts_event),
+                    total_bars=writer.count,
+                )
+                if settings_changed:
+                    current_day = density_controller.current_day_iso
+                    assert current_day is not None
+                    current_month = current_day[:7]
+                    if active_month is None:
+                        active_month = current_month
+                    elif current_month != active_month:
+                        previous_month = active_month
+                        dropped_partial_ticks = aggregator.ticks
+                        expectations = AfmlBarExpectations(
+                            **afml_expectations_to_dict(aggregator.expectations),
+                        )
+                        aggregator = create_aggregator(expectations)
+                        monthly_state_resets.append(
+                            {
+                                "effective_month": current_month,
+                                "previous_month": previous_month,
+                                "dropped_partial_ticks": dropped_partial_ticks,
+                            },
+                        )
+                        active_month = current_month
+                    aggregator.expectations.expected_ticks = density_controller.expected_ticks
+                    aggregator.threshold_scale = density_controller.threshold_scale
             aggregator.handle_trade_tick(tick)
             ticks_processed += 1
             if ticks_processed % 5_000_000 == 0:
                 print(f"processed ticks={ticks_processed:,} DIB={writer.count:,}")
+        if density_controller is not None:
+            density_controller.finish(total_bars=writer.count)
     finally:
         catalog_sink.close()
         writer.close()
@@ -1516,7 +1655,12 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
     writer.commit()
     final_catalog_path = catalog_sink.catalog_path
     if final_catalog_path is not None:
-        final_catalog_path = finalize_incremental_catalog_path(symbol, final_catalog_path, end)
+        final_catalog_path = finalize_incremental_catalog_path(
+            symbol,
+            final_catalog_path,
+            end,
+            calibration_payload,
+        )
         catalog_sink.catalog_path = final_catalog_path
 
     summary = {
@@ -1532,18 +1676,29 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
         "target_bars_per_day": TARGET_BARS_PER_DAY,
         "target_bars_total": target_bars_total,
         "bar_type": str(bar_type),
-        "threshold_method": "rolling_daily_notional_sma",
-        "threshold_history_start": THRESHOLD_HISTORY_START,
-        "threshold_rolling_window_days": THRESHOLD_ROLLING_WINDOW_DAYS,
-        "threshold_daily_notional_divisor": THRESHOLD_DAILY_NOTIONAL_DIVISOR,
-        "threshold_update_frequency": THRESHOLD_UPDATE_FREQUENCY,
-        "threshold_min_lookback_days": THRESHOLD_MIN_LOOKBACK_DAYS,
-        "threshold_schedule": threshold_schedule,
+        "threshold_method": generation_threshold_method(),
+        "calibration_start_date": calibration_start.isoformat(),
+        "calibration_end_date": calibration_end.isoformat(),
+        "calibration_days": calibration_days,
+        "calibration_target_bars": calibration_target,
+        "calibration_ticks": len(calibration_ticks),
+        "ewma_span_candidates": EWMA_SPAN_CANDIDATES,
+        "scale_search_iterations": SCALE_SEARCH_ITERATIONS,
+        "scale_search_damping": SCALE_SEARCH_DAMPING,
+        "imbalance_floor_frac": IMBALANCE_FLOOR_FRAC,
         "ewma_span": ewma_span,
-        "initial_expectation_start_date": expectation_start.isoformat(),
-        "initial_expectation_end_date": expectation_end.isoformat(),
-        "initial_expectation_days": expectation_days,
-        "initial_expectation_target_bars": expectation_target,
+        "threshold_scale": threshold_scale,
+        "calibration_selected": selected,
+        "adaptive_density": ADAPTIVE_DENSITY,
+        "rolling_density": rolling_density_summary_config(),
+        "density_adjustment_strength": DENSITY_ADJUSTMENT_STRENGTH,
+        "density_min_scale": DENSITY_MIN_SCALE,
+        "density_max_scale": DENSITY_MAX_SCALE,
+        "density_min_elapsed_fraction": DENSITY_MIN_ELAPSED_FRACTION,
+        "initial_expectation_start_date": calibration_start.isoformat(),
+        "initial_expectation_end_date": calibration_end.isoformat(),
+        "initial_expectation_days": calibration_days,
+        "initial_expectation_target_bars": calibration_target,
         "update_expected_ticks": UPDATE_EXPECTED_TICKS,
         "write_catalog": WRITE_CATALOG,
         "use_tick_cache": USE_TICK_CACHE,
@@ -1556,6 +1711,23 @@ def generate_dib_for_symbol(symbol_arg: str, threshold_payload: dict) -> None:
         "bars": writer.count,
         "bars_per_day_avg": writer.count / days,
         "daily_counts": writer.daily_counts,
+        "density_state_source": density_state_source,
+        "density_daily_schedule": (
+            density_controller.daily_records if density_controller is not None else []
+        ),
+        "density_controller_state": (
+            density_controller.state_dict() if density_controller is not None else None
+        ),
+        "final_expectations": {
+            **afml_expectations_to_dict(aggregator.expectations),
+            "expected_ticks": (
+                density_controller.expected_ticks
+                if density_controller is not None
+                else aggregator.expectations.expected_ticks
+            ),
+        },
+        "monthly_state_resets": monthly_state_resets,
+        "end_partial_ticks_dropped": aggregator.ticks,
         "path": str(output_path),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
@@ -1570,26 +1742,26 @@ def main() -> None:
     target_end = resolve_generation_end(GENERATION_END_CONFIG, incremental=INCREMENTAL_ENABLED)
     print(
         "AFML DIB from Binance aggTrades "
-        f"threshold_history={THRESHOLD_HISTORY_START}..{target_end:%Y-%m-%d} "
-        f"threshold=daily_notional_sma({THRESHOLD_ROLLING_WINDOW_DAYS}d)/"
-        f"{THRESHOLD_DAILY_NOTIONAL_DIVISOR} "
-        f"update={THRESHOLD_UPDATE_FREQUENCY} "
+        f"calibration={CALIBRATION_START_CONFIG}..{CALIBRATION_END_CONFIG} "
+        f"generation_end={target_end:%Y-%m-%d} "
+        f"threshold={generation_threshold_method()} target={TARGET_BARS_PER_DAY}/day "
+        f"ewma_candidates={EWMA_SPAN_CANDIDATES} "
         f"product={PRODUCT} "
         f"tick_cache={'on' if USE_TICK_CACHE else 'off'} "
         f"catalog={'on' if WRITE_CATALOG else 'off'}",
     )
     for index, symbol in enumerate(SYMBOLS, start=1):
         normalized = normalize_symbol(symbol)
-        repair_split_incremental_catalogs(symbol)
-        start, end = generation_range_for_symbol(symbol)
+        calibration_payload = load_or_create_calibration_plan(symbol)
+        repair_split_incremental_catalogs(symbol, calibration_payload)
+        start, end = generation_range_for_symbol(symbol, calibration_payload)
         if start > end:
             print(f"\n[{index}/{len(SYMBOLS)}] {normalized} already current through {end:%Y-%m-%d}")
             continue
         set_generation_range(start, end)
         print(f"\n[{index}/{len(SYMBOLS)}] {normalized}")
         print(f"{normalized} generation range {GENERATION_START}..{GENERATION_END}")
-        threshold_payload = load_or_create_threshold_plan(symbol)
-        generate_dib_for_symbol(symbol, threshold_payload)
+        generate_dib_for_symbol(symbol, calibration_payload)
 
 
 if __name__ == "__main__":

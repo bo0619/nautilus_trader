@@ -125,6 +125,7 @@ bench_data/
 nautilus_trader/**/.gitignore
 nautilus_trader/test_kit/mocks/.nautilus/
 nautilus_trader.egg-info
+tests/*
 tests/test_data/catalog/
 tests/test_data/large/*
 tests/test_data/local/
@@ -138,3 +139,7 @@ tests/test_data/**/backtest/**
 !tests/test_data/nautilus/*/**.parquet
 !tests/integration_tests/adapters/betfair/responses/*.log
 !/nautilus_core/adapters/src/databento/test_data/*
+
+# my personal codes
+binance_scripts/*
+afml_strategies/output/*

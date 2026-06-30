@@ -31,9 +31,11 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.events import PositionClosed
+from nautilus_trader.model.events import PositionOpened
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.trading.strategy import Strategy
 
@@ -63,6 +65,9 @@ class AfmlSignalStrategyConfig(StrategyConfig, frozen=True):
     reset_barrier_on_resize: bool = False
     close_positions_on_stop: bool = True
     reduce_only_on_stop: bool = True
+    entry_order_type: str = "market"
+    entry_limit_post_only: bool = False
+    entry_limit_offset_bps: float = 0.0
 
 
 class AfmlSignalStrategy(Strategy):
@@ -87,6 +92,11 @@ class AfmlSignalStrategy(Strategy):
             config.vertical_barrier_days,
             "vertical_barrier_days",
         )
+        self._entry_order_type = str(config.entry_order_type or "market").strip().lower()
+        if self._entry_order_type not in {"market", "limit"}:
+            raise ValueError("entry_order_type must be 'market' or 'limit'")
+        self._entry_limit_post_only = bool(config.entry_limit_post_only)
+        self._entry_limit_offset_bps = float(config.entry_limit_offset_bps)
         self._signals = self._load_signals(config.signal_path)
         self._pending_target_side: OrderSide | None = None
         self._pending_target_size_multiplier = Decimal(1)
@@ -95,6 +105,7 @@ class AfmlSignalStrategy(Strategy):
         self._pending_entry_profit_taking_mult: float | None = None
         self._pending_entry_stop_loss_mult: float | None = None
         self._pending_entry_ts_event: int | None = None
+        self._entry_order_pending = False
         self._close_pending = False
         self._entry_side: OrderSide | None = None
         self._entry_price: float | None = None
@@ -234,6 +245,9 @@ class AfmlSignalStrategy(Strategy):
         """
         if self._check_triple_barrier_exit(bar):
             return
+        if self._entry_order_pending and self.portfolio.is_flat(self.config.instrument_id):
+            self.cancel_all_orders(self.config.instrument_id)
+            self._clear_pending_entry_request()
 
         item = self._signals.get(int(bar.ts_event))
         if item is None:
@@ -330,9 +344,9 @@ class AfmlSignalStrategy(Strategy):
             self._pending_target_side = None
             self._pending_target_size_multiplier = Decimal(1)
             self._close_pending = False
-            self._submit_market(side, abs(target_signed_qty))
-            self._set_barrier_entry(
+            self._submit_entry(
                 side,
+                abs(target_signed_qty),
                 bar=bar,
                 target=target,
                 profit_taking_mult=profit_taking_mult,
@@ -383,6 +397,16 @@ class AfmlSignalStrategy(Strategy):
         self._pending_entry_stop_loss_mult = stop_loss_mult
         self._pending_entry_ts_event = int(bar.ts_event)
 
+    def _clear_pending_entry_request(self) -> None:
+        self._pending_target_side = None
+        self._pending_target_size_multiplier = Decimal(1)
+        self._pending_entry_price = None
+        self._pending_entry_target = None
+        self._pending_entry_profit_taking_mult = None
+        self._pending_entry_stop_loss_mult = None
+        self._pending_entry_ts_event = None
+        self._entry_order_pending = False
+
     def _target_signed_qty(self, side: OrderSide, size_multiplier: Decimal) -> Decimal:
         target_qty = self.config.trade_size * size_multiplier
         return target_qty if side == OrderSide.BUY else -target_qty
@@ -430,16 +454,11 @@ class AfmlSignalStrategy(Strategy):
         return self._submit_market(side, quantity, reduce_only=reduce_only)
 
     def _flatten(self) -> None:
-        self._pending_target_side = None
-        self._pending_target_size_multiplier = Decimal(1)
-        self._pending_entry_price = None
-        self._pending_entry_target = None
-        self._pending_entry_profit_taking_mult = None
-        self._pending_entry_stop_loss_mult = None
-        self._pending_entry_ts_event = None
+        self._clear_pending_entry_request()
         if self.portfolio.is_flat(self.config.instrument_id):
             self._close_pending = False
             self._clear_barrier_entry()
+            self.cancel_all_orders(self.config.instrument_id)
             return
         if not self._close_pending:
             self._close_pending = True
@@ -558,17 +577,118 @@ class AfmlSignalStrategy(Strategy):
             self._pending_entry_profit_taking_mult = None
             self._pending_entry_stop_loss_mult = None
             self._pending_entry_ts_event = None
-            self._submit_market(pending_side, self.config.trade_size * pending_size_multiplier)
-            if pending_price is not None and pending_ts_event is not None:
-                self._entry_side = pending_side
-                self._entry_price = pending_price
-                self._entry_target = pending_target
-                self._entry_profit_taking_mult = pending_profit_taking_mult
-                self._entry_stop_loss_mult = pending_stop_loss_mult
-                self._entry_ts_event = pending_ts_event
-                self._entry_bar_count = 0
+            quantity = self.config.trade_size * pending_size_multiplier
+            if self._entry_order_type == "limit" and pending_price is not None:
+                if self._submit_limit(pending_side, quantity, price=pending_price):
+                    self._pending_target_side = pending_side
+                    self._pending_target_size_multiplier = pending_size_multiplier
+                    self._pending_entry_price = pending_price
+                    self._pending_entry_target = pending_target
+                    self._pending_entry_profit_taking_mult = pending_profit_taking_mult
+                    self._pending_entry_stop_loss_mult = pending_stop_loss_mult
+                    self._pending_entry_ts_event = pending_ts_event
+                    self._entry_order_pending = True
+            else:
+                self._submit_market(pending_side, quantity)
+                if pending_price is not None and pending_ts_event is not None:
+                    self._entry_side = pending_side
+                    self._entry_price = pending_price
+                    self._entry_target = pending_target
+                    self._entry_profit_taking_mult = pending_profit_taking_mult
+                    self._entry_stop_loss_mult = pending_stop_loss_mult
+                    self._entry_ts_event = pending_ts_event
+                    self._entry_bar_count = 0
         else:
             self._clear_barrier_entry()
+
+    def on_position_opened(self, event: PositionOpened) -> None:
+        if event.instrument_id != self.config.instrument_id:
+            return
+        if not self._entry_order_pending or self._pending_target_side is None:
+            return
+        pending_price = self._pending_entry_price
+        pending_ts_event = self._pending_entry_ts_event
+        if pending_price is None or pending_ts_event is None:
+            self._clear_pending_entry_request()
+            return
+        self._entry_side = self._pending_target_side
+        self._entry_price = pending_price
+        self._entry_target = self._pending_entry_target
+        self._entry_profit_taking_mult = self._pending_entry_profit_taking_mult
+        self._entry_stop_loss_mult = self._pending_entry_stop_loss_mult
+        self._entry_ts_event = pending_ts_event
+        self._entry_bar_count = 0
+        self._clear_pending_entry_request()
+
+    def _submit_entry(
+        self,
+        side: OrderSide,
+        quantity: Decimal,
+        *,
+        bar: Bar,
+        target: float | None,
+        profit_taking_mult: float | None,
+        stop_loss_mult: float | None,
+    ) -> bool:
+        if self._entry_order_type == "limit":
+            limit_price = self._entry_limit_price(side, bar)
+            if not self._submit_limit(side, quantity, price=limit_price):
+                return False
+            self._set_pending_target(
+                side,
+                Decimal(str(max(0.0, min(1.0, quantity / self.config.trade_size)))),
+                bar=bar,
+                target=target,
+                profit_taking_mult=profit_taking_mult,
+                stop_loss_mult=stop_loss_mult,
+            )
+            self._pending_entry_price = limit_price
+            self._entry_order_pending = True
+            return True
+        if not self._submit_market(side, quantity):
+            return False
+        self._set_barrier_entry(
+            side,
+            bar=bar,
+            target=target,
+            profit_taking_mult=profit_taking_mult,
+            stop_loss_mult=stop_loss_mult,
+        )
+        return True
+
+    def _entry_limit_price(self, side: OrderSide, bar: Bar) -> float:
+        offset = max(0.0, self._entry_limit_offset_bps) / 10_000.0
+        close = float(bar.close)
+        if side == OrderSide.BUY:
+            return close * (1.0 - offset)
+        return close * (1.0 + offset)
+
+    def _submit_limit(
+        self,
+        side: OrderSide,
+        quantity: Decimal,
+        *,
+        price: float,
+    ) -> bool:
+        if quantity <= 0:
+            return False
+        if self.config.min_position_change > 0 and quantity < self.config.min_position_change:
+            return False
+        assert self.instrument is not None
+        order_qty = self._order_qty(quantity)
+        if self._quantity_is_zero(order_qty):
+            return False
+        order: LimitOrder = self.order_factory.limit(
+            instrument_id=self.config.instrument_id,
+            order_side=side,
+            quantity=order_qty,
+            price=self.instrument.make_price(price),
+            time_in_force=self.config.order_time_in_force or TimeInForce.GTC,
+            post_only=self._entry_limit_post_only,
+            reduce_only=False,
+        )
+        self.submit_order(order)
+        return True
 
     def _submit_market(
         self,
@@ -609,12 +729,7 @@ class AfmlSignalStrategy(Strategy):
         """
         Clean up orders, positions, and subscriptions.
         """
-        self._pending_target_side = None
-        self._pending_entry_price = None
-        self._pending_entry_target = None
-        self._pending_entry_profit_taking_mult = None
-        self._pending_entry_stop_loss_mult = None
-        self._pending_entry_ts_event = None
+        self._clear_pending_entry_request()
         self._close_pending = False
         self._clear_barrier_entry()
         self.cancel_all_orders(self.config.instrument_id)

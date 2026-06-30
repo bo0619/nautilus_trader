@@ -1,0 +1,278 @@
+{
+  "name": "cvdslope_profit_hf_maker_v2",
+  "description": "Maker-style high-frequency DRB AFML profile without hard-coded UTC session or weekday filters.",
+  "event_definition": {
+    "trend_window_bars": 30,
+    "micro_slope_window_bars": 8,
+    "cvd_z_window_bars": 240,
+    "min_event_gap_bars": 1,
+    "long": {
+      "r2_threshold": 0.50,
+      "cvd_z_min": 1.4,
+      "micro_slope_min": 0.0
+    },
+    "short": {
+      "r2_threshold": 0.50,
+      "cvd_z_max": -1.4,
+      "micro_slope_max": 0.0
+    }
+  },
+  "fair_value": {
+    "kind": "kalman_local_level",
+    "q_over_r": 0.001,
+    "input_space": "log_price"
+  },
+  "barrier_optimization": {
+    "vertical_barrier_bars": 30,
+    "barrier_unit": "afml_daily_volatility",
+    "volatility_ewma_span": 100,
+    "volatility_lookback_days": 1,
+    "volatility_floor_quantile": 0.05,
+    "volatility_target_aggregation": "median",
+    "payoff_policy": "first_touch_or_terminal_log_return",
+    "tie_policy": "stop_loss_first"
+  },
+  "research_exit_grid": {
+    "profit_taking_mult": [0.30, 0.40, 0.50],
+    "stop_loss_mult": [1.20, 1.50, 1.80],
+    "vertical_barrier_bars": [20, 30, 40, 60],
+    "selected_static_config": {
+      "profit_taking_mult": 0.40,
+      "stop_loss_mult": 1.50,
+      "vertical_barrier_bars": 30
+    }
+  },
+  "meta_model": {
+    "family": "profit_weighted_sequential_bootstrap_rf",
+    "n_estimators": 80,
+    "max_features": "sqrt",
+    "max_samples": "avg_uniqueness",
+    "min_samples_leaf": 10,
+    "min_weight_fraction_leaf": 0.03,
+    "max_depth": 6,
+    "class_weight": "balanced_subsample",
+    "class_probability_threshold": 0.40,
+    "profit_weighting": {
+      "return_floor": 0.0007,
+      "return_weight_scale": 0.0015,
+      "max_return_weight": 6.0,
+      "positive_return_multiplier": 1.0,
+      "negative_return_multiplier": 1.35
+    },
+    "threshold_selection": {
+      "enabled": true,
+      "validation_fraction": 0.25,
+      "min_threshold": 0.20,
+      "max_threshold": 0.75,
+      "step": 0.025,
+      "min_trades": 20,
+      "max_accepted_rate": 0.95,
+      "min_precision_lift": 0.0,
+      "min_profit_factor": 1.10,
+      "min_win_count": 3,
+      "min_loss_count": 3,
+      "min_mean_return": 0.0,
+      "execution_proxy": {
+        "enabled": true,
+        "use_as_primary_constraint": true,
+        "min_positions": 20,
+        "min_win_rate": 0.60,
+        "min_profit_factor": 1.15,
+        "min_mean_return": 0.0002,
+        "trade_count_reference": 60,
+        "trade_count_weight": 0.15
+      },
+      "candidate_filters": {
+        "enabled": true,
+        "max_exclusions": 2,
+        "columns": [
+          "volatility_state_low_vol",
+          "volatility_state_mid_vol",
+          "volatility_state_high_vol",
+          "flow_state_imbalanced_flow",
+          "primary_side_short",
+          "primary_side_long"
+        ]
+      }
+    },
+    "n_splits": 5,
+    "embargo_bars": 800,
+    "n_jobs": 1,
+    "progress_interval": 10,
+    "pca_components": 0.95,
+    "pca_random_state": 42,
+    "feature_selection": {
+      "enabled": false,
+      "top_n": 48,
+      "mda_repeats": 1,
+      "sfi_n_estimators": 0,
+      "final_mda_enabled": false,
+      "final_sfi_enabled": false,
+      "mda_prune_negative": false,
+      "mda_pruning_validation_fraction": 0.25,
+      "protected_primary_features": true
+    },
+    "bet_size_step": 0.05,
+    "bet_size_min_abs": 0.05,
+    "bet_size_max_abs": 1.0
+  },
+  "primary_model": {
+    "enabled": false,
+    "mode": "maker_precision_primary",
+    "allowed_sessions_utc": [],
+    "allowed_weekdays": [],
+    "maker_precision": {
+      "calibration_lookback_days": 180,
+      "allow_short": false,
+      "long_signed_dollar_quantile": 0.55,
+      "long_order_flow_quantile": 0.52,
+      "min_buy_notional_share_quantile": 0.52,
+      "max_vpin_zscore_quantile": 0.70,
+      "max_bar_spread_proxy_quantile": 0.65,
+      "min_theta_to_threshold_quantile": 0.35,
+      "min_bar_density_quantile": 0.55,
+      "max_abs_log_return_quantile": 0.80,
+      "min_flow_score": 0.67,
+      "min_liquidity_score": 0.50,
+      "min_absorption_score": 0.60,
+      "min_maker_score": 0.62,
+      "max_adverse_selection_risk": 0.40
+    },
+    "information_gate": {
+      "enabled": false
+    },
+    "candidate_filters": {
+      "enabled": true,
+      "volatility_states": ["mid_vol", "high_vol"],
+      "sides": ["long"]
+    },
+    "regime_gating": {
+      "enabled": true,
+      "volatility_low_quantile": 0.50,
+      "volatility_high_quantile": 0.90
+    }
+  },
+  "validation": {
+    "cpcv": {
+      "enabled": true,
+      "n_groups": 6,
+      "n_test_groups": 2,
+      "embargo_bars": 800
+    },
+    "deflated_sharpe": {
+      "enabled": true,
+      "benchmark_sr": 0.0,
+      "n_trials": "auto"
+    },
+    "strategy_failure": {
+      "enabled": true,
+      "target_sr": 1.0
+    },
+    "probability_calibration": {
+      "enabled": true,
+      "method": "sigmoid"
+    },
+    "acceptance_gate": {
+      "enabled": true,
+      "action": "skip_real_backtest",
+      "max_accepted_rate": 0.95,
+      "min_precision_lift": 0.0,
+      "min_f1_lift": 0.0,
+      "block_f1_lift": false,
+      "min_proxy_profit_factor": 1.10,
+      "min_active_signals": 120,
+      "position_proxy": {
+        "enabled": true,
+        "min_positions": 60,
+        "min_win_rate": 0.60,
+        "min_profit_factor": 1.15,
+        "min_mean_return": 0.0002
+      },
+      "block_dsr_zero": false,
+      "max_failure_probability": 0.35,
+      "strict_psr": 0.90,
+      "strict_dsr": 0.90,
+      "strict_failure_probability": 0.35
+    },
+    "diagnostic_backtest": {
+      "enabled_on_rejection": true
+    }
+  },
+  "real_data_workflow": {
+    "output_dir": "afml_strategies/output/hf",
+    "input_csv": "binance_scripts/data/afml_bars/BTCUSDT/BTCUSDT_20250201_20260531_1440tpd_DRB.csv",
+    "price_column": "close",
+    "data_start": "2025-02-01",
+    "data_end": "2026-05-31",
+    "train_start": "2025-02-01",
+    "train_end": "2025-12-31",
+    "test_start": "2026-02-01",
+    "test_end": "2026-05-31",
+    "run_backtest": true,
+    "show_progress": true
+  },
+  "real_data_labeling": {
+    "volatility_ewma_span": 100,
+    "volatility_lookback_days": 1,
+    "volatility_floor_quantile": 0.05,
+    "cusum_window": 120,
+    "cusum_threshold_mult": 3.0,
+    "cusum_floor_quantile": 0.10,
+    "min_ret": 0.0,
+    "oldest_weight": 0.75,
+    "rare_label_min_pct": null,
+    "meta_label_min_ret": null
+  },
+  "feature_engineering": {
+    "fracdiff_d": 0.35,
+    "fracdiff_threshold": 0.01,
+    "microstructure_window": 20,
+    "information_window": 64,
+    "calendar_windows": ["1D", "3D", "7D", "30D"],
+    "calendar_min_periods": 8,
+    "tail_quantile": 0.99,
+    "robust_z_clip": 5.0,
+    "excluded_feature_patterns": [
+      "event_session_utc",
+      "session_utc",
+      "weekday",
+      "hour",
+      "session"
+    ]
+  },
+  "backtest": {
+    "trade_notional": "10000",
+    "starting_balance": "1000000",
+    "default_leverage": "20",
+    "confidence_threshold": 0.0,
+    "min_position_change": "size_increment",
+    "flatten_on_zero": false,
+    "entry_order_type": "limit",
+    "entry_limit_post_only": false,
+    "entry_limit_offset_bps": 1.1,
+    "log_level": "ERROR"
+  },
+  "execution_costs": {
+    "slippage_per_side_rate": 0.0,
+    "maker_fee_rate": 0.0002,
+    "taker_fee_rate": 0.0005,
+    "fee_liquidity": "maker_taker"
+  },
+  "primary_optuna": {
+    "enabled": false,
+    "min_primary_events": 50,
+    "min_accepted_events": 10
+  },
+  "sequential_bagging": {
+    "sample_length_multiplier": 1.0,
+    "random_seed": 2027
+  },
+  "runtime_strategy": {
+    "source": "static_config",
+    "long_profit_taking_mult": 0.40,
+    "long_stop_loss_mult": 1.50,
+    "short_profit_taking_mult": 0.40,
+    "short_stop_loss_mult": 1.50,
+    "vertical_barrier_bars": 30
+  }
+}

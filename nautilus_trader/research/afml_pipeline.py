@@ -30,8 +30,12 @@ from __future__ import annotations
 
 import math
 import os
+import time
+from copy import deepcopy
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
 
 import numpy as np
@@ -59,6 +63,10 @@ TimeLike = str | pd.Timestamp | None
 DEFAULT_FEATURE_FRACDIFF_D = 0.4
 DEFAULT_FEATURE_FRACDIFF_THRESHOLD = 0.01
 DEFAULT_MAX_SAMPLE_WEIGHT = 10.0
+
+
+def _format_elapsed(seconds: float) -> str:
+    return f"{max(0.0, float(seconds)):.1f}s"
 
 # -------------------------------------------------------------------------------------------------
 # Shared contracts and utilities
@@ -127,6 +135,20 @@ class AfmlMetaFitResult:
     signals: pd.DataFrame
     primary_feature_transformer: Any | None = None
     meta_feature_transformer: Any | None = None
+
+
+@dataclass(frozen=True)
+class CpcvSplit:
+    """
+    One combinatorial purged CV diagnostic split.
+    """
+
+    split_id: int
+    test_group_ids: tuple[int, ...]
+    train_indices: np.ndarray
+    test_indices: np.ndarray
+    purged_count: int
+    embargo_bars: int
 
 
 def _as_utc_datetime_index(index: pd.Index) -> pd.DatetimeIndex:
@@ -381,6 +403,8 @@ def get_daily_vol(close: pd.Series, span: int = 100, lookback_days: int = 1) -> 
         raise TypeError("close must be indexed by a pandas DatetimeIndex")
     if span < 1:
         raise ValueError("span must be positive")
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
 
     index = _as_utc_datetime_index(close.index)
     close = pd.Series(close.to_numpy(dtype=float), index=index, name=close.name)
@@ -431,7 +455,7 @@ def get_horizon_log_return_volatility(
     """
     Estimate causal rolling volatility of horizon log returns.
 
-    This matches the synthetic barrier unit more closely than daily-vol targets:
+    This matches horizon-return barrier units more closely than daily-vol targets:
     each observation is the rolling standard deviation of
     ``log(close_t / close_{t-horizon_bars})``.
     """
@@ -1246,26 +1270,35 @@ def _coerce_indicator_matrix(indicator_matrix: Any):
 def _sequential_bootstrap_sparse(
     matrix: Any, sample_length: int, rng: np.random.Generator
 ) -> np.ndarray:
+    matrix = matrix.tocsc(copy=False)
+    row_matrix = matrix.tocsr(copy=False)
     n_bars, n_events = matrix.shape
     selected = np.empty(sample_length, dtype=int)
     concurrency = np.zeros(n_bars, dtype=float)
-    event_counts = np.asarray(matrix.sum(axis=0)).ravel()
+    event_counts = np.asarray(matrix.sum(axis=0)).ravel().astype(float)
+    score_sum = event_counts.copy()
     for draw in range(sample_length):
-        inv_concurrency = 1.0 / (concurrency + 1.0)
-        avg_uniqueness = np.asarray(matrix.T @ inv_concurrency).ravel()
         avg_uniqueness = np.divide(
-            avg_uniqueness,
+            score_sum,
             event_counts,
-            out=np.zeros_like(avg_uniqueness),
+            out=np.zeros_like(score_sum),
             where=event_counts > 0.0,
         )
+        avg_uniqueness = np.maximum(avg_uniqueness, 0.0)
         total = avg_uniqueness.sum()
         probabilities = None if total <= 0.0 else avg_uniqueness / total
         choice = int(rng.choice(n_events, p=probabilities))
         selected[draw] = choice
         start = matrix.indptr[choice]
         end = matrix.indptr[choice + 1]
-        concurrency[matrix.indices[start:end]] += 1.0
+        for bar_pos in matrix.indices[start:end]:
+            old_inverse = 1.0 / (concurrency[bar_pos] + 1.0)
+            concurrency[bar_pos] += 1.0
+            new_inverse = 1.0 / (concurrency[bar_pos] + 1.0)
+            delta = new_inverse - old_inverse
+            row_start = row_matrix.indptr[bar_pos]
+            row_end = row_matrix.indptr[bar_pos + 1]
+            score_sum[row_matrix.indices[row_start:row_end]] += delta
     return selected
 
 
@@ -1339,6 +1372,178 @@ def sequential_bootstrap(
         random_state=random_state,
     )
     return pd.Index(indicator_matrix.columns.take(positions))
+
+
+# -------------------------------------------------------------------------------------------------
+# Chapters 7 and 12 - Purged CV and CPCV diagnostics
+# -------------------------------------------------------------------------------------------------
+
+
+def _numeric_event_span(values: Any, *, name: str) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if len(arr) == 0:
+        raise ValueError(f"{name} cannot be empty")
+    try:
+        out = arr.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must contain numeric event coordinates") from exc
+    if not np.all(np.isfinite(out)):
+        raise ValueError(f"{name} must contain only finite values")
+    return out
+
+
+def _cpcv_event_arrays(
+    starts: Any,
+    ends: Any,
+    *,
+    n_groups: int,
+    n_test_groups: int,
+    embargo_bars: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    starts_array = _numeric_event_span(starts, name="starts")
+    ends_array = _numeric_event_span(ends, name="ends")
+    if len(starts_array) != len(ends_array):
+        raise ValueError("starts and ends must have the same length")
+    if np.any(ends_array < starts_array):
+        raise ValueError("ends must be greater than or equal to starts")
+    if n_groups < 2:
+        raise ValueError("n_groups must be at least 2")
+    if n_groups > len(starts_array):
+        raise ValueError("n_groups cannot exceed the number of events")
+    if not 1 <= n_test_groups < n_groups:
+        raise ValueError("n_test_groups must satisfy 1 <= n_test_groups < n_groups")
+    if embargo_bars < 0:
+        raise ValueError("embargo_bars cannot be negative")
+    return starts_array, ends_array
+
+
+def _cpcv_train_mask(
+    starts_array: np.ndarray,
+    ends_array: np.ndarray,
+    *,
+    test_blocks: list[np.ndarray],
+    test_indices: np.ndarray,
+    embargo_bars: int,
+) -> np.ndarray:
+    train_mask = np.ones(len(starts_array), dtype=bool)
+    train_mask[test_indices] = False
+    for block in test_blocks:
+        test_start = float(np.min(starts_array[block]))
+        test_end = float(np.max(ends_array[block]))
+        overlaps = (starts_array <= test_end) & (ends_array >= test_start)
+        train_mask &= ~overlaps
+        if embargo_bars > 0:
+            embargo_upper = test_end + float(embargo_bars)
+            embargoed = (starts_array > test_end) & (starts_array <= embargo_upper)
+            train_mask &= ~embargoed
+    return train_mask
+
+
+def combinatorial_purged_cv_splits(
+    starts: Any,
+    ends: Any,
+    *,
+    n_groups: int,
+    n_test_groups: int,
+    embargo_bars: int = 0,
+) -> list[CpcvSplit]:
+    """
+    Build CPCV diagnostic splits from event start/end coordinates.
+
+    ``starts`` and ``ends`` are numeric coordinates on the same event axis
+    (bar indices in the current AFML scripts). Training samples are removed
+    when their label span overlaps any selected test group. The configured
+    embargo removes training observations whose start falls immediately after
+    each test block, matching the mlfinlab PurgedKFold/CPCV contract.
+    """
+    starts_array, ends_array = _cpcv_event_arrays(
+        starts,
+        ends,
+        n_groups=n_groups,
+        n_test_groups=n_test_groups,
+        embargo_bars=embargo_bars,
+    )
+
+    ordered = np.argsort(starts_array, kind="stable")
+    groups = [group for group in np.array_split(ordered, n_groups) if len(group) > 0]
+    splits: list[CpcvSplit] = []
+    for group_ids in combinations(range(len(groups)), n_test_groups):
+        test_blocks = [groups[group_id] for group_id in group_ids]
+        test_indices = np.sort(np.concatenate(test_blocks))
+        train_mask = _cpcv_train_mask(
+            starts_array,
+            ends_array,
+            test_blocks=test_blocks,
+            test_indices=test_indices,
+            embargo_bars=embargo_bars,
+        )
+        train_indices = np.flatnonzero(train_mask)
+        if len(train_indices) == 0:
+            continue
+        purged_count = int(len(starts_array) - len(test_indices) - len(train_indices))
+        splits.append(
+            CpcvSplit(
+                split_id=len(splits),
+                test_group_ids=tuple(int(group_id) for group_id in group_ids),
+                train_indices=train_indices.astype(int),
+                test_indices=test_indices.astype(int),
+                purged_count=purged_count,
+                embargo_bars=int(embargo_bars),
+            ),
+        )
+    return splits
+
+
+def cpcv_split_summary(
+    splits: list[CpcvSplit],
+    *,
+    n_samples: int | None = None,
+    n_groups: int | None = None,
+    n_test_groups: int | None = None,
+) -> dict[str, Any]:
+    """
+    Compact JSON-ready summary for CPCV split diagnostics.
+    """
+    if not splits:
+        return {
+            "enabled": True,
+            "n_splits": 0,
+            "n_samples": int(n_samples or 0),
+            "n_groups": n_groups,
+            "n_test_groups": n_test_groups,
+            "error": "CPCV produced no usable splits after purge/embargo",
+        }
+
+    inferred_samples = max(int(split.test_indices.max()) for split in splits) + 1
+    sample_count = int(n_samples if n_samples is not None else inferred_samples)
+    coverage = np.zeros(sample_count, dtype=int)
+    for split in splits:
+        coverage[split.test_indices] += 1
+
+    train_sizes = np.asarray([len(split.train_indices) for split in splits], dtype=float)
+    test_sizes = np.asarray([len(split.test_indices) for split in splits], dtype=float)
+    purged_counts = np.asarray([split.purged_count for split in splits], dtype=float)
+    return {
+        "enabled": True,
+        "n_splits": len(splits),
+        "n_samples": sample_count,
+        "n_groups": n_groups,
+        "n_test_groups": n_test_groups,
+        "embargo_bars": int(splits[0].embargo_bars),
+        "train_size_min": int(np.min(train_sizes)),
+        "train_size_max": int(np.max(train_sizes)),
+        "train_size_mean": float(np.mean(train_sizes)),
+        "test_size_min": int(np.min(test_sizes)),
+        "test_size_max": int(np.max(test_sizes)),
+        "test_size_mean": float(np.mean(test_sizes)),
+        "purged_count_min": int(np.min(purged_counts)),
+        "purged_count_max": int(np.max(purged_counts)),
+        "purged_count_mean": float(np.mean(purged_counts)),
+        "test_coverage_min": int(np.min(coverage)) if len(coverage) else 0,
+        "test_coverage_max": int(np.max(coverage)) if len(coverage) else 0,
+    }
 
 
 # -------------------------------------------------------------------------------------------------
@@ -1477,6 +1682,7 @@ def _fit_single_decision_tree_estimator(
     min_samples_leaf: int,
     min_weight_fraction_leaf: float,
     class_weight: str | dict[int, float] | None,
+    splitter: str,
 ) -> tuple[int, Any, np.ndarray, np.ndarray]:
     estimator_num, seed = estimator_args
     sampled = sequential_bootstrap_indices(
@@ -1487,6 +1693,7 @@ def _fit_single_decision_tree_estimator(
     tree_class_weight = "balanced" if class_weight == "balanced_subsample" else class_weight
     estimator = decision_tree_classifier(
         criterion="entropy",
+        splitter=splitter,
         max_features=max_features,
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
@@ -1520,6 +1727,7 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
         min_samples_leaf: int = 1,
         min_weight_fraction_leaf: float = 0.0,
         class_weight: str | dict[int, float] | None = "balanced",
+        splitter: str = "best",
         random_state: int | None = None,
         n_jobs: int | None = 1,
         verbose: bool = False,
@@ -1533,6 +1741,7 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
         self.min_samples_leaf = min_samples_leaf
         self.min_weight_fraction_leaf = min_weight_fraction_leaf
         self.class_weight = class_weight
+        self.splitter = splitter
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1555,6 +1764,8 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
             raise ValueError("min_samples_leaf must be positive")
         if not 0.0 <= self.min_weight_fraction_leaf <= 0.5:
             raise ValueError("min_weight_fraction_leaf must be in [0, 0.5]")
+        if self.splitter not in {"best", "random"}:
+            raise ValueError("splitter must be 'best' or 'random'")
         if self.n_jobs == 0:
             raise ValueError("n_jobs cannot be 0")
         if self.progress_interval < 1:
@@ -1603,6 +1814,7 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
             "min_samples_leaf": self.min_samples_leaf,
             "min_weight_fraction_leaf": self.min_weight_fraction_leaf,
             "class_weight": self.class_weight,
+            "splitter": self.splitter,
         }
         n_jobs = min(self._effective_n_jobs(), self.n_estimators)
         if n_jobs == 1:
@@ -1617,12 +1829,20 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
             raise ImportError("Parallel fitting requires joblib") from exc
 
         with parallel_backend("loky"):
-            fitted = Parallel(n_jobs=n_jobs)(
-                delayed(_fit_single_decision_tree_estimator)(job, **fit_kwargs) for job in jobs
-            )
-        yield from fitted
+            try:
+                fitted = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
+                    delayed(_fit_single_decision_tree_estimator)(job, **fit_kwargs)
+                    for job in jobs
+                )
+                yield from fitted
+            except TypeError:
+                fitted = Parallel(n_jobs=n_jobs)(
+                    delayed(_fit_single_decision_tree_estimator)(job, **fit_kwargs)
+                    for job in jobs
+                )
+                yield from fitted
 
-    def fit(
+    def fit(  # noqa: C901
         self,
         X: pd.DataFrame,
         y: pd.Series,
@@ -1684,6 +1904,16 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
         self.bootstrap_indices_ = []
         seeds = [int(rng.integers(0, np.iinfo(np.int32).max)) for _ in range(self.n_estimators)]
         jobs = list(enumerate(seeds, start=1))
+        fit_started = time.perf_counter()
+        if self.verbose:
+            label = f"{self.progress_label}: " if self.progress_label else ""
+            print(
+                f"  {label}starting bagging fit rows={X.shape[0]:,} "
+                f"features={X.shape[1]:,} estimators={self.n_estimators} "
+                f"n_jobs={min(self._effective_n_jobs(), self.n_estimators)} "
+                f"sample_length={sample_length:,} max_samples={self.max_samples}",
+                flush=True,
+            )
         fitted = self._fit_estimator_jobs(
             jobs,
             decision_tree_classifier=decision_tree_classifier,
@@ -1711,6 +1941,13 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
         self.classes_ = classes
         self.feature_names_ = list(X.columns)
         self.indicator_matrix_ = indicator_matrix
+        if self.verbose:
+            label = f"{self.progress_label}: " if self.progress_label else ""
+            print(
+                f"  {label}finished bagging fit estimators={len(self.estimators_)}/{self.n_estimators} "
+                f"elapsed={_format_elapsed(time.perf_counter() - fit_started)}",
+                flush=True,
+            )
         return self
 
     def _check_fitted(self) -> None:
@@ -1769,6 +2006,1316 @@ class SequentialBootstrapBaggingClassifier(ClassifierMixin, BaseEstimator):
             raise TypeError(f"Expected {cls.__name__}, got {type(model).__name__}")
         return model
 
+
+PRIMARY_MOE_MODEL_NAME = "afml_moe_weighted_vote"
+
+DEFAULT_PRIMARY_EXPERTS: dict[str, dict[str, Any]] = {
+    "shared_purged_rf": {
+        "enabled": True,
+        "family": "bagged_tree",
+        "weight": 0.25,
+        "n_estimators": 80,
+        "max_samples": "avg_uniqueness",
+        "max_features": 1,
+        "min_samples_leaf": 5,
+        "min_weight_fraction_leaf": 0.05,
+        "class_weight": "balanced_subsample",
+    },
+    "trend_purged_rf": {
+        "enabled": True,
+        "family": "bagged_tree",
+        "weight": 0.20,
+        "n_estimators": 80,
+        "max_samples": "avg_uniqueness",
+        "max_features": 0.5,
+        "min_samples_leaf": 6,
+        "min_weight_fraction_leaf": 0.05,
+        "class_weight": "balanced_subsample",
+        "feature_patterns": [
+            "cvd",
+            "trend",
+            "slope",
+            "momentum",
+            "breakout",
+            "sadf",
+            "r2",
+        ],
+    },
+    "reversion_purged_rf": {
+        "enabled": True,
+        "family": "bagged_tree",
+        "weight": 0.15,
+        "n_estimators": 80,
+        "max_samples": "avg_uniqueness",
+        "max_features": 0.5,
+        "min_samples_leaf": 6,
+        "min_weight_fraction_leaf": 0.05,
+        "class_weight": "balanced_subsample",
+        "feature_patterns": [
+            "zscore",
+            "stretch",
+            "exhaust",
+            "entropy",
+            "tail",
+            "theta",
+            "reversion",
+            "kurt",
+            "skew",
+        ],
+    },
+    "microstructure_purged_rf": {
+        "enabled": True,
+        "family": "bagged_tree",
+        "weight": 0.15,
+        "n_estimators": 80,
+        "max_samples": "avg_uniqueness",
+        "max_features": 0.5,
+        "min_samples_leaf": 6,
+        "min_weight_fraction_leaf": 0.05,
+        "class_weight": "balanced_subsample",
+        "feature_patterns": [
+            "order_flow",
+            "imbalance",
+            "vpin",
+            "signed",
+            "spread",
+            "impact",
+            "buy_sell",
+            "notional",
+            "volume",
+            "lambda",
+        ],
+    },
+    "volatility_session_purged_rf": {
+        "enabled": True,
+        "family": "bagged_tree",
+        "weight": 0.15,
+        "n_estimators": 80,
+        "max_samples": "avg_uniqueness",
+        "max_features": 0.5,
+        "min_samples_leaf": 6,
+        "min_weight_fraction_leaf": 0.05,
+        "class_weight": "balanced_subsample",
+        "feature_patterns": [
+            "vol",
+            "session",
+            "hour",
+            "duration",
+            "density",
+            "regime",
+            "state",
+            "calendar",
+        ],
+    },
+    "linear_margin_svm": {
+        "enabled": True,
+        "family": "linear_svm",
+        "weight": 0.10,
+        "C": 0.5,
+        "max_iter": 4000,
+        "class_weight": "balanced",
+        "calibration_method": "sigmoid",
+    },
+}
+
+BANNED_PRIMARY_EXPERT_NAMES = {
+    "sequential_bagged_tree",
+    "random_split_bagged_tree",
+    "elastic_net_logistic",
+    "rule_anchor",
+    "boosting",
+    "gbdt",
+    "xgboost",
+    "lightgbm",
+    "histgradientboosting",
+    "hist_gradient_boosting",
+}
+
+BANNED_PRIMARY_EXPERT_FAMILIES = {
+    "boosting",
+    "gbdt",
+    "xgboost",
+    "lightgbm",
+    "histgradientboosting",
+    "hist_gradient_boosting",
+}
+
+
+def _merge_expert_config(config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    merged = {name: values.copy() for name, values in DEFAULT_PRIMARY_EXPERTS.items()}
+    if not isinstance(config, dict):
+        return merged
+    for name, values in config.items():
+        if not isinstance(values, dict):
+            continue
+        key = str(name)
+        lowered = key.lower()
+        if lowered in BANNED_PRIMARY_EXPERT_NAMES:
+            raise ValueError(f"Primary expert {key!r} has been removed from AFML-MoE")
+        if key not in DEFAULT_PRIMARY_EXPERTS:
+            raise ValueError(f"Unsupported AFML-MoE primary expert: {key}")
+        base = merged[key].copy()
+        base.update(values)
+        family = str(base.get("family", "")).lower()
+        if family in BANNED_PRIMARY_EXPERT_FAMILIES:
+            raise ValueError(f"Primary expert {key!r} uses banned family {family!r}")
+        merged[key] = base
+    return merged
+
+
+def _normalize_class_probability_frame(
+    proba: pd.DataFrame,
+    *,
+    index: pd.Index,
+    classes: np.ndarray,
+) -> pd.DataFrame:
+    out = pd.DataFrame(0.0, index=index, columns=classes)
+    for column in proba.columns:
+        label = int(column)
+        if label in out.columns:
+            out[label] = pd.to_numeric(proba[column], errors="coerce").fillna(0.0)
+    row_sum = out.sum(axis=1)
+    zero_rows = row_sum <= 0.0
+    nonzero = ~zero_rows
+    if nonzero.any():
+        out.loc[nonzero] = out.loc[nonzero].div(row_sum.loc[nonzero], axis=0)
+    if zero_rows.any():
+        out.loc[zero_rows] = 1.0 / max(1, len(classes))
+    return out
+
+
+def _first_numeric_series(
+    frame: pd.DataFrame,
+    names: tuple[str, ...],
+    index: pd.Index,
+) -> pd.Series:
+    for name in names:
+        if name in frame:
+            return pd.to_numeric(frame[name], errors="coerce").reindex(index)
+    return pd.Series(0.0, index=index, dtype=float)
+
+
+def _series_robust_location_scale(series: pd.Series) -> tuple[float, float]:
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        return 0.0, 1.0
+    center = float(values.median())
+    q75 = float(values.quantile(0.75))
+    q25 = float(values.quantile(0.25))
+    scale = (q75 - q25) / 1.349
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = float(values.std(ddof=0))
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return center, scale
+
+
+def _robust_z_apply(series: pd.Series, center: float, scale: float, clip: float) -> pd.Series:
+    zscore = (pd.to_numeric(series, errors="coerce") - float(center)) / max(float(scale), 1e-12)
+    return zscore.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(
+        lower=-float(clip),
+        upper=float(clip),
+    )
+
+
+@dataclass(frozen=True)
+class RegimeStateModel:
+    """
+    Deterministic train-only market-state scorer for dual-policy primary models.
+    """
+
+    component_stats: dict[str, tuple[float, float]]
+    trend_threshold: float
+    reversion_threshold: float
+    volatility_quantiles: tuple[float, float]
+    entropy_quantiles: tuple[float, float]
+    flow_threshold: float
+    dominance_ratio: float = 1.05
+    robust_z_clip: float = 5.0
+
+    def _component(self, features: pd.DataFrame, name: str) -> pd.Series:
+        index = features.index
+        if name == "trend_strength":
+            trend_r2 = _first_numeric_series(
+                features,
+                ("cvdslope_trend_r2", "trend_r2"),
+                index,
+            ).clip(lower=0.0)
+            sadf = _first_numeric_series(features, ("sadf_zscore", "sadf"), index).clip(lower=0.0)
+            return (trend_r2 + sadf) / 2.0
+        if name == "flow_persistence":
+            flow = _first_numeric_series(
+                features,
+                (
+                    "cvdslope_micro_slope",
+                    "cvd_slope",
+                    "signed_notional_cumsum_ffd_ewm_fast",
+                ),
+                index,
+            )
+            return flow.abs()
+        if name == "order_flow_imbalance":
+            flow = _first_numeric_series(
+                features,
+                (
+                    "calendar_order_flow_imbalance_1d",
+                    "order_flow_imbalance",
+                    "signed_dollar_imbalance",
+                ),
+                index,
+            )
+            return flow.abs()
+        if name == "price_stretch":
+            stretch = _first_numeric_series(
+                features,
+                ("zscore_slow", "calendar_log_return_robust_z_1d", "log_return_1"),
+                index,
+            )
+            return stretch.abs()
+        if name == "flow_exhaustion":
+            exhaustion = _first_numeric_series(
+                features,
+                (
+                    "vpin_zscore",
+                    "calendar_vpin_1d",
+                    "theta_to_threshold_robust_zscore",
+                    "signed_dollar_imbalance_abs",
+                ),
+                index,
+            )
+            return exhaustion.abs()
+        if name == "tail_event":
+            tail = _first_numeric_series(
+                features,
+                (
+                    "calendar_abs_return_robust_z_1d",
+                    "calendar_tail_event_share_1d",
+                    "hl_range",
+                ),
+                index,
+            )
+            return tail.abs()
+        if name == "volatility":
+            return _first_numeric_series(
+                features,
+                ("daily_vol", "calendar_realized_vol_1d", "realized_vol"),
+                index,
+            )
+        if name == "entropy":
+            return _first_numeric_series(
+                features,
+                ("entropy_zscore", "shannon_entropy", "lz_zscore"),
+                index,
+            )
+        raise KeyError(f"Unknown regime component: {name}")
+
+    def transform(self, features: pd.DataFrame) -> pd.DataFrame:
+        features = features.replace([np.inf, -np.inf], np.nan).copy()
+        index = features.index
+        components: dict[str, pd.Series] = {}
+        for name, (center, scale) in self.component_stats.items():
+            components[name] = _robust_z_apply(
+                self._component(features, name),
+                center,
+                scale,
+                self.robust_z_clip,
+            )
+
+        trend_score = (
+            components.get("trend_strength", pd.Series(0.0, index=index))
+            + components.get("flow_persistence", pd.Series(0.0, index=index))
+            + components.get("order_flow_imbalance", pd.Series(0.0, index=index))
+            - 0.5 * components.get("entropy", pd.Series(0.0, index=index)).clip(lower=0.0)
+        ) / 3.5
+        reversion_score = (
+            components.get("price_stretch", pd.Series(0.0, index=index))
+            + components.get("flow_exhaustion", pd.Series(0.0, index=index))
+            + components.get("tail_event", pd.Series(0.0, index=index))
+        ) / 3.0
+
+        trend_ready = (
+            (trend_score >= float(self.trend_threshold))
+            & (trend_score >= reversion_score * float(self.dominance_ratio))
+        )
+        reversion_ready = (
+            (reversion_score >= float(self.reversion_threshold))
+            & (reversion_score > trend_score * float(self.dominance_ratio))
+        )
+        market_state = pd.Series("neutral", index=index, dtype=object)
+        market_state.loc[trend_ready] = "trend"
+        market_state.loc[reversion_ready] = "mean_reversion"
+        market_state.loc[(trend_score >= self.trend_threshold) & (reversion_score >= self.reversion_threshold)] = (
+            "mixed"
+        )
+
+        volatility = self._component(features, "volatility")
+        vol_low, vol_high = self.volatility_quantiles
+        volatility_state = pd.Series("mid_vol", index=index, dtype=object)
+        volatility_state.loc[volatility <= vol_low] = "low_vol"
+        volatility_state.loc[volatility >= vol_high] = "high_vol"
+
+        flow = components.get("order_flow_imbalance", pd.Series(0.0, index=index))
+        flow_state = pd.Series("balanced_flow", index=index, dtype=object)
+        flow_state.loc[flow >= float(self.flow_threshold)] = "imbalanced_flow"
+
+        entropy = self._component(features, "entropy")
+        entropy_low, entropy_high = self.entropy_quantiles
+        entropy_state = pd.Series("mid_entropy", index=index, dtype=object)
+        entropy_state.loc[entropy <= entropy_low] = "low_entropy"
+        entropy_state.loc[entropy >= entropy_high] = "high_entropy"
+
+        return pd.DataFrame(
+            {
+                "primary_market_state": market_state,
+                "trend_score": trend_score.astype(float),
+                "reversion_score": reversion_score.astype(float),
+                "volatility_state": volatility_state,
+                "flow_state": flow_state,
+                "entropy_state": entropy_state,
+            },
+            index=index,
+        )
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "component_stats": {
+                name: {"center": center, "scale": scale}
+                for name, (center, scale) in self.component_stats.items()
+            },
+            "trend_threshold": float(self.trend_threshold),
+            "reversion_threshold": float(self.reversion_threshold),
+            "volatility_quantiles": {
+                "low": float(self.volatility_quantiles[0]),
+                "high": float(self.volatility_quantiles[1]),
+            },
+            "entropy_quantiles": {
+                "low": float(self.entropy_quantiles[0]),
+                "high": float(self.entropy_quantiles[1]),
+            },
+            "flow_threshold": float(self.flow_threshold),
+            "dominance_ratio": float(self.dominance_ratio),
+            "robust_z_clip": float(self.robust_z_clip),
+        }
+
+
+def fit_regime_state_model(
+    features: pd.DataFrame,
+    train_index: pd.DatetimeIndex,
+    *,
+    config: dict[str, Any] | None = None,
+) -> RegimeStateModel:
+    """
+    Fit deterministic regime scoring thresholds using train-only rows.
+    """
+    config = config if isinstance(config, dict) else {}
+    train_index = pd.DatetimeIndex(train_index).intersection(features.index)
+    train_features = features.loc[train_index].replace([np.inf, -np.inf], np.nan)
+    clip = float(config.get("robust_z_clip", 5.0))
+    component_names = (
+        "trend_strength",
+        "flow_persistence",
+        "order_flow_imbalance",
+        "price_stretch",
+        "flow_exhaustion",
+        "tail_event",
+        "volatility",
+        "entropy",
+    )
+    provisional = RegimeStateModel(
+        component_stats=dict.fromkeys(component_names, (0.0, 1.0)),
+        trend_threshold=0.0,
+        reversion_threshold=0.0,
+        volatility_quantiles=(0.0, 0.0),
+        entropy_quantiles=(0.0, 0.0),
+        flow_threshold=0.0,
+        robust_z_clip=clip,
+    )
+    component_stats = {
+        name: _series_robust_location_scale(provisional._component(train_features, name))
+        for name in component_names
+    }
+    model = RegimeStateModel(
+        component_stats=component_stats,
+        trend_threshold=0.0,
+        reversion_threshold=0.0,
+        volatility_quantiles=(0.0, 0.0),
+        entropy_quantiles=(0.0, 0.0),
+        flow_threshold=0.0,
+        dominance_ratio=float(config.get("dominance_ratio", 1.05)),
+        robust_z_clip=clip,
+    )
+    train_scores = model.transform(train_features)
+    trend_quantile = float(config.get("trend_score_quantile", 0.60))
+    reversion_quantile = float(config.get("reversion_score_quantile", 0.60))
+    vol_low_quantile = float(config.get("volatility_low_quantile", 0.33))
+    vol_high_quantile = float(config.get("volatility_high_quantile", 0.67))
+    entropy_low_quantile = float(config.get("entropy_low_quantile", 0.33))
+    entropy_high_quantile = float(config.get("entropy_high_quantile", 0.67))
+    flow_quantile = float(config.get("flow_imbalance_quantile", 0.70))
+    volatility = model._component(train_features, "volatility").dropna()
+    entropy = model._component(train_features, "entropy").dropna()
+    flow_center, flow_scale = component_stats["order_flow_imbalance"]
+    flow = _robust_z_apply(
+        model._component(train_features, "order_flow_imbalance"),
+        flow_center,
+        flow_scale,
+        clip,
+    ).dropna()
+    return RegimeStateModel(
+        component_stats=component_stats,
+        trend_threshold=float(train_scores["trend_score"].quantile(trend_quantile)),
+        reversion_threshold=float(train_scores["reversion_score"].quantile(reversion_quantile)),
+        volatility_quantiles=(
+            float(volatility.quantile(vol_low_quantile)) if not volatility.empty else 0.0,
+            float(volatility.quantile(vol_high_quantile)) if not volatility.empty else 0.0,
+        ),
+        entropy_quantiles=(
+            float(entropy.quantile(entropy_low_quantile)) if not entropy.empty else 0.0,
+            float(entropy.quantile(entropy_high_quantile)) if not entropy.empty else 0.0,
+        ),
+        flow_threshold=float(flow.quantile(flow_quantile)) if not flow.empty else 0.0,
+        dominance_ratio=float(config.get("dominance_ratio", 1.05)),
+        robust_z_clip=clip,
+    )
+
+
+def _policy_edge_lookup(
+    edge_table: dict[str, Any],
+    state: str,
+    policy: str,
+    side: int,
+) -> dict[str, Any] | None:
+    state_table = edge_table.get(state)
+    if not isinstance(state_table, dict):
+        state_table = edge_table.get("all")
+    if not isinstance(state_table, dict):
+        return None
+    policy_table = state_table.get(policy)
+    if not isinstance(policy_table, dict):
+        return None
+    edge = policy_table.get(str(int(side)))
+    return edge if isinstance(edge, dict) else None
+
+
+class RegimeSwitchingPrimarySideModel(ClassifierMixin, BaseEstimator):
+    """
+    Select trend-following or mean-reversion policy by train-only regime edge.
+    """
+
+    def __init__(
+        self,
+        *,
+        trend_model: Any,
+        reversion_model: Any,
+        regime_model: RegimeStateModel,
+        policy_edge_table: dict[str, Any],
+        abstain_if_no_positive_policy: bool = True,
+    ) -> None:
+        self.trend_model = trend_model
+        self.reversion_model = reversion_model
+        self.regime_model = regime_model
+        self.policy_edge_table = policy_edge_table
+        self.abstain_if_no_positive_policy = abstain_if_no_positive_policy
+        self.classes_ = np.array([-1, 1], dtype=int)
+
+    def _policy_candidates(
+        self,
+        *,
+        index_value: Any,
+        market_state: str,
+        trend_frame: pd.DataFrame,
+        reversion_frame: pd.DataFrame,
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for policy, frame in (
+            ("trend_following", trend_frame),
+            ("mean_reversion", reversion_frame),
+        ):
+            side = int(frame.loc[index_value, "primary_side"])
+            if side == 0:
+                continue
+            edge = _policy_edge_lookup(self.policy_edge_table, market_state, policy, side)
+            if edge is None or not bool(edge.get("eligible", False)):
+                continue
+            confidence = float(frame.loc[index_value, "primary_confidence"])
+            score = float(edge.get("score", 0.0)) + confidence * 1e-3
+            candidates.append(
+                {
+                    "policy": policy,
+                    "frame": frame,
+                    "side": side,
+                    "edge": edge,
+                    "score": score,
+                },
+            )
+        return candidates
+
+    def primary_side_frame(self, X: pd.DataFrame) -> pd.DataFrame:
+        trend_frame = self.trend_model.primary_side_frame(X)
+        reversion_frame = self.reversion_model.primary_side_frame(X)
+        index = trend_frame.index.intersection(reversion_frame.index)
+        trend_frame = trend_frame.loc[index]
+        reversion_frame = reversion_frame.loc[index]
+        regime = self.regime_model.transform(X.loc[index])
+
+        rows: list[pd.Series] = []
+        for ts in index:
+            market_state = str(regime.loc[ts, "primary_market_state"])
+            candidates = self._policy_candidates(
+                index_value=ts,
+                market_state=market_state,
+                trend_frame=trend_frame,
+                reversion_frame=reversion_frame,
+            )
+            if candidates:
+                selected = max(candidates, key=lambda item: item["score"])
+                selected_frame = selected["frame"].loc[ts].copy()
+                selected_frame["primary_policy"] = selected["policy"]
+                selected_frame["primary_market_state"] = market_state
+                selected_frame["selected_policy_oof_edge"] = float(
+                    selected["edge"].get("mean_return", 0.0),
+                )
+                selected_frame["selected_policy_profit_factor"] = selected["edge"].get("profit_factor")
+                selected_frame["selected_policy_trade_count"] = int(selected["edge"].get("trade_count", 0))
+            else:
+                selected_frame = trend_frame.loc[ts].copy()
+                selected_frame["primary_side"] = 0
+                selected_frame["primary_policy"] = "none"
+                selected_frame["primary_market_state"] = market_state
+                selected_frame["selected_policy_oof_edge"] = 0.0
+                selected_frame["selected_policy_profit_factor"] = np.nan
+                selected_frame["selected_policy_trade_count"] = 0
+                reason = "no_positive_policy_edge" if self.abstain_if_no_positive_policy else "policy_abstain"
+                previous_reason = str(selected_frame.get("primary_abstain_reason", "") or "")
+                selected_frame["primary_abstain_reason"] = (
+                    reason if not previous_reason else f"{previous_reason}+{reason}"
+                )
+
+            selected_frame["trend_side"] = int(trend_frame.loc[ts, "primary_side"])
+            selected_frame["trend_confidence"] = float(trend_frame.loc[ts, "primary_confidence"])
+            selected_frame["trend_prob_-1"] = float(trend_frame.loc[ts].get("primary_prob_-1", np.nan))
+            selected_frame["trend_prob_1"] = float(trend_frame.loc[ts].get("primary_prob_1", np.nan))
+            selected_frame["reversion_side"] = int(reversion_frame.loc[ts, "primary_side"])
+            selected_frame["reversion_confidence"] = float(reversion_frame.loc[ts, "primary_confidence"])
+            selected_frame["reversion_prob_-1"] = float(
+                reversion_frame.loc[ts].get("primary_prob_-1", np.nan),
+            )
+            selected_frame["reversion_prob_1"] = float(
+                reversion_frame.loc[ts].get("primary_prob_1", np.nan),
+            )
+            for column in (
+                "trend_score",
+                "reversion_score",
+                "volatility_state",
+                "flow_state",
+                "entropy_state",
+            ):
+                selected_frame[column] = regime.loc[ts, column]
+            rows.append(selected_frame)
+
+        return pd.DataFrame(rows, index=index)
+
+    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+        frame = self.primary_side_frame(X)
+        proba = pd.DataFrame(0.5, index=frame.index, columns=self.classes_)
+        if "primary_prob_-1" in frame:
+            proba[-1] = pd.to_numeric(frame["primary_prob_-1"], errors="coerce").fillna(0.5)
+        if "primary_prob_1" in frame:
+            proba[1] = pd.to_numeric(frame["primary_prob_1"], errors="coerce").fillna(0.5)
+        abstain = frame["primary_side"].astype(int) == 0
+        proba.loc[abstain, -1] = 0.5
+        proba.loc[abstain, 1] = 0.5
+        return _normalize_class_probability_frame(proba, index=proba.index, classes=self.classes_)
+
+    def predict(self, X: pd.DataFrame) -> pd.Series:
+        return self.primary_side_frame(X)["primary_side"].rename("prediction")
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "model": "regime_switching_dual_policy",
+            "trend_model": self.trend_model.diagnostics()
+            if hasattr(self.trend_model, "diagnostics")
+            else {},
+            "reversion_model": self.reversion_model.diagnostics()
+            if hasattr(self.reversion_model, "diagnostics")
+            else {},
+            "regime_model": self.regime_model.diagnostics(),
+            "policy_edge_table": self.policy_edge_table,
+            "abstain_if_no_positive_policy": bool(self.abstain_if_no_positive_policy),
+            "classes": [int(label) for label in self.classes_],
+        }
+
+
+class _CalibratedLinearSvmExpert:
+    def __init__(
+        self,
+        *,
+        C: float = 0.5,
+        max_iter: int = 4000,
+        class_weight: str | dict[Any, float] | None = "balanced",
+        variance_floor: float = 1e-12,
+        random_state: int | None = None,
+    ) -> None:
+        self.C = C
+        self.max_iter = max_iter
+        self.class_weight = class_weight
+        self.variance_floor = variance_floor
+        self.random_state = random_state
+
+    @staticmethod
+    def _weighted_class_prior(
+        y: pd.Series,
+        classes: np.ndarray,
+        weights: pd.Series | None,
+    ) -> pd.Series:
+        if weights is None or float(weights.sum()) <= 0.0:
+            counts = y.value_counts(normalize=True)
+            return pd.Series(
+                [float(counts.get(int(label), 0.0)) for label in classes],
+                index=classes,
+                dtype=float,
+            )
+        values = []
+        total = float(weights.sum())
+        for label in classes:
+            values.append(float(weights.loc[y == int(label)].sum()) / total)
+        return pd.Series(values, index=classes, dtype=float)
+
+    def _active_feature_names(
+        self,
+        X: pd.DataFrame,
+        weights: pd.Series | None,
+    ) -> list[str]:
+        values = X.to_numpy(dtype=float)
+        if weights is not None and float(weights.sum()) > 0.0:
+            weight_values = weights.to_numpy(dtype=float)
+            mean = np.average(values, axis=0, weights=weight_values)
+            variance = np.average((values - mean) ** 2, axis=0, weights=weight_values)
+        else:
+            variance = np.nanvar(values, axis=0)
+        mask = np.isfinite(variance) & (variance > float(self.variance_floor))
+        return [column for column, keep in zip(X.columns, mask, strict=True) if bool(keep)]
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: pd.Series | None = None,
+    ) -> _CalibratedLinearSvmExpert:
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.svm import LinearSVC
+        except ImportError as exc:
+            raise ImportError("linear_margin_svm expert requires scikit-learn") from exc
+
+        X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        y = y.reindex(X.index).dropna().astype(int)
+        X = X.loc[y.index]
+        if X.empty:
+            raise ValueError("Cannot fit linear_margin_svm on an empty feature matrix")
+        weights = (
+            sample_weight.reindex(X.index).fillna(0.0).clip(lower=0.0).astype(float)
+            if sample_weight is not None
+            else None
+        )
+        self.classes_ = np.array(sorted(y.unique()), dtype=int)
+        self.input_feature_names_ = list(X.columns)
+        self.feature_names_ = self._active_feature_names(X, weights)
+        self.dropped_feature_names_ = [
+            column for column in self.input_feature_names_ if column not in self.feature_names_
+        ]
+        self.constant_proba_ = self._weighted_class_prior(y, self.classes_, weights)
+        if not self.feature_names_:
+            self.scaler_ = None
+            self.model_ = None
+            self.calibrator_ = None
+            return self
+
+        X_active = X[self.feature_names_]
+        self.scaler_ = StandardScaler()
+        x_scaled = self.scaler_.fit_transform(X_active, sample_weight=weights)
+        self.model_ = LinearSVC(
+            C=float(self.C),
+            max_iter=int(self.max_iter),
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+        )
+        fit_kwargs = {}
+        if weights is not None:
+            fit_kwargs["sample_weight"] = weights
+        self.model_.fit(x_scaled, y, **fit_kwargs)
+        scores = np.asarray(self.model_.decision_function(x_scaled), dtype=float).reshape(-1, 1)
+        self.calibrator_ = LogisticRegression(max_iter=1000, random_state=self.random_state)
+        calibration_kwargs = {}
+        if weights is not None:
+            calibration_kwargs["sample_weight"] = weights
+        self.calibrator_.fit(scores, y, **calibration_kwargs)
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+        if getattr(self, "model_", None) is None or not getattr(self, "feature_names_", None):
+            prior = getattr(self, "constant_proba_", pd.Series(1.0 / len(self.classes_), index=self.classes_))
+            return pd.DataFrame(
+                {int(label): float(prior.get(label, 0.0)) for label in self.classes_},
+                index=X.index,
+            )
+        X = X.reindex(columns=self.feature_names_).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        x_scaled = self.scaler_.transform(X)
+        scores = np.asarray(self.model_.decision_function(x_scaled), dtype=float).reshape(-1, 1)
+        proba = self.calibrator_.predict_proba(scores)
+        return pd.DataFrame(proba, index=X.index, columns=self.calibrator_.classes_)
+
+
+class AfmlMoeWeightedVotePrimarySideModel(ClassifierMixin, BaseEstimator):
+    """
+    AFML-compliant MoE primary side model using sparse weighted voting.
+    """
+
+    requires_event_spans = True
+
+    def __init__(
+        self,
+        *,
+        experts: dict[str, Any] | None = None,
+        router: dict[str, Any] | None = None,
+        confidence_threshold: float = 0.45,
+        disagreement_threshold: float = 0.45,
+        abstain_enabled: bool = True,
+        regime_gating_enabled: bool = True,
+        expert_weights: dict[str, float] | None = None,
+        expert_scores: dict[str, float] | None = None,
+        expert_metrics: dict[str, Any] | None = None,
+        random_state: int | None = None,
+        n_jobs: int | None = 1,
+        verbose: bool = False,
+        progress_interval: int = 10,
+        progress_label: str | None = None,
+        rule_model: Any | None = None,
+    ) -> None:
+        self.experts = experts
+        self.router = router
+        self.confidence_threshold = confidence_threshold
+        self.disagreement_threshold = disagreement_threshold
+        self.abstain_enabled = abstain_enabled
+        self.regime_gating_enabled = regime_gating_enabled
+        self.expert_weights = expert_weights
+        self.expert_scores = expert_scores
+        self.expert_metrics = expert_metrics
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+        self.progress_interval = progress_interval
+        self.progress_label = progress_label
+        self.rule_model = rule_model
+
+    def _validate(self) -> None:
+        if not 0.0 <= float(self.confidence_threshold) <= 1.0:
+            raise ValueError("confidence_threshold must be in [0, 1]")
+        if not 0.0 <= float(self.disagreement_threshold) <= 1.0:
+            raise ValueError("disagreement_threshold must be in [0, 1]")
+        router = self.router if isinstance(self.router, dict) else {}
+        top_k = int(router.get("top_k", 2))
+        if top_k < 1:
+            raise ValueError("primary_model.router.top_k must be positive")
+        max_single = float(router.get("max_single_expert_usage", 1.0))
+        if not 0.0 < max_single <= 1.0:
+            raise ValueError("primary_model.router.max_single_expert_usage must be in (0, 1]")
+
+    def _enabled_experts(self) -> dict[str, dict[str, Any]]:
+        merged = _merge_expert_config(self.experts)
+        return {
+            name: config
+            for name, config in merged.items()
+            if bool(config.get("enabled", True))
+        }
+
+    def _configured_weight(self, name: str, config: dict[str, Any]) -> float:
+        if isinstance(self.expert_weights, dict) and name in self.expert_weights:
+            return max(0.0, float(self.expert_weights[name]))
+        return max(0.0, float(config.get("weight", 1.0)))
+
+    def _configured_score(self, name: str, weight: float) -> float:
+        if isinstance(self.expert_scores, dict) and name in self.expert_scores:
+            return max(0.0, float(self.expert_scores[name]))
+        return max(0.0, float(weight))
+
+    def _feature_names_for_expert(
+        self,
+        name: str,
+        config: dict[str, Any],
+        X: pd.DataFrame,
+    ) -> list[str]:
+        patterns = config.get("feature_patterns", [])
+        if not isinstance(patterns, list) or not patterns:
+            return list(X.columns)
+        lowered_patterns = [str(pattern).lower() for pattern in patterns]
+        selected = [
+            column
+            for column in X.columns
+            if any(pattern in str(column).lower() for pattern in lowered_patterns)
+        ]
+        if selected:
+            return selected
+        if self.verbose:
+            label = f"{self.progress_label}: " if self.progress_label else ""
+            print(f"  {label}{name} feature subset empty; using all features", flush=True)
+        return list(X.columns)
+
+    def _fit_tree_expert(
+        self,
+        name: str,
+        config: dict[str, Any],
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: pd.Series,
+        *,
+        t1: pd.Series | None,
+        bar_index: pd.DatetimeIndex | None,
+        indicator_matrix: pd.DataFrame | None,
+        splitter: str,
+        seed_offset: int,
+    ) -> SequentialBootstrapBaggingClassifier:
+        label = f"{self.progress_label}:{name}" if self.progress_label else name
+        model = SequentialBootstrapBaggingClassifier(
+            n_estimators=int(config.get("n_estimators", 80)),
+            max_samples=config.get("max_samples", "avg_uniqueness"),
+            max_features=config.get("max_features", 1),
+            max_depth=config.get("max_depth"),
+            min_samples_leaf=int(config.get("min_samples_leaf", 5)),
+            min_weight_fraction_leaf=float(config.get("min_weight_fraction_leaf", 0.05)),
+            class_weight=config.get("class_weight", "balanced_subsample"),
+            splitter=splitter,
+            random_state=None if self.random_state is None else int(self.random_state) + seed_offset,
+            n_jobs=self.n_jobs,
+            verbose=self.verbose,
+            progress_interval=int(self.progress_interval),
+            progress_label=label,
+        )
+        model.fit(
+            X,
+            y,
+            sample_weight=sample_weight,
+            t1=t1,
+            bar_index=bar_index,
+            indicator_matrix=indicator_matrix,
+        )
+        return model
+
+    def fit(  # noqa: C901
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: pd.Series | None = None,
+        *,
+        t1: pd.Series | None = None,
+        bar_index: pd.DatetimeIndex | None = None,
+        indicator_matrix: pd.DataFrame | None = None,
+    ) -> AfmlMoeWeightedVotePrimarySideModel:
+        self._validate()
+        X = X.replace([np.inf, -np.inf], np.nan).dropna()
+        y = y.reindex(X.index).dropna().astype(int)
+        X = X.loc[y.index]
+        if X.empty:
+            raise ValueError("Cannot fit primary model on an empty feature matrix")
+        classes = np.array(sorted(y.unique()), dtype=int)
+        if classes.shape[0] < 2:
+            raise ValueError("At least two side classes are required to fit primary model")
+
+        weights = (
+            sample_weight.reindex(X.index).fillna(0.0).astype(float)
+            if sample_weight is not None
+            else pd.Series(1.0, index=X.index, name="sample_weight")
+        )
+        weights = weights.clip(lower=0.0)
+        if weights.sum() <= 0.0:
+            weights = pd.Series(1.0, index=X.index, name="sample_weight")
+
+        t1 = t1.reindex(X.index) if t1 is not None else None
+        self.classes_ = classes
+        self.feature_names_ = list(X.columns)
+        self.expert_models_: dict[str, Any] = {}
+        self.expert_configs_: dict[str, dict[str, Any]] = {}
+        self.expert_feature_names_: dict[str, list[str]] = {}
+        configured_weights: dict[str, float] = {}
+        configured_scores: dict[str, float] = {}
+
+        enabled_experts = self._enabled_experts()
+        fit_started = time.perf_counter()
+        label = f"{self.progress_label}: " if self.progress_label else ""
+        if self.verbose:
+            print(
+                f"  {label}starting AFML-MoE fit rows={X.shape[0]:,} "
+                f"features={X.shape[1]:,} experts={','.join(enabled_experts)}",
+                flush=True,
+            )
+        for name, config in enabled_experts.items():
+            family = str(config.get("family", "bagged_tree")).lower()
+            feature_names = self._feature_names_for_expert(name, config, X)
+            X_expert = X[feature_names]
+            model: Any
+            expert_started = time.perf_counter()
+            if self.verbose:
+                n_estimators = config.get("n_estimators", "n/a")
+                print(
+                    f"  {label}starting expert {name} family={family} "
+                    f"features={len(feature_names):,} n_estimators={n_estimators}",
+                    flush=True,
+                )
+            if family == "bagged_tree":
+                model = self._fit_tree_expert(
+                    name,
+                    config,
+                    X_expert,
+                    y,
+                    weights,
+                    t1=t1,
+                    bar_index=bar_index,
+                    indicator_matrix=indicator_matrix,
+                    splitter="best",
+                    seed_offset=1_000 + len(self.expert_models_) * 1_000,
+                )
+            elif family == "linear_svm":
+                model = _CalibratedLinearSvmExpert(
+                    C=float(config.get("C", 0.5)),
+                    max_iter=int(config.get("max_iter", 4000)),
+                    class_weight=config.get("class_weight", "balanced"),
+                    variance_floor=float(config.get("variance_floor", 1e-12)),
+                    random_state=None
+                    if self.random_state is None
+                    else int(self.random_state) + 10_000 + len(self.expert_models_),
+                ).fit(X_expert, y, sample_weight=weights)
+            else:
+                raise ValueError(f"Unsupported AFML-MoE expert family: {family}")
+            if self.verbose:
+                print(
+                    f"  {label}finished expert {name} "
+                    f"elapsed={_format_elapsed(time.perf_counter() - expert_started)}",
+                    flush=True,
+                )
+
+            self.expert_models_[name] = model
+            self.expert_configs_[name] = config.copy()
+            self.expert_feature_names_[name] = feature_names
+            configured_weights[name] = self._configured_weight(name, config)
+            configured_scores[name] = self._configured_score(name, configured_weights[name])
+
+        if not self.expert_models_:
+            raise ValueError("No primary experts were fitted")
+        self.set_expert_weights(configured_weights)
+        self.expert_scores_ = {
+            name: configured_scores.get(name, self.expert_weights_.get(name, 0.0))
+            for name in self.expert_models_
+        }
+        self.expert_metrics_ = self.expert_metrics if isinstance(self.expert_metrics, dict) else {}
+        if self.verbose:
+            print(
+                f"  {label}finished AFML-MoE fit fitted_experts={len(self.expert_models_)} "
+                f"elapsed={_format_elapsed(time.perf_counter() - fit_started)}",
+                flush=True,
+            )
+        return self
+
+    def _check_fitted(self) -> None:
+        if (
+            getattr(self, "classes_", None) is None
+            or getattr(self, "feature_names_", None) is None
+            or not getattr(self, "expert_models_", None)
+        ):
+            raise ValueError("Primary model is not fitted")
+
+    def set_expert_weights(
+        self,
+        weights: dict[str, float],
+    ) -> AfmlMoeWeightedVotePrimarySideModel:
+        if not getattr(self, "expert_models_", None):
+            raise ValueError("Cannot set weights before fitting experts")
+        positive = {
+            name: max(0.0, float(weights.get(name, 0.0)))
+            for name in self.expert_models_
+        }
+        total = sum(positive.values())
+        if total <= 0.0:
+            positive = dict.fromkeys(self.expert_models_, 1.0)
+            total = float(len(positive))
+        self.expert_weights_ = {name: value / total for name, value in positive.items()}
+        return self
+
+    def _prepared_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        self._check_fitted()
+        return X.reindex(columns=self.feature_names_).replace([np.inf, -np.inf], np.nan).dropna()
+
+    def _expert_proba(self, name: str, model: Any, X: pd.DataFrame) -> pd.DataFrame:
+        feature_names = self.expert_feature_names_.get(name, self.feature_names_)
+        raw = model.predict_proba(X.reindex(columns=feature_names))
+        if isinstance(raw, pd.DataFrame):
+            proba = raw.copy()
+            proba.index = X.index
+        else:
+            columns = getattr(model, "classes_", self.classes_)
+            proba = pd.DataFrame(raw, index=X.index, columns=columns)
+        return _normalize_class_probability_frame(
+            proba,
+            index=X.index,
+            classes=self.classes_,
+        )
+
+    def expert_probability_frames(self, X: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        X = self._prepared_features(X)
+        return {
+            name: self._expert_proba(name, model, X)
+            for name, model in self.expert_models_.items()
+        }
+
+    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+        frame = self.primary_side_frame(X)
+        proba = pd.DataFrame(0.5, index=frame.index, columns=self.classes_)
+        for column in self.classes_:
+            name = f"primary_prob_{int(column)}"
+            if name in frame:
+                proba[column] = pd.to_numeric(frame[name], errors="coerce").fillna(0.5)
+        return _normalize_class_probability_frame(proba, index=proba.index, classes=self.classes_)
+
+    def predict(self, X: pd.DataFrame) -> pd.Series:
+        return self.primary_side_frame(X)["primary_side"].rename("prediction")
+
+    @staticmethod
+    def _append_reason(existing: str, reason: str) -> str:
+        if not existing:
+            return reason
+        parts = set(existing.split("+"))
+        if reason in parts:
+            return existing
+        return f"{existing}+{reason}"
+
+    def primary_side_frame(self, X: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
+        expert_frames = self.expert_probability_frames(X)
+        if not expert_frames:
+            raise ValueError("No expert probabilities are available")
+        index = next(iter(expert_frames.values())).index
+        pooled = pd.DataFrame(0.0, index=index, columns=self.classes_)
+        predictions = pd.Series(0, index=index, dtype=int)
+        confidence = pd.Series(0.0, index=index, dtype=float)
+        expert_votes = pd.DataFrame(
+            {
+                name: frame.idxmax(axis=1).astype(int)
+                for name, frame in expert_frames.items()
+            },
+            index=index,
+        )
+        router = self.router if isinstance(self.router, dict) else {}
+        shared_expert = str(router.get("shared_expert", "shared_purged_rf"))
+        if shared_expert not in expert_frames:
+            shared_expert = next(iter(expert_frames))
+        top_k = int(router.get("top_k", 2))
+        max_single_usage = float(router.get("max_single_expert_usage", 1.0))
+        max_disagreement = float(router.get("max_disagreement", self.disagreement_threshold))
+        min_vote_margin = float(router.get("min_vote_margin", 0.0))
+        min_selected_weight = float(router.get("min_selected_weight", 0.0))
+
+        expert_confidence = pd.DataFrame(
+            {name: frame.max(axis=1).astype(float) for name, frame in expert_frames.items()},
+            index=index,
+        )
+        expert_margins = pd.DataFrame(0.0, index=index, columns=list(expert_frames))
+        for name, frame in expert_frames.items():
+            if -1 in frame.columns and 1 in frame.columns:
+                expert_margins[name] = (frame[1] - frame[-1]).astype(float)
+
+        disagreement = pd.Series(0.0, index=index, dtype=float)
+        moe_selected = pd.Series("", index=index, dtype=object)
+        moe_shared_weight = pd.Series(0.0, index=index, dtype=float)
+        moe_vote_margin = pd.Series(0.0, index=index, dtype=float)
+        max_selected_weight = pd.Series(0.0, index=index, dtype=float)
+        driver_expert = pd.Series("", index=index, dtype=object)
+        driver_side = pd.Series(0, index=index, dtype=int)
+        driver_weight = pd.Series(0.0, index=index, dtype=float)
+        driver_margin = pd.Series(0.0, index=index, dtype=float)
+        driver_contribution = pd.Series(0.0, index=index, dtype=float)
+        selected_weight_columns = {
+            f"primary_moe_weight_{name}": pd.Series(0.0, index=index, dtype=float)
+            for name in expert_frames
+        }
+        expert_columns: dict[str, pd.Series] = {}
+
+        for name, expert_frame in expert_frames.items():
+            expert_vote = expert_votes[name].astype(int)
+            expert_columns[f"primary_expert_{name}_vote"] = expert_vote
+            expert_columns[f"primary_moe_vote_{name}"] = expert_vote
+            expert_columns[f"primary_moe_utility_{name}"] = pd.Series(
+                float(getattr(self, "expert_scores_", {}).get(name, 0.0)),
+                index=index,
+                dtype=float,
+            )
+            expert_columns[f"primary_moe_avg_uniqueness_weighted_score_{name}"] = pd.Series(
+                float(getattr(self, "expert_scores_", {}).get(name, 0.0)),
+                index=index,
+                dtype=float,
+            )
+            if -1 in expert_frame.columns:
+                expert_columns[f"primary_expert_{name}_prob_-1"] = expert_frame[-1].astype(float)
+            if 1 in expert_frame.columns:
+                expert_columns[f"primary_expert_{name}_prob_1"] = expert_frame[1].astype(float)
+            if -1 in expert_frame.columns and 1 in expert_frame.columns:
+                expert_margin = (expert_frame[1] - expert_frame[-1]).astype(float)
+            else:
+                expert_margin = pd.Series(0.0, index=expert_frame.index, dtype=float)
+            expert_columns[f"primary_expert_{name}_margin"] = expert_margin
+
+        expert_names = list(expert_frames)
+        base_weights = {
+            name: float(self.expert_weights_.get(name, 0.0))
+            for name in expert_names
+        }
+        for ts in index:
+            ranked = [
+                (
+                    name,
+                    base_weights.get(name, 0.0) * float(expert_confidence.loc[ts, name]),
+                )
+                for name in expert_names
+                if name != shared_expert and base_weights.get(name, 0.0) > 0.0
+            ]
+            ranked.sort(key=lambda item: item[1], reverse=True)
+            selected = [shared_expert] + [name for name, _ in ranked[:top_k]]
+            selected = list(dict.fromkeys(selected))
+            raw_weights = {
+                name: base_weights.get(name, 0.0) * float(expert_confidence.loc[ts, name])
+                for name in selected
+            }
+            total = sum(raw_weights.values())
+            if total <= 0.0:
+                raw_weights = dict.fromkeys(selected, 1.0)
+                total = float(len(raw_weights))
+            weights = {name: value / total for name, value in raw_weights.items()}
+            moe_selected.loc[ts] = ",".join(selected)
+            moe_shared_weight.loc[ts] = weights.get(shared_expert, 0.0)
+            max_selected_weight.loc[ts] = max(weights.values()) if weights else 0.0
+            for name, weight in weights.items():
+                selected_weight_columns[f"primary_moe_weight_{name}"].loc[ts] = weight
+                pooled.loc[ts] += expert_frames[name].loc[ts].reindex(self.classes_).fillna(0.0) * weight
+
+            pooled.loc[ts] = pooled.loc[ts] / max(float(pooled.loc[ts].sum()), 1e-12)
+            vote_score = sum(weights[name] * int(expert_votes.loc[ts, name]) for name in selected)
+            prediction = 1 if vote_score > 0.0 else -1 if vote_score < 0.0 else int(pooled.loc[ts].idxmax())
+            predictions.loc[ts] = prediction
+            confidence.loc[ts] = float(pooled.loc[ts].max())
+            moe_vote_margin.loc[ts] = abs(float(vote_score))
+            disagreement.loc[ts] = sum(
+                weight for name, weight in weights.items() if int(expert_votes.loc[ts, name]) != prediction
+            )
+            driver_side.loc[ts] = prediction
+            best_name = ""
+            best_contribution = -np.inf
+            for name, weight in weights.items():
+                if prediction == 1:
+                    margin = float(expert_frames[name].loc[ts].get(1, 0.0)) - float(
+                        expert_frames[name].loc[ts].get(-1, 0.0),
+                    )
+                else:
+                    margin = float(expert_frames[name].loc[ts].get(-1, 0.0)) - float(
+                        expert_frames[name].loc[ts].get(1, 0.0),
+                    )
+                contribution = margin * weight
+                if contribution > best_contribution:
+                    best_name = name
+                    best_contribution = contribution
+                    driver_weight.loc[ts] = weight
+                    driver_margin.loc[ts] = margin
+            driver_expert.loc[ts] = best_name
+            driver_contribution.loc[ts] = 0.0 if best_contribution == -np.inf else best_contribution
+
+        low_confidence = confidence < float(self.confidence_threshold)
+        high_disagreement = disagreement > max_disagreement
+        weak_vote = moe_vote_margin <= min_vote_margin
+        weak_selected_weight = max_selected_weight <= min_selected_weight
+        expert_dominance = max_selected_weight > max_single_usage
+
+        side = predictions.copy()
+        abstain_reason = pd.Series("", index=index, dtype=object)
+        if bool(self.abstain_enabled):
+            abstain = (
+                low_confidence
+                | high_disagreement
+                | weak_vote
+                | weak_selected_weight
+                | expert_dominance
+            )
+            side.loc[abstain] = 0
+            abstain_reason.loc[low_confidence] = "low_confidence"
+            for mask, reason in (
+                (high_disagreement, "expert_disagreement"),
+                (weak_vote, "weak_moe_vote_margin"),
+                (weak_selected_weight, "weak_moe_router_weight"),
+                (expert_dominance, "single_expert_dominance"),
+            ):
+                for ts in abstain_reason.loc[mask].index:
+                    abstain_reason.loc[ts] = self._append_reason(str(abstain_reason.loc[ts]), reason)
+
+        frame = pd.DataFrame(
+            {
+                "primary_side": side.astype(int),
+                "primary_prediction": predictions.astype(int),
+                "primary_confidence": confidence.astype(float),
+                "primary_uncertainty": (1.0 - confidence).astype(float),
+                "primary_disagreement": disagreement.astype(float),
+                "primary_abstain_reason": abstain_reason,
+                "primary_expert_count": len(expert_frames),
+                "primary_driver_expert": driver_expert,
+                "primary_driver_side": driver_side.astype(int),
+                "primary_driver_weight": driver_weight.astype(float),
+                "primary_driver_margin": driver_margin.astype(float),
+                "primary_driver_contribution": driver_contribution.replace(-np.inf, 0.0).astype(float),
+                "primary_policy": PRIMARY_MOE_MODEL_NAME,
+                "primary_market_state": "afml_moe",
+                "selected_policy_oof_edge": 0.0,
+                "selected_policy_profit_factor": np.nan,
+                "selected_policy_trade_count": 0,
+                "trend_side": 0,
+                "trend_confidence": 0.0,
+                "reversion_side": 0,
+                "reversion_confidence": 0.0,
+                "trend_score": 0.0,
+                "reversion_score": 0.0,
+                "volatility_state": "unknown",
+                "flow_state": "unknown",
+                "entropy_state": "unknown",
+                "primary_moe_selected_experts": moe_selected,
+                "primary_moe_shared_weight": moe_shared_weight.astype(float),
+                "primary_moe_vote_margin": moe_vote_margin.astype(float),
+                "primary_moe_disagreement": disagreement.astype(float),
+            },
+            index=index,
+        )
+        for column in pooled.columns:
+            frame[f"primary_prob_{int(column)}"] = pooled[column].astype(float)
+        if -1 in pooled.columns and 1 in pooled.columns:
+            frame["primary_prob_margin"] = pooled[1] - pooled[-1]
+        for column, values in selected_weight_columns.items():
+            frame[column] = values.astype(float)
+        for column, values in expert_columns.items():
+            frame[column] = values
+        return frame
+
+    def diagnostics(self) -> dict[str, Any]:
+        self._check_fitted()
+        return {
+            "model": PRIMARY_MOE_MODEL_NAME,
+            "experts": list(self.expert_models_.keys()),
+            "expert_weights": dict(self.expert_weights_),
+            "expert_scores": dict(getattr(self, "expert_scores_", {})),
+            "expert_metrics": getattr(self, "expert_metrics_", {}),
+            "expert_feature_names": {
+                name: list(columns)
+                for name, columns in getattr(self, "expert_feature_names_", {}).items()
+            },
+            "router": self.router if isinstance(self.router, dict) else {},
+            "confidence_threshold": float(self.confidence_threshold),
+            "disagreement_threshold": float(self.disagreement_threshold),
+            "abstain_enabled": bool(self.abstain_enabled),
+            "regime_gating_enabled": bool(self.regime_gating_enabled),
+            "classes": [int(label) for label in self.classes_],
+        }
 
 # -------------------------------------------------------------------------------------------------
 # Chapter 8 - Feature importance
@@ -1841,6 +3388,8 @@ def mda_feature_importance(
     sample_weight: pd.Series | None = None,
     n_repeats: int = 5,
     random_state: int | None = None,
+    progress_label: str | None = None,
+    progress_interval: int = 10,
 ) -> pd.DataFrame:
     """
     Compute mean decrease accuracy by permuting each feature out-of-sample.
@@ -1857,9 +3406,19 @@ def mda_feature_importance(
         raise ValueError("Cannot compute MDA on an empty feature matrix")
 
     rng = np.random.default_rng(random_state)
+    started = time.perf_counter()
+    label = f"{progress_label}: " if progress_label else ""
+    progress_interval = max(1, int(progress_interval))
+    if progress_label:
+        print(
+            f"  {label}starting MDA features={X.shape[1]:,} "
+            f"rows={X.shape[0]:,} repeats={n_repeats}",
+            flush=True,
+        )
     baseline = _weighted_accuracy(y, model.predict(X), sample_weight)
     rows: list[dict[str, float | str]] = []
-    for feature in X.columns:
+    total_features = len(X.columns)
+    for pos, feature in enumerate(X.columns, start=1):
         decreases = []
         values = X[feature].to_numpy(dtype=float)
         for _ in range(n_repeats):
@@ -1876,6 +3435,17 @@ def mda_feature_importance(
                 "baseline_score": baseline,
             },
         )
+        if progress_label and (pos == 1 or pos == total_features or pos % progress_interval == 0):
+            print(
+                f"  {label}MDA feature {pos}/{total_features} "
+                f"elapsed={_format_elapsed(time.perf_counter() - started)}",
+                flush=True,
+            )
+    if progress_label:
+        print(
+            f"  {label}finished MDA elapsed={_format_elapsed(time.perf_counter() - started)}",
+            flush=True,
+        )
     return pd.DataFrame(rows).sort_values("importance", ascending=False, ignore_index=True)
 
 
@@ -1885,12 +3455,24 @@ def sfi_feature_importance(
     train_index: pd.DatetimeIndex,
     test_index: pd.DatetimeIndex,
     model_factory: Any,
+    progress_label: str | None = None,
+    progress_interval: int = 10,
 ) -> pd.DataFrame:
     """
     Compute single feature importance by fitting one model per feature.
     """
     rows: list[dict[str, float | str]] = []
-    for feature in dataset.X.columns:
+    started = time.perf_counter()
+    label = f"{progress_label}: " if progress_label else ""
+    progress_interval = max(1, int(progress_interval))
+    total_features = len(dataset.X.columns)
+    if progress_label:
+        print(
+            f"  {label}starting SFI features={total_features:,} "
+            f"train={len(train_index):,} test={len(test_index):,}",
+            flush=True,
+        )
+    for pos, feature in enumerate(dataset.X.columns, start=1):
         feature_dataset = AfmlDataset(
             close=dataset.close,
             features=dataset.features[[feature]],
@@ -1915,6 +3497,17 @@ def sfi_feature_importance(
                 "std": 0.0,
             },
         )
+        if progress_label and (pos == 1 or pos == total_features or pos % progress_interval == 0):
+            print(
+                f"  {label}SFI feature {pos}/{total_features} "
+                f"elapsed={_format_elapsed(time.perf_counter() - started)}",
+                flush=True,
+            )
+    if progress_label:
+        print(
+            f"  {label}finished SFI elapsed={_format_elapsed(time.perf_counter() - started)}",
+            flush=True,
+        )
     return pd.DataFrame(rows).sort_values("importance", ascending=False, ignore_index=True)
 
 
@@ -1926,6 +3519,13 @@ def sfi_feature_importance(
 def _normal_cdf(value: float | np.ndarray) -> float | np.ndarray:
     erf = np.vectorize(math.erf)
     return 0.5 * (1.0 + erf(np.asarray(value, dtype=float) / math.sqrt(2.0)))
+
+
+def _normal_ppf(probability: float) -> float:
+    probability = float(probability)
+    if not 0.0 < probability < 1.0:
+        raise ValueError("probability must be inside (0, 1)")
+    return float(NormalDist().inv_cdf(probability))
 
 
 def bet_size_from_probability(
@@ -1960,6 +3560,7 @@ def make_bet_size_frame(
     signals: pd.DataFrame,
     *,
     probability_col: str | None = None,
+    probability_status: str | None = None,
     signal_col: str = "signal",
     num_classes: int = 2,
     min_abs_size: float = 0.0,
@@ -1973,8 +3574,8 @@ def make_bet_size_frame(
         raise ValueError(f"signals must contain {signal_col!r}")
     if not 0.0 <= min_abs_size <= max_abs_size <= 1.0:
         raise ValueError("size bounds must satisfy 0 <= min_abs_size <= max_abs_size <= 1")
-    if step_size is not None and not 0.0 < step_size <= 1.0:
-        raise ValueError("step_size must satisfy 0 < step_size <= 1")
+    if step_size is not None and not 0.0 <= step_size <= 1.0:
+        raise ValueError("step_size must satisfy 0 <= step_size <= 1")
 
     out = signals.copy()
     if probability_col is None:
@@ -1992,13 +3593,20 @@ def make_bet_size_frame(
     magnitude = magnitude.clip(lower=min_abs_size, upper=max_abs_size)
     active = out[signal_col].astype(int) != 0
     magnitude = magnitude.where(active, 0.0)
-    bet_size = out[signal_col].astype(int) * magnitude
-    if step_size is not None:
+    raw_bet_size = out[signal_col].astype(int) * magnitude
+    bet_size = raw_bet_size.copy()
+    if step_size is not None and float(step_size) > 0.0:
         bet_size = (bet_size / step_size).round() * step_size
         bet_size = bet_size.clip(lower=-max_abs_size, upper=max_abs_size)
         bet_size = bet_size.where(active, 0.0)
+    out["bet_size_raw"] = raw_bet_size
+    out["bet_size_raw_abs"] = raw_bet_size.abs()
     out["bet_size"] = bet_size
     out["bet_size_abs"] = bet_size.abs()
+    if probability_col is None or probability_col not in signals.columns:
+        out["bet_size_probability_status"] = "missing_probability"
+    else:
+        out["bet_size_probability_status"] = probability_status or "uncalibrated_probability"
     return out
 
 
@@ -2036,6 +3644,374 @@ def probabilistic_sharpe_ratio(
     denominator = math.sqrt(max(1e-12, 1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr * sr))
     z = (sr - benchmark_sr) * math.sqrt(n - 1.0) / denominator
     return float(_normal_cdf(z))
+
+
+def deflated_sharpe_ratio(
+    returns: pd.Series,
+    *,
+    benchmark_sr: float = 0.0,
+    periods_per_year: float = 365.0,
+    n_trials: int = 1,
+) -> float:
+    """
+    Multiple-testing adjusted probability that Sharpe exceeds a benchmark.
+
+    This keeps the existing PSR implementation as the base estimator, then
+    raises the benchmark by the expected maximum Sharpe induced by ``n_trials``
+    independent trials.
+    """
+    returns = returns.dropna().astype(float)
+    n = len(returns)
+    if n < 3:
+        return 0.0
+    if n_trials <= 1:
+        return probabilistic_sharpe_ratio(
+            returns,
+            benchmark_sr=benchmark_sr,
+            periods_per_year=periods_per_year,
+        )
+
+    sr = annualized_sharpe_ratio(returns, periods_per_year=periods_per_year)
+    skew = float(returns.skew())
+    kurt = float(returns.kurt() + 3.0)
+    sr_std = math.sqrt(max(1e-12, 1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr * sr))
+    sr_std /= math.sqrt(n - 1.0)
+    euler_gamma = 0.5772156649015329
+    trials = float(max(2, int(n_trials)))
+    expected_max_z = (1.0 - euler_gamma) * _normal_ppf(1.0 - 1.0 / trials)
+    expected_max_z += euler_gamma * _normal_ppf(1.0 - 1.0 / (trials * math.e))
+    deflated_benchmark = float(benchmark_sr) + sr_std * expected_max_z
+    return probabilistic_sharpe_ratio(
+        returns,
+        benchmark_sr=deflated_benchmark,
+        periods_per_year=periods_per_year,
+    )
+
+
+def sharpe_ratio_diagnostics(
+    returns: pd.Series | np.ndarray,
+    *,
+    benchmark_sr: float = 0.0,
+    periods_per_year: float = 365.0,
+    n_trials: int = 1,
+) -> dict[str, Any]:
+    """
+    JSON-ready PSR/DSR summary for a return stream.
+    """
+    series = pd.Series(returns).dropna().astype(float)
+    return {
+        "n_returns": len(series),
+        "periods_per_year": float(periods_per_year),
+        "benchmark_sharpe": float(benchmark_sr),
+        "n_trials": int(max(1, n_trials)),
+        "annualized_sharpe": annualized_sharpe_ratio(series, periods_per_year=periods_per_year),
+        "probabilistic_sharpe_ratio": probabilistic_sharpe_ratio(
+            series,
+            benchmark_sr=benchmark_sr,
+            periods_per_year=periods_per_year,
+        ),
+        "deflated_sharpe_ratio": deflated_sharpe_ratio(
+            series,
+            benchmark_sr=benchmark_sr,
+            periods_per_year=periods_per_year,
+            n_trials=n_trials,
+        ),
+    }
+
+
+def strategy_required_precision(
+    *,
+    avg_win: float,
+    avg_loss: float,
+    annual_frequency: float,
+    target_sr: float,
+) -> float | None:
+    """
+    Return the required hit rate for the target Sharpe under asymmetric win/loss payoffs.
+    """
+    win = float(avg_win)
+    loss = abs(float(avg_loss))
+    if win <= 0.0 or loss <= 0.0 or annual_frequency <= 0.0:
+        return None
+    target_per_bet = float(target_sr) / math.sqrt(float(annual_frequency))
+
+    def payoff_sharpe(probability: float) -> float:
+        mean = probability * win - (1.0 - probability) * loss
+        second = probability * win * win + (1.0 - probability) * loss * loss
+        variance = max(0.0, second - mean * mean)
+        if variance <= 0.0:
+            if mean > 0.0:
+                return math.inf
+            if mean < 0.0:
+                return -math.inf
+            return 0.0
+        return mean / math.sqrt(variance)
+
+    low = 0.0
+    high = 1.0
+    for _ in range(80):
+        mid = (low + high) / 2.0
+        if payoff_sharpe(mid) < target_per_bet:
+            low = mid
+        else:
+            high = mid
+    return float(high)
+
+
+def _annual_frequency_from_index(index: pd.Index, fallback: float) -> float:
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
+        return float(fallback)
+    span_days = (index.max() - index.min()).total_seconds() / 86_400.0
+    if span_days <= 0.0:
+        return float(fallback)
+    return float(len(index) * 365.0 / span_days)
+
+
+def strategy_failure_probability_summary(
+    returns: pd.Series | np.ndarray,
+    *,
+    target_sr: float = 1.0,
+    periods_per_year: float = 365.0,
+) -> dict[str, Any]:
+    """
+    Estimate Chapter-15 strategy failure probability ``P[p < p*]``.
+    """
+    series = pd.Series(returns).dropna().astype(float)
+    if series.empty:
+        return {
+            "enabled": True,
+            "status": "insufficient_returns",
+            "trade_count": 0,
+            "failure_probability": None,
+        }
+
+    wins = series[series > 0.0]
+    losses = series[series < 0.0]
+    decisive = len(wins) + len(losses)
+    if decisive < 2 or wins.empty or losses.empty:
+        return {
+            "enabled": True,
+            "status": "insufficient_win_loss_mix",
+            "trade_count": len(series),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "failure_probability": None,
+        }
+
+    observed_precision = float(len(wins) / decisive)
+    avg_win = float(wins.mean())
+    avg_loss = float(abs(losses.mean()))
+    annual_frequency = _annual_frequency_from_index(series.index, periods_per_year)
+    required_precision = strategy_required_precision(
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        annual_frequency=annual_frequency,
+        target_sr=target_sr,
+    )
+    if required_precision is None:
+        failure_probability = None
+    else:
+        precision_std = math.sqrt(
+            max(1e-12, observed_precision * (1.0 - observed_precision) / float(decisive)),
+        )
+        z = (required_precision - observed_precision) / precision_std
+        failure_probability = float(_normal_cdf(z))
+
+    return {
+        "enabled": True,
+        "status": "ok",
+        "trade_count": len(series),
+        "decisive_trade_count": int(decisive),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "observed_precision": observed_precision,
+        "required_precision": required_precision,
+        "failure_probability": failure_probability,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff_ratio": avg_win / avg_loss if avg_loss > 0.0 else None,
+        "annual_frequency": annual_frequency,
+        "target_sharpe": float(target_sr),
+    }
+
+
+def probability_calibration_config_summary(config: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Normalize probability calibration config without changing model behavior.
+    """
+    config = config if isinstance(config, dict) else {}
+    method = str(config.get("method", "sigmoid")).strip().lower()
+    if method not in {"sigmoid", "isotonic"}:
+        method = "sigmoid"
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "method": method,
+        "status": "configured_off" if not bool(config.get("enabled", False)) else "configured_on",
+    }
+
+
+def calibrate_binary_probabilities(
+    probability: pd.Series,
+    y: pd.Series,
+    *,
+    target_probability: pd.Series | None = None,
+    method: str = "sigmoid",
+) -> pd.Series:
+    """
+    Fit a binary probability calibrator on a calibration fold and transform probabilities.
+
+    This helper is intentionally not wired into default workflows; callers must
+    provide a purged/embargoed calibration fold explicitly.
+    """
+    method = method.strip().lower()
+    if method not in {"sigmoid", "isotonic"}:
+        raise ValueError("method must be 'sigmoid' or 'isotonic'")
+    calibration = probability.dropna().astype(float).clip(1e-6, 1.0 - 1e-6)
+    truth = y.reindex(calibration.index).dropna().astype(int)
+    calibration = calibration.loc[truth.index]
+    if calibration.empty:
+        raise ValueError("calibration probability series is empty")
+    if len(set(truth.to_numpy(dtype=int))) < 2:
+        raise ValueError("probability calibration requires both binary classes")
+    target = target_probability if target_probability is not None else probability
+    target = target.dropna().astype(float).clip(1e-6, 1.0 - 1e-6)
+
+    if method == "sigmoid":
+        try:
+            from sklearn.linear_model import LogisticRegression
+        except ImportError as exc:
+            raise ImportError("sigmoid calibration requires scikit-learn") from exc
+
+        x_cal = np.log(calibration / (1.0 - calibration)).to_numpy(dtype=float).reshape(-1, 1)
+        x_target = np.log(target / (1.0 - target)).to_numpy(dtype=float).reshape(-1, 1)
+        model = LogisticRegression(solver="lbfgs")
+        model.fit(x_cal, truth.to_numpy(dtype=int))
+        classes = list(model.classes_)
+        positive_pos = classes.index(1)
+        calibrated = model.predict_proba(x_target)[:, positive_pos]
+    else:
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except ImportError as exc:
+            raise ImportError("isotonic calibration requires scikit-learn") from exc
+
+        model = IsotonicRegression(out_of_bounds="clip")
+        model.fit(calibration.to_numpy(dtype=float), truth.to_numpy(dtype=int))
+        calibrated = model.transform(target.to_numpy(dtype=float))
+
+    return pd.Series(calibrated, index=target.index, name="calibrated_probability")
+
+
+def _config_section(config: dict[str, Any], name: str) -> dict[str, Any]:
+    value = config.get(name, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _configured_trials(value: Any, fallback: int) -> int:
+    if value is None:
+        return int(max(1, fallback))
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return int(max(1, fallback))
+    return int(max(1, value))
+
+
+def afml_validation_diagnostics(
+    returns: pd.Series | np.ndarray,
+    *,
+    validation_config: dict[str, Any] | None = None,
+    periods_per_year: float = 365.0,
+    n_trials: int = 1,
+    event_starts: Any | None = None,
+    event_ends: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Compact AFML validation summary for backtest and research outputs.
+    """
+    config = validation_config if isinstance(validation_config, dict) else {}
+    dsr_config = _config_section(config, "deflated_sharpe")
+    failure_config = _config_section(config, "strategy_failure")
+    cpcv_config = _config_section(config, "cpcv")
+
+    trial_count = _configured_trials(dsr_config.get("n_trials"), n_trials)
+    if bool(dsr_config.get("enabled", True)):
+        sharpe = sharpe_ratio_diagnostics(
+            returns,
+            benchmark_sr=float(dsr_config.get("benchmark_sr", 0.0)),
+            periods_per_year=periods_per_year,
+            n_trials=trial_count,
+        )
+    else:
+        sharpe = {"enabled": False}
+
+    if bool(failure_config.get("enabled", True)):
+        failure = strategy_failure_probability_summary(
+            returns,
+            target_sr=float(failure_config.get("target_sr", 1.0)),
+            periods_per_year=periods_per_year,
+        )
+    else:
+        failure = {"enabled": False}
+
+    cpcv: dict[str, Any]
+    if bool(cpcv_config.get("enabled", False)) and event_starts is not None and event_ends is not None:
+        n_groups = int(cpcv_config.get("n_groups", 6))
+        n_test_groups = int(cpcv_config.get("n_test_groups", 2))
+        embargo_bars = int(cpcv_config.get("embargo_bars", 0))
+        n_events = len(np.asarray(event_starts))
+        if n_events < n_groups:
+            cpcv = {
+                "enabled": True,
+                "status": "insufficient_events",
+                "n_samples": int(n_events),
+                "n_groups": n_groups,
+                "n_test_groups": n_test_groups,
+                "embargo_bars": embargo_bars,
+                "error": "n_groups cannot exceed the number of events",
+            }
+            return {
+                "sharpe": sharpe,
+                "strategy_failure": failure,
+                "cpcv": cpcv,
+                "probability_calibration": probability_calibration_config_summary(
+                    _config_section(config, "probability_calibration"),
+                ),
+            }
+        try:
+            splits = combinatorial_purged_cv_splits(
+                event_starts,
+                event_ends,
+                n_groups=n_groups,
+                n_test_groups=n_test_groups,
+                embargo_bars=embargo_bars,
+            )
+            cpcv = cpcv_split_summary(
+                splits,
+                n_samples=len(np.asarray(event_starts)),
+                n_groups=n_groups,
+                n_test_groups=n_test_groups,
+            )
+        except Exception as exc:
+            cpcv = {
+                "enabled": True,
+                "n_groups": n_groups,
+                "n_test_groups": n_test_groups,
+                "embargo_bars": embargo_bars,
+                "error": str(exc),
+            }
+    else:
+        cpcv = {
+            "enabled": bool(cpcv_config.get("enabled", False)),
+            "status": "missing_event_spans" if bool(cpcv_config.get("enabled", False)) else "configured_off",
+        }
+
+    return {
+        "sharpe": sharpe,
+        "strategy_failure": failure,
+        "cpcv": cpcv,
+        "probability_calibration": probability_calibration_config_summary(
+            _config_section(config, "probability_calibration"),
+        ),
+    }
 
 
 # -------------------------------------------------------------------------------------------------
@@ -2249,9 +4225,10 @@ def _add_calendar_regime_features(
     min_periods: int,
     tail_quantile: float,
     robust_z_clip: float | None,
-) -> None:
+) -> pd.DataFrame:
     abs_return = log_return.abs()
     signed_abs_notional = signed_notional.abs()
+    calendar_columns: dict[str, pd.Series] = {}
 
     for window in calendar_windows:
         label = _calendar_window_label(window)
@@ -2272,70 +4249,75 @@ def _add_calendar_regime_features(
         tail_event = (abs_return >= abs_return_tail).astype(float)
         tail_event_count = tail_event.rolling(window=window, min_periods=min_periods).sum()
 
-        features[f"calendar_bar_count_{label}"] = bar_count
-        features[f"calendar_bar_density_per_day_{label}"] = bar_count / window_days
-        features[f"calendar_realized_vol_{label}"] = rolling_return.std()
-        features[f"calendar_return_skew_{label}"] = return_skew
-        features[f"calendar_return_excess_kurt_{label}"] = return_excess_kurt
-        features[f"calendar_jb_moment_distance_{label}"] = jb_moment_distance
-        features[f"calendar_abs_return_max_{label}"] = rolling_abs_return.max()
-        features[f"calendar_abs_return_q{int(tail_quantile * 100):02d}_{label}"] = (
+        calendar_columns[f"calendar_bar_count_{label}"] = bar_count
+        calendar_columns[f"calendar_bar_density_per_day_{label}"] = bar_count / window_days
+        calendar_columns[f"calendar_realized_vol_{label}"] = rolling_return.std()
+        calendar_columns[f"calendar_return_skew_{label}"] = return_skew
+        calendar_columns[f"calendar_return_excess_kurt_{label}"] = return_excess_kurt
+        calendar_columns[f"calendar_jb_moment_distance_{label}"] = jb_moment_distance
+        calendar_columns[f"calendar_abs_return_max_{label}"] = rolling_abs_return.max()
+        calendar_columns[f"calendar_abs_return_q{int(tail_quantile * 100):02d}_{label}"] = (
             abs_return_tail
         )
-        features[f"calendar_tail_event_count_{label}"] = tail_event_count
-        features[f"calendar_tail_event_share_{label}"] = _safe_divide(
+        calendar_columns[f"calendar_tail_event_count_{label}"] = tail_event_count
+        calendar_columns[f"calendar_tail_event_share_{label}"] = _safe_divide(
             tail_event_count,
             bar_count,
         )
-        features[f"calendar_log_return_robust_z_{label}"] = _rolling_iqr_zscore(
+        calendar_columns[f"calendar_log_return_robust_z_{label}"] = _rolling_iqr_zscore(
             log_return,
             window,
             min_periods=min_periods,
             clip=robust_z_clip,
         )
-        features[f"calendar_abs_return_robust_z_{label}"] = _rolling_iqr_zscore(
+        calendar_columns[f"calendar_abs_return_robust_z_{label}"] = _rolling_iqr_zscore(
             abs_return,
             window,
             min_periods=min_periods,
             clip=robust_z_clip,
         )
-        features[f"calendar_dollar_volume_sum_{label}"] = rolling_notional.sum()
-        features[f"calendar_dollar_volume_robust_z_{label}"] = _rolling_iqr_zscore(
+        calendar_columns[f"calendar_dollar_volume_sum_{label}"] = rolling_notional.sum()
+        calendar_columns[f"calendar_dollar_volume_robust_z_{label}"] = _rolling_iqr_zscore(
             total_notional,
             window,
             min_periods=min_periods,
             clip=robust_z_clip,
         )
-        features[f"calendar_signed_notional_robust_z_{label}"] = _rolling_iqr_zscore(
+        calendar_columns[f"calendar_signed_notional_robust_z_{label}"] = _rolling_iqr_zscore(
             signed_notional,
             window,
             min_periods=min_periods,
             clip=robust_z_clip,
         )
-        features[f"calendar_order_flow_imbalance_{label}"] = _safe_divide(
+        calendar_columns[f"calendar_order_flow_imbalance_{label}"] = _safe_divide(
             signed_notional.rolling(window=window, min_periods=min_periods).sum(),
             rolling_notional.sum(),
         )
-        features[f"calendar_vpin_{label}"] = _safe_divide(
+        calendar_columns[f"calendar_vpin_{label}"] = _safe_divide(
             rolling_signed_abs_notional.sum(),
             rolling_notional.sum(),
         )
 
         if theta_to_threshold is not None:
-            features[f"calendar_theta_to_threshold_mean_{label}"] = theta_to_threshold.rolling(
+            calendar_columns[f"calendar_theta_to_threshold_mean_{label}"] = theta_to_threshold.rolling(
                 window=window,
                 min_periods=min_periods,
             ).mean()
-            features[f"calendar_theta_to_threshold_max_{label}"] = theta_to_threshold.rolling(
+            calendar_columns[f"calendar_theta_to_threshold_max_{label}"] = theta_to_threshold.rolling(
                 window=window,
                 min_periods=min_periods,
             ).max()
-            features[f"calendar_theta_to_threshold_robust_z_{label}"] = _rolling_iqr_zscore(
+            calendar_columns[f"calendar_theta_to_threshold_robust_z_{label}"] = _rolling_iqr_zscore(
                 theta_to_threshold,
                 window,
                 min_periods=min_periods,
                 clip=robust_z_clip,
             )
+
+    if not calendar_columns:
+        return features.copy()
+    calendar_frame = pd.DataFrame(calendar_columns, index=features.index)
+    return pd.concat([features, calendar_frame], axis=1).copy()
 
 
 def make_pipeline_features(  # noqa: C901
@@ -2612,7 +4594,7 @@ def make_pipeline_features(  # noqa: C901
         )
 
     if calendar_windows:
-        _add_calendar_regime_features(
+        features = _add_calendar_regime_features(
             features,
             close=close,
             log_return=log_return,
@@ -2624,7 +4606,6 @@ def make_pipeline_features(  # noqa: C901
             tail_quantile=tail_quantile,
             robust_z_clip=robust_z_clip,
         )
-        features = features.copy()
 
     features["shannon_entropy"] = rolling_binary_entropy(log_return, window=information_window)
     features["lz_complexity"] = rolling_lz_complexity(log_return, window=information_window)
@@ -3006,6 +4987,91 @@ def _fit_classifier(model: Any, dataset: AfmlDataset, train_index: pd.DatetimeIn
     return model
 
 
+def _new_primary_model(template: Any | None) -> Any:
+    return SequentialBootstrapBaggingClassifier() if template is None else deepcopy(template)
+
+
+def _purged_train_index_for_validation(
+    dataset: AfmlDataset,
+    candidate_index: pd.DatetimeIndex,
+    validation_index: pd.DatetimeIndex,
+    *,
+    embargo_bars: int,
+) -> pd.DatetimeIndex:
+    candidate_index = pd.DatetimeIndex(candidate_index).intersection(dataset.X.index).sort_values()
+    validation_index = pd.DatetimeIndex(validation_index).intersection(dataset.X.index).sort_values()
+    if validation_index.empty or candidate_index.empty:
+        return pd.DatetimeIndex([])
+
+    event_end = pd.to_datetime(dataset.events.loc[candidate_index, "t1"], utc=True)
+    validation_start = validation_index.min()
+    validation_end = pd.to_datetime(dataset.events.loc[validation_index, "t1"], utc=True).max()
+    if pd.isna(validation_end):
+        validation_end = validation_index.max()
+
+    embargo_end = validation_end
+    if embargo_bars > 0:
+        bar_index = pd.DatetimeIndex(dataset.close.index).sort_values()
+        end_pos = int(bar_index.searchsorted(validation_end, side="right"))
+        embargo_pos = min(len(bar_index) - 1, end_pos + int(embargo_bars))
+        if len(bar_index) > 0:
+            embargo_end = bar_index[embargo_pos]
+
+    allowed = (event_end < validation_start) | (candidate_index > embargo_end)
+    allowed &= ~candidate_index.isin(validation_index)
+    return pd.DatetimeIndex(candidate_index[np.asarray(allowed, dtype=bool)])
+
+
+def _primary_oof_side_frame(
+    dataset: AfmlDataset,
+    train_index: pd.DatetimeIndex,
+    *,
+    model_template: Any | None,
+    primary_probability_threshold: float,
+    n_splits: int,
+    embargo_bars: int,
+    pca_components: float | None,
+    pca_random_state: int | None,
+) -> pd.DataFrame:
+    ordered = pd.DatetimeIndex(train_index).intersection(dataset.X.index).sort_values()
+    if n_splits < 2:
+        raise ValueError("primary_oof_splits must be at least 2")
+    if len(ordered) < n_splits:
+        raise ValueError("primary OOF requires at least one training event per split")
+
+    frames: list[pd.DataFrame] = []
+    folds = [pd.DatetimeIndex(values) for values in np.array_split(ordered.to_numpy(), n_splits) if len(values)]
+    for fold_id, validation_index in enumerate(folds):
+        inner_train = _purged_train_index_for_validation(
+            dataset,
+            ordered,
+            validation_index,
+            embargo_bars=embargo_bars,
+        )
+        if len(inner_train) < 2 or dataset.y.loc[inner_train].nunique() < 2:
+            continue
+
+        fold_dataset, _fold_transformer = _pca_dataset(
+            dataset,
+            inner_train,
+            pca_components=pca_components,
+            pca_random_state=None if pca_random_state is None else int(pca_random_state) + fold_id,
+        )
+        fold_model = _new_primary_model(model_template)
+        fold_model = _fit_classifier(fold_model, fold_dataset, inner_train)
+        frames.append(
+            primary_side_frame(
+                fold_model,
+                fold_dataset.X.loc[validation_index],
+                probability_threshold=primary_probability_threshold,
+            ),
+        )
+
+    if not frames:
+        raise ValueError("Primary OOF side generation produced no fold predictions")
+    return pd.concat(frames, axis=0).sort_index()
+
+
 def _replace_dataset_features(dataset: AfmlDataset, features: pd.DataFrame) -> AfmlDataset:
     features = features.reindex(dataset.features.index)
     return AfmlDataset(
@@ -3242,14 +5308,89 @@ def primary_side_frame(
 
 def make_meta_features(features: pd.DataFrame, primary_frame: pd.DataFrame) -> pd.DataFrame:
     """
-    Add primary model confidence columns for the meta model.
+    Add primary model context columns for the meta model.
     """
     primary_columns = [
         column
         for column in primary_frame.columns
-        if column.startswith("primary_prob_") or column == "primary_confidence"
+        if (
+            column != "primary_moe_selected_experts"
+            and column.startswith(
+                (
+                    "primary_prob_",
+                    "primary_expert_",
+                    "primary_moe_",
+                    "trend_",
+                    "reversion_",
+                    "selected_policy_",
+                ),
+            )
+        )
+        or column
+        in {
+            "primary_confidence",
+            "primary_uncertainty",
+            "primary_disagreement",
+            "primary_expert_count",
+            "primary_driver_side",
+            "primary_driver_weight",
+            "primary_driver_margin",
+            "primary_driver_contribution",
+            "trend_score",
+            "reversion_score",
+        }
     ]
-    return features.join(primary_frame[primary_columns], how="inner")
+    context = (
+        primary_frame[primary_columns]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    if "primary_moe_selected_experts" in primary_frame:
+        selected_tokens = primary_frame["primary_moe_selected_experts"].fillna("").astype(str).apply(
+            lambda value: tuple(
+                token.strip()
+                for token in value.split(",")
+                if token.strip()
+            ),
+        )
+        for token in sorted({token for tokens in selected_tokens for token in tokens}):
+            context[f"primary_moe_selected_expert_{token}"] = selected_tokens.apply(
+                lambda tokens, selected=token: float(selected in tokens),
+            )
+    for column, prefix in (
+        ("primary_driver_expert", "primary_driver_expert"),
+        ("primary_policy", "primary_policy"),
+        ("primary_market_state", "primary_market_state"),
+        ("volatility_state", "volatility_state"),
+        ("flow_state", "flow_state"),
+        ("entropy_state", "entropy_state"),
+    ):
+        if column not in primary_frame:
+            continue
+        values = primary_frame[column].fillna("").astype(str)
+        values = values.where(values != "", "unknown")
+        context = context.join(
+            pd.get_dummies(
+                values,
+                prefix=prefix,
+                dtype=float,
+            ),
+            how="left",
+        )
+    session_hour = pd.Series(pd.DatetimeIndex(primary_frame.index).hour, index=primary_frame.index)
+    session = pd.Series("16_23", index=primary_frame.index, dtype=object)
+    session.loc[session_hour < 8] = "00_07"
+    session.loc[(session_hour >= 8) & (session_hour < 16)] = "08_15"
+    context = context.join(
+        pd.get_dummies(
+            session,
+            prefix="event_session_utc",
+            dtype=float,
+        ),
+        how="left",
+    )
+    return features.join(context, how="inner")
 
 
 def make_signal_frame(
@@ -3441,6 +5582,8 @@ def fit_afml_meta_model(
     oldest_weight: float = 1.0,
     pca_components: float | None = None,
     pca_random_state: int | None = None,
+    primary_oof_splits: int = 3,
+    primary_oof_embargo_bars: int = 0,
 ) -> AfmlMetaFitResult:
     """
     Fit AFML meta-labeling: primary side model plus secondary pass/trade model.
@@ -3466,7 +5609,17 @@ def fit_afml_meta_model(
         pca_random_state=pca_random_state,
     )
     primary_X = primary_model_dataset.X
-    primary_model = primary_model or SequentialBootstrapBaggingClassifier()
+    primary_oof_frame = _primary_oof_side_frame(
+        primary_dataset,
+        primary_train_index,
+        model_template=primary_model,
+        primary_probability_threshold=primary_probability_threshold,
+        n_splits=primary_oof_splits,
+        embargo_bars=primary_oof_embargo_bars,
+        pca_components=pca_components,
+        pca_random_state=pca_random_state,
+    )
+    primary_model = _new_primary_model(primary_model)
     primary_model = _fit_classifier(primary_model, primary_model_dataset, primary_train_index)
 
     primary_frame = primary_side_frame(
@@ -3474,8 +5627,19 @@ def fit_afml_meta_model(
         primary_X,
         probability_threshold=primary_probability_threshold,
     )
-    side = primary_frame["primary_side"]
-    meta_features = make_meta_features(raw_X, primary_frame)
+    primary_frame_for_meta = primary_frame.copy()
+    for column in primary_oof_frame.columns:
+        if column not in primary_frame_for_meta:
+            primary_frame_for_meta[column] = np.nan
+    primary_frame_for_meta.loc[primary_oof_frame.index, primary_oof_frame.columns] = primary_oof_frame
+    missing_oof_train = pd.DatetimeIndex(primary_train_index).difference(primary_oof_frame.index)
+    if not missing_oof_train.empty:
+        primary_frame_for_meta.loc[missing_oof_train, "primary_side"] = 0
+        primary_frame_for_meta.loc[missing_oof_train, "primary_prediction"] = 0
+        primary_frame_for_meta.loc[missing_oof_train, "primary_abstain_reason"] = "oof_unavailable"
+
+    side = primary_frame_for_meta["primary_side"]
+    meta_features = make_meta_features(raw_X, primary_frame_for_meta)
     meta_dataset = build_afml_meta_dataset(
         primary_dataset.close,
         side,
